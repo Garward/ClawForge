@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""
+Universal Meme Generator Tool for ClawForge
+Uses Imgflip API to generate contextually relevant memes
+
+Features:
+- Smart template selection based on context keywords
+- Auto-caption generation with pre-written templates
+- Manual override for custom templates/captions
+- Mood-aware generation (success, failure, confusion, etc.)
+"""
+
+import requests
+import json
+import re
+from typing import Dict, List, Optional, Tuple
+import random
+import os
+from pathlib import Path
+
+def _load_env_file():
+    """Load environment variables from .env file"""
+    env_file = Path.home() / ".env"
+    if env_file.exists():
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    # Remove quotes if present
+                    value = value.strip('"\'')
+                    os.environ[key.strip()] = value
+
+def _load_credentials():
+    """Load Imgflip credentials from environment variables"""
+    # Load .env file first if it exists
+    _load_env_file()
+    
+    # Get credentials from environment
+    username = os.getenv("IMGFLIP_USERNAME", "")
+    password = os.getenv("IMGFLIP_PASSWORD", "")
+    
+    return username, password
+
+
+class MemeGenerator:
+    def __init__(self):
+        self.imgflip_url = "https://api.imgflip.com/caption_image"
+        self.username, self.password = _load_credentials()
+        
+        # Popular meme templates with their Imgflip IDs
+        self.templates = {
+            # Reaction memes
+            "drake": "181913649",
+            "distracted_boyfriend": "112126428", 
+            "this_is_fine": "55311130",
+            "picard_facepalm": "16461716",
+            "success_kid": "61544",
+            "disaster_girl": "97984",
+            
+            # Decision/choice memes
+            "sweating_buttons": "80707627",
+            "expanding_brain": "93895088",
+            "woman_yelling_cat": "188390779",
+            
+            # Coding specific
+            "confused_math": "178591752",
+            "is_this": "100777631",
+            "tuxedo_winnie": "178591752",
+            
+            # General purpose
+            "monkey_puppet": "148909805",
+            "surprised_pikachu": "155067746",
+            "batman_slap": "438680",
+            "change_my_mind": "129242436"
+        }
+        
+        # Context keyword mapping to appropriate templates
+        self.context_map = {
+            # Development contexts
+            "debugging": ["this_is_fine", "picard_facepalm", "confused_math"],
+            "coding": ["confused_math", "this_is_fine", "drake"],
+            "bug": ["this_is_fine", "disaster_girl", "picard_facepalm"],
+            "success": ["success_kid", "drake", "expanding_brain"],
+            "deploy": ["success_kid", "this_is_fine", "disaster_girl"],
+            "error": ["this_is_fine", "picard_facepalm", "confused_math"],
+            
+            # Decision contexts  
+            "choice": ["drake", "distracted_boyfriend", "sweating_buttons"],
+            "decision": ["expanding_brain", "drake", "sweating_buttons"],
+            "comparison": ["drake", "tuxedo_winnie", "woman_yelling_cat"],
+            
+            # Gaming contexts
+            "gaming": ["drake", "this_is_fine", "success_kid"],
+            "game": ["success_kid", "disaster_girl", "drake"],
+            "chunkweave": ["expanding_brain", "success_kid", "drake"],
+            
+            # General contexts
+            "confusion": ["confused_math", "is_this", "surprised_pikachu"],
+            "reaction": ["surprised_pikachu", "monkey_puppet", "batman_slap"],
+            "explanation": ["expanding_brain", "change_my_mind", "is_this"]
+        }
+        
+        # Pre-written caption templates by meme type
+        self.caption_templates = {
+            "drake": {
+                "debugging": ("Manual print statements", "Using a proper debugger"),
+                "coding": ("Copy-paste from Stack Overflow", "Understanding the code first"),
+                "gaming": ("Just one more game", "Productive work"),
+                "choice": ("The easy way", "The right way"),
+                "deploy": ("Deploy on Friday", "Wait until Monday")
+            },
+            "this_is_fine": {
+                "debugging": ("Everything is working", "500 console errors"),
+                "coding": ("My code is perfect", "Production is on fire"),
+                "deploy": ("Deployment going smooth", "Database just crashed"),
+                "error": ("No errors in my code", "Exception stack traces everywhere")
+            },
+            "success_kid": {
+                "success": ("Code compiled", "On first try"),
+                "gaming": ("Beat the boss", "No continues used"),
+                "deploy": ("Deployed to production", "Zero downtime"),
+                "coding": ("Fixed the bug", "Didn't break anything else")
+            },
+            "confused_math": {
+                "debugging": ("Bug appears randomly", "Only on production"),
+                "coding": ("Code works locally", "Fails in CI/CD"),
+                "confusion": ("Documentation says it works", "Reality disagrees")
+            },
+            "expanding_brain": {
+                "coding": ("Hard-coded values", "Config files", "Environment variables", "Machine learning decides"),
+                "gaming": ("Button mashing", "Learn combos", "Frame-perfect inputs", "Predict opponent's moves"),
+                "explanation": ("Basic approach", "Better method", "Advanced technique", "Transcendent solution")
+            },
+            "picard_facepalm": {
+                "debugging": ("Found the bug", "It was a typo"),
+                "error": ("Error in production", "Caused by my 'quick fix'"),
+                "coding": ("Spent 3 hours debugging", "Forgot to save the file")
+            }
+        }
+        
+    def get_context_templates(self, context: str) -> List[str]:
+        """Get appropriate templates for a given context"""
+        context_lower = context.lower()
+        
+        # Direct context matches
+        for ctx, templates in self.context_map.items():
+            if ctx in context_lower:
+                return templates
+                
+        # Keyword fallback
+        keywords = ["debug", "code", "game", "error", "success", "choice"]
+        for keyword in keywords:
+            if keyword in context_lower:
+                for ctx, templates in self.context_map.items():
+                    if keyword in ctx:
+                        return templates
+                        
+        # Default fallback
+        return ["drake", "this_is_fine", "success_kid"]
+    
+    def generate_captions(self, template: str, context: str, mood: Optional[str] = None) -> Tuple[str, str]:
+        """Generate appropriate captions for a template and context"""
+        
+        # Check if we have pre-written captions
+        if template in self.caption_templates:
+            template_captions = self.caption_templates[template]
+            
+            # Try to match context
+            context_lower = context.lower()
+            for ctx_key in template_captions.keys():
+                if ctx_key in context_lower:
+                    captions = template_captions[ctx_key]
+                    if isinstance(captions, tuple) and len(captions) == 2:
+                        return captions
+                    elif isinstance(captions, tuple) and len(captions) == 4:
+                        # Expanding brain - return first two
+                        return captions[0], captions[1]
+            
+            # Fallback to first available template
+            first_key = list(template_captions.keys())[0]
+            captions = template_captions[first_key]
+            if isinstance(captions, tuple):
+                return captions[0], captions[1]
+        
+        # Generic fallback captions
+        if mood == "success":
+            return "Task started", "Task completed successfully"
+        elif mood == "failure":
+            return "What I expected", "What actually happened"  
+        elif mood == "confusion":
+            return "Documentation", "Actual behavior"
+        else:
+            return "Before", "After"
+    
+    def generate_meme(self, template: Optional[str] = None, context: str = "", 
+                     top_text: Optional[str] = None, bottom_text: Optional[str] = None,
+                     mood: Optional[str] = None) -> Dict:
+        """Generate a meme image using Imgflip API"""
+        
+        try:
+            # Check credentials
+            if not self.username or not self.password:
+                return {
+                    "success": False,
+                    "error": "Imgflip credentials not found. Set IMGFLIP_USERNAME and IMGFLIP_PASSWORD in ~/.env file"
+                }
+            
+            # Select template
+            if not template:
+                suitable_templates = self.get_context_templates(context)
+                template = random.choice(suitable_templates)
+            
+            # Validate template exists
+            if template not in self.templates:
+                available = list(self.templates.keys())
+                return {
+                    "success": False,
+                    "error": f"Unknown template '{template}'. Available: {', '.join(available)}"
+                }
+            
+            template_id = self.templates[template]
+            
+            # Generate captions if not provided
+            if not top_text or not bottom_text:
+                auto_top, auto_bottom = self.generate_captions(template, context, mood)
+                top_text = top_text or auto_top
+                bottom_text = bottom_text or auto_bottom
+            
+            # Make API request
+            payload = {
+                'template_id': template_id,
+                'text0': top_text,
+                'text1': bottom_text,
+                'username': self.username,
+                'password': self.password
+            }
+            
+            response = requests.post(self.imgflip_url, data=payload, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('success'):
+                    return {
+                        "success": True,
+                        "url": data['data']['url'],
+                        "template": template,
+                        "top_text": top_text,
+                        "bottom_text": bottom_text,
+                        "context": context
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "error": data.get('error_message', 'Unknown API error')
+                    }
+            else:
+                return {
+                    "success": False, 
+                    "error": f"HTTP {response.status_code}: {response.text}"
+                }
+                
+        except requests.RequestException as e:
+            return {
+                "success": False,
+                "error": f"Network error: {str(e)}"
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Unexpected error: {str(e)}"
+            }
+
+def meme_generate(template: Optional[str] = None, context: str = "", 
+                 top_text: Optional[str] = None, bottom_text: Optional[str] = None,
+                 mood: Optional[str] = None) -> Dict:
+    """
+    Generate a contextually relevant meme
+    
+    Args:
+        template: Specific meme template to use (optional)
+        context: Description of current situation for auto-selection
+        top_text: Custom top text (optional)
+        bottom_text: Custom bottom text (optional)  
+        mood: Mood/tone (success, failure, confusion, etc.)
+    
+    Returns:
+        Dict with success status, meme URL, and metadata
+    """
+    generator = MemeGenerator()
+    return generator.generate_meme(template, context, top_text, bottom_text, mood)
+
+def list_templates() -> List[str]:
+    """List all available meme templates"""
+    generator = MemeGenerator()
+    return list(generator.templates.keys())
+
+def get_template_contexts() -> Dict[str, List[str]]:
+    """Get mapping of contexts to suggested templates"""
+    generator = MemeGenerator()
+    return generator.context_map
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python meme_tool.py '{\"context\":\"debugging\"}'")
+        sys.exit(1)
+
+    # Special commands
+    if sys.argv[1] == "list":
+        print("Available templates:", ", ".join(list_templates()))
+        sys.exit(0)
+
+    if sys.argv[1] == "contexts":
+        for context, templates in get_template_contexts().items():
+            print(f"  {context}: {', '.join(templates)}")
+        sys.exit(0)
+
+    # JSON input mode (used by ClawForge tool system)
+    try:
+        params = json.loads(sys.argv[1])
+    except json.JSONDecodeError:
+        # Fallback: treat as context string
+        params = {"context": sys.argv[1]}
+
+    result = meme_generate(
+        template=params.get("template"),
+        context=params.get("context", ""),
+        top_text=params.get("top_text"),
+        bottom_text=params.get("bottom_text"),
+        mood=params.get("mood"),
+    )
+
+    print(json.dumps(result))

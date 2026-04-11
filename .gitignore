@@ -1,0 +1,36 @@
+# Zig build artifacts
+zig-cache/
+zig-out/
+*.o
+.zig-cache/
+
+# Compiled binaries
+router
+zig_api_test
+
+# Data directory (contains database)
+data/
+
+# Temporary files
+*.tmp
+*.temp
+.codex
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

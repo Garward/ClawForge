@@ -1,0 +1,27 @@
+{
+  "api": {
+    "token_file": "/home/garward/Scripts/Tools/Anthropic/token.txt",
+    "base_url": "https://api.anthropic.com",
+    "default_model": "claude-sonnet-4-20250514",
+    "max_tokens": 8192,
+    "timeout_ms": 120000
+  },
+  "daemon": {
+    "socket_path": "data/clawforge.sock",
+    "data_dir": "data",
+    "log_level": "info",
+    "max_clients": 5
+  },
+  "tools": {
+    "enabled": ["bash", "file_read", "file_write", "file_diff", "amazon_search", "calc", "introspect", "meme_tool", "rebuild", "zig_test", "research_tool"],
+    "bash_require_confirmation": true,
+    "bash_timeout_ms": 30000,
+    "file_write_require_confirmation": true
+  },
+  "display": {
+    "stream_output": true,
+    "show_tool_calls": true,
+    "show_token_usage": true,
+    "color_output": true
+  }
+}
