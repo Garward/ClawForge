@@ -4,7 +4,9 @@ const registry = @import("registry.zig");
 
 pub const definition = registry.ToolDefinition{
     .name = "bash",
-    .description = "Execute a bash command and return its output. Use this for running shell commands, scripts, or system utilities.",
+    .description = "Execute a shell command. For running builds, git, ls, grep, and system utilities ONLY. " ++
+        "Do NOT use for reading files (use file_read), writing files (use file_write), or editing files (use file_diff). " ++
+        "File write commands (cat >, echo >, sed -i) are blocked — use the dedicated file tools instead.",
     .input_schema_json =
     \\{"type":"object","properties":{"command":{"type":"string","description":"The bash command to execute"}},"required":["command"]}
     ,
@@ -38,7 +40,20 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
     // Block sed -i — use the file_diff tool instead for safe edits with backup
     if (std.mem.indexOf(u8, command, "sed -i") != null) {
         return .{
-            .content = "BLOCKED: sed -i is disabled. Use the file_diff tool for safe, targeted edits with automatic backup. sed -i with line numbers breaks when earlier edits shift lines, causing file corruption.",
+            .content = "BLOCKED: sed -i is disabled. Use the file_diff tool for safe, targeted edits with automatic backup.",
+            .is_error = true,
+        };
+    }
+
+    // Block cat/echo/tee file writing — use file_write or file_diff tools instead
+    if ((std.mem.indexOf(u8, command, "cat >") != null or
+        std.mem.indexOf(u8, command, "cat >>") != null or
+        std.mem.indexOf(u8, command, "echo >") != null or
+        std.mem.indexOf(u8, command, "tee ") != null) and
+        std.mem.indexOf(u8, command, "/dev/null") == null)
+    {
+        return .{
+            .content = "BLOCKED: Use the file_write tool to create files or file_diff tool to edit them. Writing files through bash heredocs causes encoding corruption. The file_write tool handles content cleanly and file_diff creates automatic backups.",
             .is_error = true,
         };
     }

@@ -1,5 +1,9 @@
 #!/bin/bash
 # Quick daemon restart for testing
+# SIGTERM first to let SQLite checkpoint the WAL cleanly
+pkill -f clawforged 2>/dev/null
+sleep 1
+# Force kill only if it didn't exit gracefully
 pkill -9 -f clawforged 2>/dev/null
 sleep 0.3
 rm -f /home/garward/Scripts/Tools/ClawForge/data/clawforge.sock

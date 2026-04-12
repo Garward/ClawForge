@@ -123,6 +123,8 @@ pub const WebAdapter = struct {
             } else {
                 try self.handleApiTools(conn.stream);
             }
+        } else if (std.mem.eql(u8, path, "/api/persona")) {
+            try self.handleApiPersona(conn.stream, method, body);
         } else {
             try self.serve404(conn.stream);
         }
@@ -194,6 +196,9 @@ pub const WebAdapter = struct {
                 json_out.appendSlice(self.allocator, ",\"output_tokens\":") catch {};
                 const out_str = std.fmt.bufPrint(&num_buf, "{d}", .{chat.output_tokens}) catch "0";
                 json_out.appendSlice(self.allocator, out_str) catch {};
+                json_out.appendSlice(self.allocator, ",\"context_tokens\":") catch {};
+                const ctx_str = std.fmt.bufPrint(&num_buf, "{d}", .{chat.context_tokens}) catch "0";
+                json_out.appendSlice(self.allocator, ctx_str) catch {};
                 json_out.appendSlice(self.allocator, "}}") catch {};
 
                 try self.sendHttp(stream, "200 OK", "application/json", json_out.items);
@@ -340,6 +345,9 @@ pub const WebAdapter = struct {
                 end_buf.appendSlice(self.allocator, ",\"output_tokens\":") catch {};
                 const out_s = std.fmt.bufPrint(&num_buf, "{d}", .{chat.output_tokens}) catch "0";
                 end_buf.appendSlice(self.allocator, out_s) catch {};
+                end_buf.appendSlice(self.allocator, ",\"context_tokens\":") catch {};
+                const ctx_s = std.fmt.bufPrint(&num_buf, "{d}", .{chat.context_tokens}) catch "0";
+                end_buf.appendSlice(self.allocator, ctx_s) catch {};
                 end_buf.appendSlice(self.allocator, "}\n\n") catch {};
                 _ = stream.write(end_buf.items) catch {};
             },
@@ -370,6 +378,8 @@ pub const WebAdapter = struct {
                 return self.handleSessionAction(stream, body, "new");
             } else if (std.mem.endsWith(u8, path, "/delete")) {
                 return self.handleSessionAction(stream, body, "delete");
+            } else if (std.mem.endsWith(u8, path, "/switch")) {
+                return self.handleSessionAction(stream, body, "switch");
             }
         }
 
@@ -424,12 +434,15 @@ pub const WebAdapter = struct {
         defer parsed.deinit();
 
         if (std.mem.eql(u8, action, "new")) {
-            const name = if (parsed.value.object.get("name")) |n| n.string else null;
-            _ = self.engine.session_store.createSession(name) catch {
+            const name = if (parsed.value.object.get("name")) |n| (if (n == .string) n.string else null) else null;
+            const new_sess = self.engine.session_store.createSession(name) catch {
                 try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Failed to create session\"}");
                 return;
             };
-            try self.sendHttp(stream, "200 OK", "application/json", "{\"ok\":true}");
+            // Return the new session ID so the UI can switch to it
+            var resp_buf: [128]u8 = undefined;
+            const resp = std.fmt.bufPrint(&resp_buf, "{{\"ok\":true,\"id\":\"{s}\"}}", .{new_sess.id}) catch "{\"ok\":true}";
+            try self.sendHttp(stream, "200 OK", "application/json", resp);
             return;
         }
 
@@ -450,6 +463,8 @@ pub const WebAdapter = struct {
             self.engine.session_store.setSessionStatus(id, "active") catch {};
         } else if (std.mem.eql(u8, action, "delete")) {
             self.engine.session_store.deleteSession(id) catch {};
+        } else if (std.mem.eql(u8, action, "switch")) {
+            self.engine.session_store.switchSession(id) catch {};
         }
 
         try self.sendHttp(stream, "200 OK", "application/json", "{\"ok\":true}");
@@ -719,6 +734,109 @@ pub const WebAdapter = struct {
 
         std.log.info("Registered runtime tool: {s} -> {s}", .{ d_name, d_path });
         try self.sendHttp(stream, "200 OK", "application/json", "{\"ok\":true}");
+    }
+
+    /// GET /api/persona — list personas + current session's active persona name
+    /// POST /api/persona {action, name, content?}
+    ///   action=select: set active persona for session
+    ///   action=create: create new persona file
+    ///   action=delete: delete persona file
+    fn handleApiPersona(self: *WebAdapter, stream: std.net.Stream, method: []const u8, body: []const u8) !void {
+        const prompt_mod = @import("core").prompt;
+
+        if (std.mem.eql(u8, method, "GET")) {
+            // Return list of available personas + which one is active
+            const personas = try prompt_mod.listPersonas(self.allocator);
+            defer {
+                for (personas) |name| self.allocator.free(name);
+                self.allocator.free(personas);
+            }
+
+            // Get active persona name from session
+            var active_name: []const u8 = "default";
+            var _sess_info = if (self.engine.session_store.active_session_id) |sid|
+                (self.engine.session_store.getSession(&sid) catch null)
+            else
+                null;
+            if (_sess_info) |si| {
+                if (si.system_prompt) |sp| active_name = sp;
+            }
+            defer if (_sess_info) |*si| self.engine.session_store.freeSessionInfo(si);
+
+            var out: std.ArrayList(u8) = .{};
+            defer out.deinit(self.allocator);
+            out.appendSlice(self.allocator, "{\"active\":\"") catch {};
+            out.appendSlice(self.allocator, active_name) catch {};
+            out.appendSlice(self.allocator, "\"") catch {};
+            out.appendSlice(self.allocator, ",\"personas\":[") catch {};
+            for (personas, 0..) |name, i| {
+                if (i > 0) out.appendSlice(self.allocator, ",") catch {};
+                out.appendSlice(self.allocator, "\"") catch {};
+                out.appendSlice(self.allocator, name) catch {};
+                out.appendSlice(self.allocator, "\"") catch {};
+            }
+            out.appendSlice(self.allocator, "]}") catch {};
+            try self.sendHttp(stream, "200 OK", "application/json", out.items);
+            return;
+        }
+
+        if (!std.mem.eql(u8, method, "POST")) {
+            try self.sendHttp(stream, "405 Method Not Allowed", "text/plain", "Method Not Allowed");
+            return;
+        }
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{
+            .allocate = .alloc_always,
+        }) catch {
+            try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Invalid JSON\"}");
+            return;
+        };
+        defer parsed.deinit();
+
+        const obj = if (parsed.value == .object) parsed.value.object else {
+            try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Expected object\"}");
+            return;
+        };
+
+        const action = if (obj.get("action")) |a| (if (a == .string) a.string else "select") else "select";
+        const name = if (obj.get("name")) |n| (if (n == .string) n.string else null) else null;
+
+        if (std.mem.eql(u8, action, "select")) {
+            // Set active persona for current session (null or "default" = default)
+            const session_id = self.engine.session_store.active_session_id orelse {
+                try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"No active session\"}");
+                return;
+            };
+            const persona_name: ?[]const u8 = if (name) |n| (if (std.mem.eql(u8, n, "default")) null else n) else null;
+            self.engine.session_store.updateSystemPrompt(&session_id, persona_name) catch {
+                try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Failed to update\"}");
+                return;
+            };
+            try self.sendHttp(stream, "200 OK", "application/json", "{\"ok\":true}");
+        } else if (std.mem.eql(u8, action, "create")) {
+            const content = if (obj.get("content")) |c| (if (c == .string) c.string else null) else null;
+            if (name == null or content == null) {
+                try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Need name and content\"}");
+                return;
+            }
+            prompt_mod.savePersona(self.allocator, name.?, content.?) catch {
+                try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Failed to save\"}");
+                return;
+            };
+            try self.sendHttp(stream, "200 OK", "application/json", "{\"ok\":true}");
+        } else if (std.mem.eql(u8, action, "delete")) {
+            if (name == null) {
+                try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Need name\"}");
+                return;
+            }
+            prompt_mod.deletePersona(self.allocator, name.?) catch {
+                try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Cannot delete\"}");
+                return;
+            };
+            try self.sendHttp(stream, "200 OK", "application/json", "{\"ok\":true}");
+        } else {
+            try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Unknown action\"}");
+        }
     }
 
     fn handleApiMessages(self: *WebAdapter, stream: std.net.Stream, path: []const u8) !void {

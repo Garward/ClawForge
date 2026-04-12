@@ -60,6 +60,76 @@ pub const RetrievedEntry = struct {
 /// Default persona — embedded at compile time from config/personas/default.txt.
 pub const DEFAULT_PERSONA = @embedFile("default_persona.txt");
 
+const common = @import("common");
+
+/// Load a persona file from config/personas/{name}.txt at runtime.
+/// Returns null if file not found. Caller owns the returned memory.
+pub fn loadPersona(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
+    // Reject path traversal
+    if (std.mem.indexOf(u8, name, "..") != null or std.mem.indexOf(u8, name, "/") != null) return null;
+
+    const rel_path = std.fmt.allocPrint(allocator, "config/personas/{s}.txt", .{name}) catch return null;
+    defer allocator.free(rel_path);
+
+    const abs_path = common.config.resolveProjectPath(allocator, rel_path) catch return null;
+    defer allocator.free(abs_path);
+
+    const file = std.fs.openFileAbsolute(abs_path, .{}) catch return null;
+    defer file.close();
+    return file.readToEndAlloc(allocator, 64 * 1024) catch null;
+}
+
+/// List available persona names from config/personas/*.txt.
+/// Returns a slice of name strings (without .txt extension). Caller owns memory.
+pub fn listPersonas(allocator: std.mem.Allocator) ![]const []const u8 {
+    const dir_path = common.config.resolveProjectPath(allocator, "config/personas") catch return &.{};
+    defer allocator.free(dir_path);
+
+    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return &.{};
+    defer dir.close();
+
+    var names: std.ArrayList([]const u8) = .{};
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .file) continue;
+        const fname = entry.name;
+        if (!std.mem.endsWith(u8, fname, ".txt")) continue;
+        const name = fname[0 .. fname.len - 4]; // strip .txt
+        try names.append(allocator, try allocator.dupe(u8, name));
+    }
+    return try names.toOwnedSlice(allocator);
+}
+
+/// Save a persona file to config/personas/{name}.txt.
+pub fn savePersona(allocator: std.mem.Allocator, name: []const u8, content: []const u8) !void {
+    if (std.mem.indexOf(u8, name, "..") != null or std.mem.indexOf(u8, name, "/") != null) return error.InvalidName;
+    if (name.len == 0) return error.InvalidName;
+
+    const rel_path = try std.fmt.allocPrint(allocator, "config/personas/{s}.txt", .{name});
+    defer allocator.free(rel_path);
+
+    const abs_path = try common.config.resolveProjectPath(allocator, rel_path);
+    defer allocator.free(abs_path);
+
+    const file = try std.fs.createFileAbsolute(abs_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(content);
+}
+
+/// Delete a persona file. Cannot delete "default".
+pub fn deletePersona(allocator: std.mem.Allocator, name: []const u8) !void {
+    if (std.mem.eql(u8, name, "default")) return error.CannotDeleteDefault;
+    if (std.mem.indexOf(u8, name, "..") != null or std.mem.indexOf(u8, name, "/") != null) return error.InvalidName;
+
+    const rel_path = try std.fmt.allocPrint(allocator, "config/personas/{s}.txt", .{name});
+    defer allocator.free(rel_path);
+
+    const abs_path = try common.config.resolveProjectPath(allocator, rel_path);
+    defer allocator.free(abs_path);
+
+    try std.fs.deleteFileAbsolute(abs_path);
+}
+
 /// Assemble a system prompt from layers. Returns allocated string.
 /// Layers are concatenated in order with section headers.
 /// If total exceeds max_tokens (estimated), trims retrieved context first.
@@ -186,8 +256,16 @@ pub fn buildFromState(
 ) !PromptLayers {
     var layers = PromptLayers{};
 
-    // Layer 1: Default persona (loaded at compile time)
-    layers.persona = DEFAULT_PERSONA;
+    // Layer 1: Persona — load by name from config/personas/ or fall back to compiled default.
+    // session_system_prompt stores the persona NAME (e.g. "Vera"), not the full text.
+    if (session_system_prompt) |persona_name| {
+        if (persona_name.len > 0) {
+            layers.persona = loadPersona(allocator, persona_name);
+        }
+    }
+    if (layers.persona == null) {
+        layers.persona = DEFAULT_PERSONA;
+    }
 
     // Layer 3: Project context if attached
     if (try project_store.getSessionProject(session_id)) |project_id| {
@@ -252,8 +330,8 @@ pub fn buildFromState(
     // Layer 5: Adapter context
     layers.adapter_context = adapter_context;
 
-    // Layer 6: Session override
-    layers.session_override = session_system_prompt;
+    // Layer 6: Session override — no longer used for persona (now Layer 1).
+    // Reserved for future per-session instruction overrides.
 
     return layers;
 }

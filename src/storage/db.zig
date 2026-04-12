@@ -27,9 +27,13 @@ pub const Connection = struct {
     pub fn applyPragmas(self: *Connection) !void {
         try self.execSimple("PRAGMA journal_mode=WAL");
         try self.execSimple("PRAGMA busy_timeout=5000");
-        try self.execSimple("PRAGMA synchronous=NORMAL");
+        // FULL sync ensures WAL commits survive SIGKILL / power loss.
+        // With WAL mode the perf cost is minimal (sync on commit, not on every write).
+        try self.execSimple("PRAGMA synchronous=FULL");
         try self.execSimple("PRAGMA foreign_keys=ON");
         try self.execSimple("PRAGMA cache_size=-64000"); // 64MB cache
+        // Checkpoint any WAL data left from a previous unclean shutdown
+        try self.execSimple("PRAGMA wal_checkpoint(TRUNCATE)");
     }
 
     /// Execute a SQL statement with no results.

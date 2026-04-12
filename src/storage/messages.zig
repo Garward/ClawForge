@@ -79,6 +79,29 @@ pub const MessageStore = struct {
     /// Strip <tool_calls>...</tool_calls> XML from stored assistant messages.
     /// This XML is for DB persistence/introspect only — sending it to the API
     /// causes the model to mimic the format as plain text instead of using real tool_use.
+    /// Strip tool calls and truncate to max_chars for older messages.
+    /// Keeps the first and last portions so the model retains context.
+    /// Truncation points are adjusted to avoid splitting multi-byte UTF-8 sequences.
+    fn compactAssistantMessage(self: *MessageStore, content: []const u8, max_chars: usize) ![]const u8 {
+        const stripped = try self.stripToolCallsXml(content);
+        if (stripped.len <= max_chars) return stripped;
+
+        // Find UTF-8-safe cut points
+        var head = max_chars * 2 / 3;
+        while (head > 0 and head < stripped.len and stripped[head] & 0xC0 == 0x80) head -= 1;
+        var tail_start = stripped.len - max_chars / 3;
+        while (tail_start < stripped.len and stripped[tail_start] & 0xC0 == 0x80) tail_start += 1;
+
+        const omitted = tail_start - head;
+        const result = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}\n\n[...{d} chars omitted for context budget...]\n\n{s}",
+            .{ stripped[0..head], omitted, stripped[tail_start..] },
+        );
+        self.allocator.free(stripped);
+        return result;
+    }
+
     fn stripToolCallsXml(self: *MessageStore, content: []const u8) ![]const u8 {
         const start_tag = "<tool_calls>";
         const end_tag = "</tool_calls>";
@@ -103,8 +126,36 @@ pub const MessageStore = struct {
     }
 
     pub fn buildApiMessages(self: *MessageStore, session_id: []const u8) ![]const api.messages.Message {
+        // Count user messages (actual human turns), not raw DB rows.
+        // A single tool-heavy exchange can produce 10+ DB rows but is only 1 turn.
+        var count_stmt = try self.conn.prepare(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ? AND role = 'user'",
+        );
+        defer count_stmt.deinit();
+        try count_stmt.bindText(1, session_id);
+        const user_turns = if (try count_stmt.step()) @as(usize, @intCast(count_stmt.columnInt(0))) else 0;
+
+        // Keep the last 10 user turns at full fidelity (+ their assistant responses).
+        // Older turns get tool XML stripped + text truncated to 4K.
+        const recent_user_turns: usize = 10;
+        const compact_turns = if (user_turns > recent_user_turns) user_turns - recent_user_turns else 0;
+
+        // Find the sequence number where the recent window starts
+        var recent_seq: i64 = 0;
+        if (compact_turns > 0) {
+            var seq_stmt = try self.conn.prepare(
+                "SELECT sequence FROM messages WHERE session_id = ? AND role = 'user' ORDER BY sequence ASC LIMIT 1 OFFSET ?",
+            );
+            defer seq_stmt.deinit();
+            try seq_stmt.bindText(1, session_id);
+            try seq_stmt.bindInt64(2, @intCast(compact_turns));
+            if (try seq_stmt.step()) {
+                recent_seq = seq_stmt.columnInt64(0);
+            }
+        }
+
         var stmt = try self.conn.prepare(
-            "SELECT role, content FROM messages WHERE session_id = ? ORDER BY sequence ASC",
+            "SELECT role, content, sequence FROM messages WHERE session_id = ? ORDER BY sequence ASC",
         );
         defer stmt.deinit();
         try stmt.bindText(1, session_id);
@@ -116,17 +167,22 @@ pub const MessageStore = struct {
             if (count >= raw.len) break;
             const role_str = stmt.columnText(0) orelse "user";
             const content = stmt.columnText(1) orelse "";
+            const seq = stmt.columnInt64(2);
 
             const role: api.messages.Role = if (std.mem.eql(u8, role_str, "assistant"))
                 .assistant
             else
                 .user;
 
-            // Strip tool_calls XML from assistant messages before sending to API
-            const clean_content = if (role == .assistant)
-                try self.stripToolCallsXml(content)
-            else
-                try self.allocator.dupe(u8, content);
+            // In the recent window: full stripped content.
+            // Older: tool XML stripped + text truncated to 4K (keeps conclusions).
+            const clean_content = if (role == .assistant) blk: {
+                if (seq < recent_seq) {
+                    break :blk try self.compactAssistantMessage(content, 4000);
+                } else {
+                    break :blk try self.stripToolCallsXml(content);
+                }
+            } else try self.allocator.dupe(u8, content);
 
             const content_slice = try self.allocator.alloc(api.messages.ContentBlock, 1);
             content_slice[0] = .{ .text = .{ .text = clean_content } };

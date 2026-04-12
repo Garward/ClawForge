@@ -4,7 +4,9 @@ const registry = @import("registry.zig");
 
 pub const definition = registry.ToolDefinition{
     .name = "file_write",
-    .description = "Write content to a file. For existing files, requires force=true and shows a warning to use file_read first. Creates automatic backups.",
+    .description = "Create or overwrite a file. Use this instead of bash for ALL file creation. " ++
+        "For editing existing files, prefer file_diff (targeted changes with backup). " ++
+        "Set force=true to overwrite existing files. Creates automatic backups.",
     .input_schema_json =
     \\{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to write to"},"content":{"type":"string","description":"Content to write to the file"},"force":{"type":"boolean","description":"Required to overwrite existing files. Use file_read first to see current content.","default":false}},"required":["path","content"]}
     ,

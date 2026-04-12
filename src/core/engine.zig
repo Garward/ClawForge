@@ -490,6 +490,9 @@ pub const Engine = struct {
         stop_reason: ?[]const u8,
         input_tokens: u32,
         output_tokens: u32,
+        /// Peak single-round input tokens (actual context window size).
+        /// input_tokens is cumulative across all tool rounds.
+        context_tokens: u32,
     };
 
     pub const ToolCallRecord = struct {
@@ -636,7 +639,9 @@ pub const Engine = struct {
             owned_tool_defs.deinit(self.allocator);
         }
 
-        const initial_tools = self.selectToolDefinitionsForMessage(chat_req.message);
+        // Always send all tools — the schema cost difference (~650 tokens) is trivial
+        // vs the risk of the model not knowing a tool exists.
+        const initial_tools = self.tool_registry.getToolDefinitions();
         if (initial_tools) |defs| {
             owned_tool_defs.append(self.allocator, defs) catch {};
         }
@@ -662,6 +667,7 @@ pub const Engine = struct {
         // ============================================================
         var total_input_tokens: u32 = 0;
         var total_output_tokens: u32 = 0;
+        var context_tokens: u32 = 0; // Peak single-round input (actual context window)
         var final_stop_reason: ?[]const u8 = null;
         var current_request = api_request;
 
@@ -686,7 +692,7 @@ pub const Engine = struct {
         }
 
         var tool_round: usize = 0;
-        while (tool_round < 20) : (tool_round += 1) {
+        while (tool_round < 100) : (tool_round += 1) {
             std.log.info("Tool round {d}, emitter={}, msgs={d}", .{ tool_round, emitter != null, current_request.messages.len });
             self.logPromptBudget(tool_round, current_request);
 
@@ -740,6 +746,7 @@ pub const Engine = struct {
 
             total_input_tokens += api_response.usage.input_tokens;
             total_output_tokens += api_response.usage.output_tokens;
+            context_tokens = @max(context_tokens, api_response.usage.input_tokens);
 
             // Always capture text from this round (API sends text preamble even with tool_use)
             if (api_response.text_content.len > 0) {
@@ -878,12 +885,47 @@ pub const Engine = struct {
                 extended[prev.len] = .{ .role = .assistant, .content = assistant_blocks.items };
                 extended[prev.len + 1] = .{ .role = .user, .content = result_blocks.items };
 
+                // Compact older tool_result blocks to prevent unbounded growth.
+                // Keep last 3 rounds (6 messages) at full size.
+                // Older results get a meaningful summary (first 500 chars) instead of full content,
+                // so the model retains enough context to make targeted fixes.
+                if (extended.len > 8) {
+                    const keep_full_from = if (extended.len > 6) extended.len - 6 else 0;
+                    for (extended[0..keep_full_from]) |*msg| {
+                        if (msg.role != .user) continue;
+                        const blocks = @constCast(msg.content);
+                        for (blocks) |*block| {
+                            switch (block.*) {
+                                .tool_result => |tr| {
+                                    if (tr.content.len > 600) {
+                                        // Keep a meaningful head excerpt so the model
+                                        // can still see file paths, error messages, etc.
+                                        const head_len = @min(tr.content.len, 500);
+                                        const summary = std.fmt.allocPrint(
+                                            self.allocator,
+                                            "{s}\n\n[...truncated {d} more chars]",
+                                            .{ tr.content[0..head_len], tr.content.len - head_len },
+                                        ) catch continue;
+                                        block.* = .{ .tool_result = .{
+                                            .tool_use_id = tr.tool_use_id,
+                                            .content = summary,
+                                            .is_error = tr.is_error,
+                                        } };
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                }
+
                 current_request.messages = extended;
                 current_request.tools = self.selectFollowupToolDefinitions(chat_req.message, api_response.tool_use);
                 if (current_request.tools) |defs| {
                     owned_tool_defs.append(self.allocator, defs) catch {};
                 }
-                current_request.stream = false; // Tool rounds are non-streaming
+                // Keep streaming enabled so tool use progress is visible to the user.
+                // current_request.stream stays as-is (true if emitter present).
             }
         }
 
@@ -893,7 +935,6 @@ pub const Engine = struct {
             std.log.info("Tool loop exhausted without text — forcing final summary call", .{});
             var final_req = current_request;
             final_req.tools = null; // No tools → model must respond with text
-            final_req.stream = false;
             if (self.provider.createMessage(&final_req)) |final_resp| {
                 if (final_resp.arena) |a| {
                     response_arenas.append(self.allocator, a) catch {};
@@ -949,6 +990,7 @@ pub const Engine = struct {
             .model = result_model,
             .stop_reason = final_stop_reason,
             .input_tokens = total_input_tokens,
+            .context_tokens = context_tokens,
             .output_tokens = total_output_tokens,
         } };
     }

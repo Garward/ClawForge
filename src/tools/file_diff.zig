@@ -4,7 +4,9 @@ const registry = @import("registry.zig");
 
 pub const definition = registry.ToolDefinition{
     .name = "file_diff",
-    .description = "Show unified diff between current file content and proposed new content. Creates backup automatically if apply=true.",
+    .description = "Edit a file with a unified diff. The PRIMARY tool for modifying existing files. " ++
+        "Pass the full new content and set apply=true to write. Creates automatic backup before writing. " ++
+        "Always use file_read first to see current content, then file_diff to apply changes.",
     .input_schema_json =
     \\{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the file"},"new_content":{"type":"string","description":"Proposed new content"},"apply":{"type":"boolean","description":"Apply the changes after showing diff","default":false}},"required":["path","new_content"]}
     ,

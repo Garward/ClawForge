@@ -118,7 +118,9 @@ pub const SessionStore = struct {
         try stmt.bindText(1, id);
         if (!try stmt.step()) return error.SessionNotFound;
 
-        @memcpy(&self.active_session_id.?, id);
+        var id_buf: [36]u8 = undefined;
+        @memcpy(&id_buf, id[0..36]);
+        self.active_session_id = id_buf;
     }
 
     pub fn deleteSession(self: *SessionStore, id: []const u8) !void {

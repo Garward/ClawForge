@@ -1047,6 +1047,25 @@
         </div>
 
         <div class="config-section">
+            <h4>Persona</h4>
+            <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;">
+                <select id="persona-select" style="flex:1;background:var(--bg-main);color:var(--text-main);border:1px solid var(--border-subtle);border-radius:var(--radius);padding:6px 8px;font-size:13px;">
+                    <option value="default">default</option>
+                </select>
+                <button id="persona-delete-btn" style="opacity:0.6;font-size:12px;" title="Delete selected persona">&#128465;</button>
+            </div>
+            <div id="persona-status" style="font-size:11px;color:var(--text-dim);margin-bottom:6px;"></div>
+            <details id="persona-create-section" style="margin-top:4px;">
+                <summary style="cursor:pointer;font-size:12px;color:var(--text-dim);">+ New Persona</summary>
+                <div style="margin-top:6px;">
+                    <input id="persona-new-name" type="text" placeholder="Name (e.g. Vera)" style="width:100%;margin-bottom:4px;background:var(--bg-main);color:var(--text-main);border:1px solid var(--border-subtle);border-radius:var(--radius);padding:6px 8px;font-size:12px;">
+                    <textarea id="persona-new-content" rows="6" style="width:100%;font-family:var(--font-mono);font-size:11px;background:var(--bg-main);color:var(--text-main);border:1px solid var(--border-subtle);border-radius:var(--radius);padding:8px;resize:vertical;" placeholder="Persona system prompt text..."></textarea>
+                    <button id="persona-create-btn" style="margin-top:4px;width:100%;">Create Persona</button>
+                </div>
+            </details>
+        </div>
+
+        <div class="config-section">
             <h4>Context &amp; Compaction</h4>
             <div id="compaction-status" style="font-size: 12px; color: var(--text-dim);">Loading...</div>
         </div>
@@ -1419,6 +1438,8 @@
 
         async function switchSession(id) {
             state.currentSession = id;
+            // Tell backend to activate this session
+            await apiPost('/api/sessions/switch', { id: id }).catch(() => {});
             renderSessions();
             resetTokenTotals();
             await loadSessionMessages(id);
@@ -1503,16 +1524,17 @@
             updateTokenDisplay();
         }
 
-        function addTokens(input, output) {
-            const prev = state.lastRequest ? state.lastRequest.input : 0;
+        function addTokens(input, output, context) {
+            const prev = state.lastRequest ? state.lastRequest.context || state.lastRequest.input : 0;
             state.tokenTotals.input += (input || 0);
             state.tokenTotals.output += (output || 0);
             state.tokenTotals.messages++;
-            state.lastRequest = { input: input || 0, output: output || 0 };
+            state.lastRequest = { input: input || 0, output: output || 0, context: context || input || 0 };
 
-            // Detect compaction: input tokens dropped significantly
-            if (prev > 0 && input > 0 && input < prev * 0.5) {
-                showCompactionNotice(prev, input);
+            // Detect compaction: context window dropped significantly
+            const ctx = context || input || 0;
+            if (prev > 0 && ctx > 0 && ctx < prev * 0.5) {
+                showCompactionNotice(prev, ctx);
             }
 
             updateTokenDisplay();
@@ -1528,17 +1550,18 @@
         }
 
         function updateTokenDisplay() {
-            // Show last request tokens in footer (more useful than cumulative)
-            const last = state.lastRequest || { input: 0, output: 0 };
+            const last = state.lastRequest || { input: 0, output: 0, context: 0 };
+            const ctx = last.context || last.input;
+            // Primary: context window size (what matters). Secondary: cumulative cost.
             dom.tokenCounter.textContent =
-                formatTokens(last.input) + ' in / ' +
+                formatTokens(ctx) + ' ctx / ' +
                 formatTokens(last.output) + ' out' +
                 (state.tokenTotals.messages > 1 ? ' (' + formatTokens(state.tokenTotals.input) + ' total)' : '');
 
-            document.getElementById('cfg-input-tokens').textContent = formatTokens(last.input) + ' (last)';
+            document.getElementById('cfg-input-tokens').textContent = formatTokens(ctx) + ' context window';
             document.getElementById('cfg-output-tokens').textContent = formatTokens(last.output) + ' (last)';
             document.getElementById('cfg-msg-count').textContent = state.tokenTotals.messages;
-            document.getElementById('cfg-total-tokens').textContent = formatTokens(state.tokenTotals.input + state.tokenTotals.output);
+            document.getElementById('cfg-total-tokens').textContent = formatTokens(state.tokenTotals.input + state.tokenTotals.output) + ' cumulative';
         }
 
         async function loadCompactionStatus() {
@@ -1948,7 +1971,7 @@
                                 case 'done':
                                     state.lastModel = event.model;
                                     finalizeStreamingMessage(msgEl, event.model, event.input_tokens, event.output_tokens);
-                                    addTokens(event.input_tokens, event.output_tokens);
+                                    addTokens(event.input_tokens, event.output_tokens, event.context_tokens);
                                     break;
                                 case 'error':
                                     const contentEl = msgEl.querySelector('.msg-content');
@@ -2014,12 +2037,12 @@
                     appendMessage('assistant', 'Error: ' + data.error);
                 } else {
                     state.lastModel = data.model;
-                    const tokens = data.usage ? { input: data.usage.input_tokens, output: data.usage.output_tokens } : null;
+                    const tokens = data.usage ? { input: data.usage.input_tokens, output: data.usage.output_tokens, context: data.usage.context_tokens } : null;
                     appendMessage('assistant', data.text || '(No response)', {
                         tokens: tokens,
                         model: data.model,
                     });
-                    if (tokens) addTokens(tokens.input, tokens.output);
+                    if (tokens) addTokens(tokens.input, tokens.output, tokens.context);
                 }
             } catch (e) {
                 loadEl.remove();
@@ -2084,13 +2107,18 @@
         /* ============================
            New Session
            ============================ */
-        function newSession() {
-            state.currentSession = null;
-            dom.messagesEl.innerHTML = '';
-            showEmptyState();
-            resetTokenTotals();
-            renderSessions();
-            dom.input.focus();
+        async function newSession() {
+            try {
+                const data = await apiPost('/api/sessions/new', { name: null });
+                state.currentSession = data.id || null;
+                dom.messagesEl.innerHTML = '';
+                showEmptyState();
+                resetTokenTotals();
+                await loadSessions();
+                dom.input.focus();
+            } catch (e) {
+                console.error('Failed to create session:', e);
+            }
         }
 
         /* ============================
@@ -2102,12 +2130,78 @@
             loadStatus();
             loadCompactionStatus();
             loadSkills();
+            loadPersona();
         }
 
         function closeConfig() {
             dom.configPanel.classList.remove('open');
             dom.configOverlay.classList.remove('open');
         }
+
+        /* ============================
+           Persona Selector (config panel)
+           ============================ */
+        async function loadPersona() {
+            const select = document.getElementById('persona-select');
+            const status = document.getElementById('persona-status');
+            try {
+                const data = await apiGet('/api/persona');
+                select.innerHTML = '';
+                for (const name of (data.personas || ['default'])) {
+                    const opt = document.createElement('option');
+                    opt.value = name;
+                    opt.textContent = name;
+                    if (name === (data.active || 'default')) opt.selected = true;
+                    select.appendChild(opt);
+                }
+                status.textContent = 'Active: ' + (data.active || 'default');
+            } catch (e) {
+                status.textContent = 'Failed to load personas';
+            }
+        }
+
+        document.getElementById('persona-select').addEventListener('change', async (e) => {
+            const status = document.getElementById('persona-status');
+            try {
+                await apiPost('/api/persona', { action: 'select', name: e.target.value });
+                status.textContent = 'Switched to: ' + e.target.value;
+            } catch (err) {
+                status.textContent = 'Error switching: ' + err.message;
+            }
+        });
+
+        document.getElementById('persona-create-btn').addEventListener('click', async () => {
+            const name = document.getElementById('persona-new-name').value.trim();
+            const content = document.getElementById('persona-new-content').value.trim();
+            const status = document.getElementById('persona-status');
+            if (!name || !content) { status.textContent = 'Need both name and content'; return; }
+            try {
+                await apiPost('/api/persona', { action: 'create', name, content });
+                document.getElementById('persona-new-name').value = '';
+                document.getElementById('persona-new-content').value = '';
+                document.getElementById('persona-create-section').removeAttribute('open');
+                status.textContent = 'Created: ' + name;
+                await loadPersona();
+            } catch (e) {
+                status.textContent = 'Error: ' + e.message;
+            }
+        });
+
+        document.getElementById('persona-delete-btn').addEventListener('click', async () => {
+            const select = document.getElementById('persona-select');
+            const name = select.value;
+            const status = document.getElementById('persona-status');
+            if (name === 'default') { status.textContent = 'Cannot delete default'; return; }
+            if (!confirm('Delete persona "' + name + '"?')) return;
+            try {
+                await apiPost('/api/persona', { action: 'delete', name });
+                await apiPost('/api/persona', { action: 'select', name: 'default' });
+                status.textContent = 'Deleted: ' + name;
+                await loadPersona();
+            } catch (e) {
+                status.textContent = 'Error: ' + e.message;
+            }
+        });
 
         /* ============================
            Tools List (config panel)
