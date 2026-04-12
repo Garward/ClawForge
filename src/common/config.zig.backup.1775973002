@@ -109,7 +109,6 @@ pub const Config = struct {
     routing: RoutingConfig,
     ollama: OllamaConfig,
     openai: OpenAIConfig,
-    discord: DiscordConfig,
     context: ContextConfig,
     _parsed: ?json.Parsed(ConfigData),
 
@@ -124,7 +123,6 @@ pub const Config = struct {
             .routing = .{},
             .ollama = .{},
             .openai = .{},
-            .discord = .{},
             .context = .{},
             ._parsed = null,
         };
@@ -168,7 +166,6 @@ pub const Config = struct {
             .routing = parsed.value.routing,
             .ollama = parsed.value.ollama,
             .openai = parsed.value.openai,
-            .discord = parsed.value.discord,
             .context = parsed.value.context,
             ._parsed = parsed,
         };

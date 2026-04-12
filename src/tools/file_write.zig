@@ -6,7 +6,8 @@ pub const definition = registry.ToolDefinition{
     .name = "file_write",
     .description = "Create or overwrite a file. Use this instead of bash for ALL file creation. " ++
         "For editing existing files, prefer file_diff (targeted changes with backup). " ++
-        "Set force=true to overwrite existing files. Creates automatic backups.",
+        "Set force=true to overwrite existing files after reading them first. Creates automatic backups. " ++
+        "Do not use this to guess edits to an existing file you have not reread.",
     .input_schema_json =
     \\{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to write to"},"content":{"type":"string","description":"Content to write to the file"},"force":{"type":"boolean","description":"Required to overwrite existing files. Use file_read first to see current content.","default":false}},"required":["path","content"]}
     ,
@@ -63,8 +64,10 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
     if (existed_before and !force) {
         const error_msg = std.fmt.allocPrint(
             allocator,
-            \\File '{s}' already exists.
-            \\Use file_read first, then rerun file_write with force=true to confirm overwrite.
+            \\FILE WRITE BLOCKED
+            \\Path: {s}
+            \\Reason: file already exists and force=false
+            \\Action: use file_read first, then rerun with force=true to confirm overwrite.
             \\
             \\Example:
             \\  file_read("{s}")
@@ -97,17 +100,26 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
     const success_msg = if (backup_path) |bp|
         std.fmt.allocPrint(
             allocator,
-            "Successfully wrote {d} bytes to {s}\nBackup created: {s}",
-            .{ content.len, path, bp },
+            "FILE WRITE APPLIED\nPath: {s}\nAction: overwrite\nBytes written: {d}\nBackup: {s}\n\nPreview:\n{s}",
+            .{ path, content.len, bp, previewText(content, 320) },
         ) catch "File written successfully"
     else
         std.fmt.allocPrint(
             allocator,
-            "Successfully created new file {s} with {d} bytes",
-            .{ path, content.len },
+            "FILE WRITE APPLIED\nPath: {s}\nAction: create\nBytes written: {d}\n\nPreview:\n{s}",
+            .{ path, content.len, previewText(content, 320) },
         ) catch "File written successfully";
 
-    return .{ .content = success_msg, .is_error = false };
+    return .{
+        .content = success_msg,
+        .model_content = registry.compactForModel(allocator, "file_write result", success_msg, 1200, 600),
+        .is_error = false,
+    };
+}
+
+fn previewText(text: []const u8, max_len: usize) []const u8 {
+    if (text.len <= max_len) return text;
+    return text[0..max_len];
 }
 
 fn fileExists(path: []const u8) bool {

@@ -250,12 +250,15 @@ pub fn main() !void {
 
     // Initialize Discord adapter (secondary — runs on spawned thread)
     if (config.discord.enabled) {
-        var da = try adapters.DiscordAdapter.init(allocator, &config, &engine);
+        var da = adapters.DiscordAdapter.init(allocator, &config, &engine) catch |err| {
+            std.log.err("Failed to initialize Discord adapter: {}", .{err});
+            return;
+        };
         da.adapter().start() catch |err| {
             std.log.err("Failed to start Discord adapter: {}", .{err});
         };
 
-        if (da.running.load(.acquire)) {
+        if (da.running.load(.Acquire)) {
             discord = da;
             adapters.registerAdapter(&database.conn, da.adapter());
             if (std.Thread.spawn(.{}, runDiscordAdapter, .{&discord.?})) |thread| {
@@ -286,7 +289,7 @@ pub fn main() !void {
         fn handle(_: c_int) callconv(std.builtin.CallingConvention.c) void {
             if (cli_ptr) |c| c.running = false;
             if (web_ptr) |w| w.running = false;
-            if (discord_ptr) |d| d.running.store(false, .release);
+            if (discord_ptr) |d| d.running.store(false, .Release);
         }
     };
     handler_fn.cli_ptr = &cli;

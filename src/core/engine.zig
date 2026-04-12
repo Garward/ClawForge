@@ -35,6 +35,8 @@ pub const Engine = struct {
     // Streaming state tracking
     is_streaming: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pending_compaction: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // Tracks files read via file_read this conversation turn — enforces read-before-write
+    files_read_this_turn: std.StringHashMap(void) = undefined,
     start_time: i64,
 
     pub fn init(
@@ -70,6 +72,7 @@ pub const Engine = struct {
             .tool_generator = null,
             .router = router_mod.Router.init(&config.routing),
             .optimization_manager = null,
+            .files_read_this_turn = std.StringHashMap(void).init(allocator),
             .start_time = std.time.timestamp(),
         };
     }
@@ -252,8 +255,69 @@ pub const Engine = struct {
             }
         }
 
+        // Enforce read-before-write: file_diff and file_write (force=true on existing) require prior file_read
+        if (std.mem.eql(u8, name, "file_diff") or std.mem.eql(u8, name, "file_write")) {
+            if (input == .object) {
+                if (input.object.get("path")) |p| {
+                    if (p == .string) {
+                        const file_path = self.normalizeToolPath(p.string);
+                        defer if (file_path.ptr != p.string.ptr) self.allocator.free(@constCast(file_path));
+
+                        const needs_read = if (std.mem.eql(u8, name, "file_diff")) blk: {
+                            const create = if (input.object.get("create_if_missing")) |c| (c == .bool and c.bool) else false;
+                            if (create) {
+                                std.fs.accessAbsolute(file_path, .{}) catch break :blk false;
+                                break :blk true;
+                            }
+                            break :blk true;
+                        } else blk: {
+                            const force = if (input.object.get("force")) |f| (f == .bool and f.bool) else false;
+                            if (!force) break :blk false;
+                            break :blk true;
+                        };
+
+                        if (needs_read and !self.files_read_this_turn.contains(file_path)) {
+                            return .{
+                                .content = std.fmt.allocPrint(
+                                    self.allocator,
+                                    "BLOCKED: You must file_read(\"{s}\") before modifying it. " ++
+                                        "Never edit files from memory — always read first to see the current content.",
+                                    .{file_path},
+                                ) catch "BLOCKED: file_read required before editing. Read the file first.",
+                                .is_error = true,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
         const result = self.tool_registry.execute(name, input) orelse
             return .{ .content = TOOL_NOT_FOUND_MSG, .is_error = true };
+
+        // Track successful file reads (normalized path so ~/foo and /home/.../foo match)
+        if (!result.is_error and std.mem.eql(u8, name, "file_read")) {
+            if (input == .object) {
+                if (input.object.get("path")) |p| {
+                    if (p == .string) {
+                        const norm = self.normalizeToolPath(p.string);
+                        if (!self.files_read_this_turn.contains(norm)) {
+                            // If normalizeToolPath returned the original string, dupe it for ownership
+                            const owned = if (norm.ptr == p.string.ptr)
+                                (self.allocator.dupe(u8, norm) catch return result)
+                            else
+                                @as([]u8, @constCast(norm));
+                            self.files_read_this_turn.put(owned, {}) catch {
+                                self.allocator.free(owned);
+                            };
+                        } else {
+                            // Already tracked, free the normalized copy if it was allocated
+                            if (norm.ptr != p.string.ptr) self.allocator.free(@constCast(norm));
+                        }
+                    }
+                }
+            }
+        }
 
         // Cache successful results
         if (!result.is_error) {
@@ -273,6 +337,15 @@ pub const Engine = struct {
         }
 
         return result;
+    }
+
+    /// Expand ~ to $HOME so read-tracking matches regardless of which form the model uses.
+    fn normalizeToolPath(self: *Engine, raw: []const u8) []const u8 {
+        if (raw.len > 0 and raw[0] == '~') {
+            const home = std.posix.getenv("HOME") orelse return raw;
+            return std.fmt.allocPrint(self.allocator, "{s}{s}", .{ home, raw[1..] }) catch raw;
+        }
+        return raw;
     }
 
     /// Check if a tool requires confirmation.
@@ -575,6 +648,13 @@ pub const Engine = struct {
     // ================================================================
 
     fn processChat(self: *Engine, chat_req: common.Request.ChatRequest, emitter: ?StreamEmitter, confirmer: ?ToolConfirmCallback) Result {
+        // Reset read-tracking for this conversation turn (free duped keys)
+        {
+            var it = self.files_read_this_turn.keyIterator();
+            while (it.next()) |key| self.allocator.free(@constCast(key.*));
+            self.files_read_this_turn.clearRetainingCapacity();
+        }
+
         // Get or create session
         var sess = self.session_store.getActiveSession() orelse blk: {
             break :blk self.session_store.createSession(null) catch {
@@ -887,8 +967,8 @@ pub const Engine = struct {
 
                 // Compact older tool_result blocks to prevent unbounded growth.
                 // Keep last 3 rounds (6 messages) at full size.
-                // Older results get a meaningful summary (first 500 chars) instead of full content,
-                // so the model retains enough context to make targeted fixes.
+                // Older results keep both the beginning and the end so paths and the
+                // actual trailing compiler/runtime errors remain visible to the model.
                 if (extended.len > 8) {
                     const keep_full_from = if (extended.len > 6) extended.len - 6 else 0;
                     for (extended[0..keep_full_from]) |*msg| {
@@ -898,13 +978,17 @@ pub const Engine = struct {
                             switch (block.*) {
                                 .tool_result => |tr| {
                                     if (tr.content.len > 600) {
-                                        // Keep a meaningful head excerpt so the model
-                                        // can still see file paths, error messages, etc.
-                                        const head_len = @min(tr.content.len, 500);
+                                        const head_len = @min(tr.content.len, 320);
+                                        const tail_len = @min(tr.content.len - head_len, 220);
+                                        const omitted = tr.content.len - head_len - tail_len;
                                         const summary = std.fmt.allocPrint(
                                             self.allocator,
-                                            "{s}\n\n[...truncated {d} more chars]",
-                                            .{ tr.content[0..head_len], tr.content.len - head_len },
+                                            "{s}\n\n[...truncated {d} chars...]\n\n{s}",
+                                            .{
+                                                tr.content[0..head_len],
+                                                omitted,
+                                                tr.content[tr.content.len - tail_len ..],
+                                            },
                                         ) catch continue;
                                         block.* = .{ .tool_result = .{
                                             .tool_use_id = tr.tool_use_id,
@@ -924,6 +1008,9 @@ pub const Engine = struct {
                 if (current_request.tools) |defs| {
                     owned_tool_defs.append(self.allocator, defs) catch {};
                 }
+                // Keep persona/system flavor on the initial user-facing round only.
+                // Intermediate tool-work rounds should focus on the task state, not chat style.
+                current_request.system = null;
                 // Keep streaming enabled so tool use progress is visible to the user.
                 // current_request.stream stays as-is (true if emitter present).
             }
@@ -935,6 +1022,7 @@ pub const Engine = struct {
             std.log.info("Tool loop exhausted without text — forcing final summary call", .{});
             var final_req = current_request;
             final_req.tools = null; // No tools → model must respond with text
+            final_req.system = system_prompt; // Reapply persona/system prompt for the final user-facing response.
             if (self.provider.createMessage(&final_req)) |final_resp| {
                 if (final_resp.arena) |a| {
                     response_arenas.append(self.allocator, a) catch {};

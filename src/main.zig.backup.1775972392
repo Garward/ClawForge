@@ -1,0 +1,242 @@
+const std = @import("std");
+const common = @import("common");
+const api = @import("api");
+const tools = @import("tools");
+const storage = @import("storage");
+const core = @import("core");
+const workers = @import("workers");
+const adapters = @import("adapters");
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{
+        .retain_metadata = true,
+        .safety = true,
+    }){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    std.log.info("ClawForge daemon starting...", .{});
+
+    // Parse command line for socket path
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    const socket_path: ?[]const u8 = if (args.len > 1) args[1] else null;
+
+    // ================================================================
+    // CONFIGURATION — full config + path validation
+    // ================================================================
+
+    var config = common.Config.init(allocator);
+    defer config.deinit();
+    try config.load(); // Load from standard paths
+
+    // Add path validation
+    try config.validatePaths();
+
+    // Pretty-print the startup config (not dumping the whole thing)
+    std.log.info("Config loaded:", .{});
+    std.log.info("  Data path: {s}", .{config.data_path});
+    if (config.log_file) |log| std.log.info("  Log file: {s}", .{log});
+    std.log.info("  Adapters: CLI={}, Web={}", .{ config.cli.enabled, config.web.enabled });
+
+    // ================================================================
+    // DATABASE + STORAGE — persistent conversation state
+    // ================================================================
+
+    var database = storage.Database.init(allocator, config.db_path);
+    defer database.deinit();
+    try database.connect();
+
+    var message_store = storage.MessageStore.init(allocator, &database);
+    defer message_store.deinit();
+
+    std.log.info("Database connected: {s}", .{database.db_path});
+    std.log.info("Storage layer initialized", .{});
+
+    // ================================================================
+    // WORKER POOL — thread pool for DB/file operations
+    // ================================================================
+
+    var worker_pool = workers.WorkerPool.init(allocator, &database, 3);
+    defer worker_pool.deinit();
+
+    // ================================================================
+    // TOOL SYSTEM — dynamic tool registry + execution engine
+    // ================================================================
+
+    var tool_gen = tools.ToolGenerator.init(allocator, &config);
+    defer tool_gen.deinit();
+
+    std.log.info("Tool definitions generated: {} tools available", .{tool_gen.definitions.items.len});
+
+    // ================================================================
+    // CORE ENGINE — conversation engine with tool/memory integration
+    // ================================================================
+
+    var engine = core.Engine.init(allocator, &config, &message_store);
+    defer engine.deinit();
+    engine.setWorkerPool(&worker_pool);
+    worker_pool.start();
+    engine.setToolGenerator(&tool_gen);
+
+    // Optimization manager — file cache, result cache, batch processor, context pruner
+    var opt_manager = core.optimization.OptimizationManager.init(allocator, &message_store);
+    defer opt_manager.deinit();
+    engine.setOptimizationManager(&opt_manager);
+    std.log.info("Worker pool started (3 threads, per-thread DB connections)", .{});
+
+    // ================================================================
+    // ADAPTER SYSTEM — each adapter runs in its own thread
+    // ================================================================
+
+    // Ensure adapter registry table exists
+    adapters.ensureRegistryTable(&database.conn);
+
+    // CLI Socket Adapter (primary — runs on main thread)
+    var cli = adapters.CliAdapter.init(allocator, &config, &engine, socket_path);
+    defer cli.deinit();
+    const cli_adapter = cli.adapter();
+    try cli_adapter.start();
+    adapters.registerAdapter(&database.conn, cli_adapter);
+
+    // Web Adapter (secondary — runs on spawned thread)
+    var web: ?adapters.WebAdapter = null;
+    var web_thread: ?std.Thread = null;
+
+    if (config.web.enabled) {
+        var wa = adapters.WebAdapter.init(allocator, &config, &engine);
+        wa.adapter().start() catch |err| {
+            std.log.err("Failed to start web adapter: {}", .{err});
+        };
+
+        if (wa.running) {
+            web = wa;
+            adapters.registerAdapter(&database.conn, wa.adapter());
+            if (std.Thread.spawn(.{}, runAdapter, .{&web.?})) |thread| {
+                web_thread = thread;
+            } else |err| {
+                std.log.err("Failed to spawn web adapter thread: {}", .{err});
+                web.?.adapter().stop();
+                web = null;
+            }
+        }
+    }
+
+    // Discord Adapter (tertiary — runs on spawned thread)
+    var discord: ?adapters.DiscordAdapter = null;
+    var discord_thread: ?std.Thread = null;
+
+    // Check if Discord is enabled via environment variable
+    const discord_enabled = std.process.hasEnvVarConstant("DISCORD_TOKEN");
+    
+    if (discord_enabled) {
+        std.log.info("Discord token found, initializing Discord adapter...", .{});
+        
+        var da = adapters.DiscordAdapter.init(allocator, &config, &engine) catch |err| {
+            std.log.err("Failed to initialize Discord adapter: {}", .{err});
+            da = null;
+        };
+        
+        if (da) |*discord_adapter| {
+            discord_adapter.start() catch |err| {
+                std.log.err("Failed to start Discord adapter: {}", .{err});
+                discord_adapter.deinit();
+                da = null;
+            };
+            
+            if (da != null) {
+                discord = da;
+                // Note: Discord adapter doesn't use the Adapter interface yet, so we can't register it
+                // TODO: Update Discord adapter to properly implement Adapter interface
+                
+                if (std.Thread.spawn(.{}, runDiscordAdapter, .{&discord.?})) |thread| {
+                    discord_thread = thread;
+                    std.log.info("Discord adapter started successfully", .{});
+                } else |err| {
+                    std.log.err("Failed to spawn Discord adapter thread: {}", .{err});
+                    discord.?.stop();
+                    discord.?.deinit();
+                    discord = null;
+                }
+            }
+        }
+    } else {
+        std.log.info("Discord adapter disabled (no DISCORD_TOKEN environment variable)", .{});
+    }
+
+    defer {
+        // Stop worker pool first (drain queues before DB closes)
+        // worker_pool.stop();
+        if (web) |*wa| wa.adapter().stop();
+        if (web_thread) |t| t.join();
+        
+        if (discord) |*da| {
+            da.stop();
+            da.deinit();
+        }
+        if (discord_thread) |t| t.join();
+    }
+
+    // Signal handling — stops all adapters
+    const handler_fn = struct {
+        var cli_ptr: ?*adapters.CliAdapter = null;
+        var web_ptr: ?*adapters.WebAdapter = null;
+        var discord_ptr: ?*adapters.DiscordAdapter = null;
+
+        fn handle(_: c_int) callconv(std.builtin.CallingConvention.c) void {
+            if (cli_ptr) |c| c.running = false;
+            if (web_ptr) |w| w.running = false;
+            if (discord_ptr) |d| d.running.store(false, .release);
+        }
+    };
+    handler_fn.cli_ptr = &cli;
+    if (web) |*wa| handler_fn.web_ptr = wa;
+    if (discord) |*da| handler_fn.discord_ptr = da;
+
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = handler_fn.handle },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+
+    try std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    try std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+
+    std.log.info("ClawForge daemon ready! Adapters active:", .{});
+    std.log.info("  CLI: {} (socket: {s})", .{ cli.running, cli.socket_path orelse "default" });
+    if (web) |*wa| std.log.info("  Web: {} (port: {})", .{ wa.running, config.web.port });
+    if (discord) |*da| std.log.info("  Discord: {}", .{da.running.load(.acquire)});
+
+    // Main event loop
+    var stop_requested = false;
+    while (cli.running and !stop_requested) {
+        stop_requested = cli.poll() catch |err| blk: {
+            std.log.err("CLI adapter error: {}", .{err});
+            break :blk true; // Exit on error
+        };
+
+        // Give other threads time to process
+        std.time.sleep(10 * std.time.ns_per_ms);
+    }
+
+    std.log.info("ClawForge daemon shutting down...", .{});
+}
+
+/// Helper function to run an adapter (generic wrapper)
+fn runAdapter(adapter: *adapters.WebAdapter) void {
+    // Web adapters manage their own lifecycle
+    while (adapter.running) {
+        std.time.sleep(100 * std.time.ns_per_ms);
+    }
+    std.log.info("Web adapter thread exiting", .{});
+}
+
+/// Helper function to run Discord adapter
+fn runDiscordAdapter(adapter: *adapters.DiscordAdapter) void {
+    // Discord adapter manages its own lifecycle
+    while (adapter.running.load(.acquire)) {
+        std.time.sleep(100 * std.time.ns_per_ms);
+    }
+    std.log.info("Discord adapter thread exiting", .{});
+}

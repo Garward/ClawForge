@@ -5,7 +5,9 @@ const registry = @import("registry.zig");
 pub const definition = registry.ToolDefinition{
     .name = "bash",
     .description = "Execute a shell command. For running builds, git, ls, grep, and system utilities ONLY. " ++
-        "Do NOT use for reading files (use file_read), writing files (use file_write), or editing files (use file_diff). " ++
+        "Use dedicated tools first for code understanding and modification: file_read for reading, file_diff for edits, file_write for new files, zig_test for compiler diagnostics. " ++
+        "Use bash for builds, searches, git, and system utilities when a dedicated tool does not fit. " ++
+        "Do NOT use bash as a substitute for normal file reading or file editing. " ++
         "File write commands (cat >, echo >, sed -i) are blocked — use the dedicated file tools instead.",
     .input_schema_json =
     \\{"type":"object","properties":{"command":{"type":"string","description":"The bash command to execute"}},"required":["command"]}
@@ -45,15 +47,19 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
         };
     }
 
-    // Block cat/echo/tee file writing — use file_write or file_diff tools instead
+    // Block file-writing bash patterns — use file_write or file_diff tools instead
     if ((std.mem.indexOf(u8, command, "cat >") != null or
         std.mem.indexOf(u8, command, "cat >>") != null or
+        std.mem.indexOf(u8, command, "cat <<") != null or
         std.mem.indexOf(u8, command, "echo >") != null or
-        std.mem.indexOf(u8, command, "tee ") != null) and
+        std.mem.indexOf(u8, command, "printf >") != null or
+        std.mem.indexOf(u8, command, "printf >>") != null or
+        std.mem.indexOf(u8, command, "tee ") != null or
+        std.mem.indexOf(u8, command, "dd of=") != null) and
         std.mem.indexOf(u8, command, "/dev/null") == null)
     {
         return .{
-            .content = "BLOCKED: Use the file_write tool to create files or file_diff tool to edit them. Writing files through bash heredocs causes encoding corruption. The file_write tool handles content cleanly and file_diff creates automatic backups.",
+            .content = "BLOCKED: Use the file_write tool to create files or file_diff tool to edit them. Writing files through bash causes encoding corruption. The file_write tool handles content cleanly and file_diff creates automatic backups.",
             .is_error = true,
         };
     }

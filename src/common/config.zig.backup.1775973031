@@ -168,7 +168,6 @@ pub const Config = struct {
             .routing = parsed.value.routing,
             .ollama = parsed.value.ollama,
             .openai = parsed.value.openai,
-            .discord = parsed.value.discord,
             .context = parsed.value.context,
             ._parsed = parsed,
         };

@@ -255,7 +255,7 @@ pub fn main() !void {
             std.log.err("Failed to start Discord adapter: {}", .{err});
         };
 
-        if (da.running.load(.acquire)) {
+        if (da.running.load(.Acquire)) {
             discord = da;
             adapters.registerAdapter(&database.conn, da.adapter());
             if (std.Thread.spawn(.{}, runDiscordAdapter, .{&discord.?})) |thread| {
@@ -286,7 +286,7 @@ pub fn main() !void {
         fn handle(_: c_int) callconv(std.builtin.CallingConvention.c) void {
             if (cli_ptr) |c| c.running = false;
             if (web_ptr) |w| w.running = false;
-            if (discord_ptr) |d| d.running.store(false, .release);
+            if (discord_ptr) |d| d.running.store(false, .Release);
         }
     };
     handler_fn.cli_ptr = &cli;

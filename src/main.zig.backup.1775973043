@@ -248,50 +248,25 @@ pub fn main() !void {
         }
     }
 
-    // Initialize Discord adapter (secondary — runs on spawned thread)
-    if (config.discord.enabled) {
-        var da = try adapters.DiscordAdapter.init(allocator, &config, &engine);
-        da.adapter().start() catch |err| {
-            std.log.err("Failed to start Discord adapter: {}", .{err});
-        };
-
-        if (da.running.load(.acquire)) {
-            discord = da;
-            adapters.registerAdapter(&database.conn, da.adapter());
-            if (std.Thread.spawn(.{}, runDiscordAdapter, .{&discord.?})) |thread| {
-                discord_thread = thread;
-            } else |err| {
-                std.log.err("Failed to spawn Discord adapter thread: {}", .{err});
-                discord.?.adapter().stop();
-                discord = null;
-            }
-        }
-    }
-
     defer {
         // Stop worker pool first (drain queues before DB closes)
         // worker_pool.stop();
         if (web) |*wa| wa.adapter().stop();
         if (web_thread) |t| t.join();
-        if (discord) |*da| da.adapter().stop();
-        if (discord_thread) |t| t.join();
     }
 
     // Signal handling — stops all adapters
     const handler_fn = struct {
         var cli_ptr: ?*adapters.CliAdapter = null;
         var web_ptr: ?*adapters.WebAdapter = null;
-        var discord_ptr: ?*adapters.DiscordAdapter = null;
 
         fn handle(_: c_int) callconv(std.builtin.CallingConvention.c) void {
             if (cli_ptr) |c| c.running = false;
             if (web_ptr) |w| w.running = false;
-            if (discord_ptr) |d| d.running.store(false, .release);
         }
     };
     handler_fn.cli_ptr = &cli;
     if (web) |*wa| handler_fn.web_ptr = wa;
-    if (discord) |*da| handler_fn.discord_ptr = da;
 
     const act = std.posix.Sigaction{
         .handler = .{ .handler = handler_fn.handle },
@@ -315,8 +290,4 @@ pub fn main() !void {
 
 fn runAdapter(wa: *adapters.WebAdapter) void {
     wa.adapter().run();
-}
-
-fn runDiscordAdapter(da: *adapters.DiscordAdapter) void {
-    da.adapter().run();
 }

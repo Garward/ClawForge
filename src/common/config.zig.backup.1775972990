@@ -76,13 +76,6 @@ pub const OpenAIConfig = struct {
     default_model: []const u8 = "gpt-4o-mini",
 };
 
-pub const DiscordConfig = struct {
-    enabled: bool = false,
-    token_file: []const u8 = "",
-    guild_id: []const u8 = "",
-    channel_id: []const u8 = "",
-};
-
 /// Inner config data that can be JSON parsed
 const ConfigData = struct {
     api: ApiConfig = .{},
@@ -94,7 +87,6 @@ const ConfigData = struct {
     routing: RoutingConfig = .{},
     ollama: OllamaConfig = .{},
     openai: OpenAIConfig = .{},
-    discord: DiscordConfig = .{},
     context: ContextConfig = .{},
 };
 
@@ -109,7 +101,6 @@ pub const Config = struct {
     routing: RoutingConfig,
     ollama: OllamaConfig,
     openai: OpenAIConfig,
-    discord: DiscordConfig,
     context: ContextConfig,
     _parsed: ?json.Parsed(ConfigData),
 
@@ -124,7 +115,6 @@ pub const Config = struct {
             .routing = .{},
             .ollama = .{},
             .openai = .{},
-            .discord = .{},
             .context = .{},
             ._parsed = null,
         };
@@ -168,7 +158,6 @@ pub const Config = struct {
             .routing = parsed.value.routing,
             .ollama = parsed.value.ollama,
             .openai = parsed.value.openai,
-            .discord = parsed.value.discord,
             .context = parsed.value.context,
             ._parsed = parsed,
         };

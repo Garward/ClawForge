@@ -4,15 +4,19 @@ const registry = @import("registry.zig");
 
 pub const definition = registry.ToolDefinition{
     .name = "zig_test",
-    .description = "Test Zig code for compilation errors BEFORE rebuilding. ALWAYS use this before the rebuild tool. " ++
-        "Modes: 'build' (recommended — runs full project build check), 'ast-check' (syntax only for single file). " ++
-        "Usage: {\"mode\":\"build\"} to verify the full project compiles. If it fails, fix errors before calling rebuild.",
+    .description = "Run Zig compiler checks and return the actual diagnostics. " ++
+        "Use mode='build' for full-project compiler errors before rebuild. " ++
+        "Use mode='ast-check' for a single-file syntax check. " ++
+        "After a failure, reread the cited file and nearby lines before attempting another edit. " ++
+        "Do not retry the same patch without checking the current file state.",
     .input_schema_json =
-        \\{"type":"object","properties":{"mode":{"type":"string","enum":["build","ast-check"],"default":"build","description":"build = full project compile check, ast-check = single file syntax"},"path":{"type":"string","description":"File path (only for ast-check mode)"}}}
+    \\{"type":"object","properties":{"mode":{"type":"string","enum":["build","ast-check"],"default":"build","description":"build = full project compile check, ast-check = syntax check for one file"},"path":{"type":"string","description":"Absolute file path required for ast-check mode"}},"additionalProperties":false}
     ,
     .requires_confirmation = false,
     .handler = &execute,
 };
+
+const project_root = "/home/garward/Scripts/Tools/ClawForge";
 
 fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult {
     const mode = blk: {
@@ -25,31 +29,20 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
     };
 
     if (std.mem.eql(u8, mode, "build")) {
-        // Full project build check — the only reliable way to catch cross-module errors
         const result = std.process.Child.run(.{
             .allocator = allocator,
-            .argv = &.{ "/usr/bin/timeout", "60", "zig", "build" },
-            .max_output_bytes = 256 * 1024,
-            .cwd = "/home/garward/Scripts/Tools/ClawForge",
+            .argv = &.{ "/usr/bin/timeout", "90", "zig", "build" },
+            .max_output_bytes = 512 * 1024,
+            .cwd = project_root,
         }) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "Build check failed to run: {s}", .{@errorName(err)}) catch
-                return .{ .content = "Build check failed", .is_error = true };
+            const msg = std.fmt.allocPrint(allocator, "Failed to run zig build: {s}", .{@errorName(err)}) catch
+                return .{ .content = "Failed to run zig build", .is_error = true };
             return .{ .content = msg, .is_error = true };
         };
 
-        if (result.stderr.len > 0) allocator.free(result.stderr);
-
-        if (result.term.Exited == 0) {
-            return .{ .content = "BUILD OK — safe to call rebuild tool", .is_error = false };
-        } else {
-            var out: std.ArrayList(u8) = .{};
-            out.appendSlice(allocator, "BUILD FAILED — DO NOT rebuild. Fix these errors first:\n\n") catch {};
-            out.appendSlice(allocator, if (result.stdout.len > 0) result.stdout else "(no output)") catch {};
-            return .{ .content = out.toOwnedSlice(allocator) catch "Build failed", .is_error = true };
-        }
+        return formatCompilerResult(allocator, "build", null, result);
     }
 
-    // ast-check mode — single file syntax check
     const raw_path = blk: {
         if (input == .object) {
             if (input.object.get("path")) |p| {
@@ -59,55 +52,104 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
         return .{ .content = "ast-check mode requires 'path' parameter", .is_error = true };
     };
 
+    var owned_path: ?[]u8 = null;
+    defer if (owned_path) |p| allocator.free(p);
+
     const path = if (raw_path.len > 0 and raw_path[0] == '~') blk: {
         const home = std.posix.getenv("HOME") orelse "/tmp";
-        break :blk std.fmt.allocPrint(allocator, "{s}{s}", .{ home, raw_path[1..] }) catch
+        const expanded = std.fmt.allocPrint(allocator, "{s}{s}", .{ home, raw_path[1..] }) catch
             return .{ .content = "Path expansion failed", .is_error = true };
+        owned_path = expanded;
+        break :blk expanded;
     } else raw_path;
 
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "zig", "ast-check", path },
+        .argv = &.{ "/usr/bin/timeout", "30", "zig", "ast-check", path },
         .max_output_bytes = 256 * 1024,
     }) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Failed to run zig: {s}", .{@errorName(err)}) catch
-            return .{ .content = "Process execution failed", .is_error = true };
+        const msg = std.fmt.allocPrint(allocator, "Failed to run zig ast-check: {s}", .{@errorName(err)}) catch
+            return .{ .content = "Failed to run zig ast-check", .is_error = true };
         return .{ .content = msg, .is_error = true };
     };
 
-    var output: std.ArrayList(u8) = .{};
-    defer output.deinit(allocator);
+    return formatCompilerResult(allocator, "ast-check", path, result);
+}
 
-    const status_icon = if (result.term.Exited == 0) "✅" else "❌";
-    const status_text = if (result.term.Exited == 0) "PASSED" else "FAILED";
-    
-    output.appendSlice(allocator, "🧪 **Zig Test Results**\n\n") catch {};
-    output.appendSlice(allocator, status_icon) catch {};
-    output.appendSlice(allocator, " **") catch {};
-    output.appendSlice(allocator, status_text) catch {};
-    output.appendSlice(allocator, "** (") catch {};
-    output.appendSlice(allocator, mode) catch {};
-    output.appendSlice(allocator, "): ") catch {};
-    output.appendSlice(allocator, path) catch {};
-    output.appendSlice(allocator, "\n\n") catch {};
-
-    if (result.stdout.len > 0) {
-        output.appendSlice(allocator, "**📤 STDOUT:**\n```\n") catch {};
-        output.appendSlice(allocator, result.stdout) catch {};
-        output.appendSlice(allocator, "\n```\n\n") catch {};
+fn formatCompilerResult(
+    allocator: std.mem.Allocator,
+    mode: []const u8,
+    path: ?[]const u8,
+    result: std.process.Child.RunResult,
+) registry.ToolResult {
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
     }
 
-    if (result.stderr.len > 0) {
-        output.appendSlice(allocator, "**📥 STDERR:**\n```\n") catch {};
-        output.appendSlice(allocator, result.stderr) catch {};
-        output.appendSlice(allocator, "\n```\n\n") catch {};
+    const diagnostics = joinDiagnostics(allocator, result.stdout, result.stderr) catch
+        return .{ .content = "Failed to format compiler diagnostics", .is_error = true };
+    defer allocator.free(diagnostics);
+
+    const success = result.term == .Exited and result.term.Exited == 0;
+    const subject = path orelse project_root;
+    const term_text = formatTermination(allocator, result.term) catch "process status unavailable";
+    defer if (term_text.ptr != "process status unavailable".ptr) allocator.free(term_text);
+    const mode_label = if (std.mem.eql(u8, mode, "build")) "BUILD" else "AST-CHECK";
+
+    const content = if (success)
+        std.fmt.allocPrint(
+            allocator,
+            "ZIG {s} OK\nTarget: {s}\nStatus: {s}\n\n{s}",
+            .{ mode_label, subject, term_text, if (diagnostics.len > 0) diagnostics else "No compiler diagnostics." },
+        ) catch "Zig check passed"
+    else
+        std.fmt.allocPrint(
+            allocator,
+            "ZIG {s} FAILED\nTarget: {s}\nStatus: {s}\n\nCompiler diagnostics:\n{s}\n\nNext step: reread the cited file and nearby lines before patching. Do not guess from a stale read.",
+            .{ mode_label, subject, term_text, if (diagnostics.len > 0) diagnostics else "(no compiler output)" },
+        ) catch "Zig check failed";
+
+    const model_content = registry.compactForModel(
+        allocator,
+        "zig compiler diagnostics",
+        content,
+        1800,
+        1600,
+    );
+
+    return .{
+        .content = content,
+        .model_content = model_content,
+        .is_error = !success,
+    };
+}
+
+fn joinDiagnostics(allocator: std.mem.Allocator, stdout: []const u8, stderr: []const u8) ![]const u8 {
+    if (stdout.len == 0 and stderr.len == 0) {
+        return try allocator.dupe(u8, "");
     }
 
-    if (result.term.Exited == 0) {
-        output.appendSlice(allocator, "🎯 **Safe to rebuild!** No compilation errors found.\n") catch {};
-    } else {
-        output.appendSlice(allocator, "⚠️  **DO NOT REBUILD** - Fix errors first to prevent daemon suicide!\n") catch {};
+    if (stdout.len == 0) {
+        return try allocator.dupe(u8, stderr);
     }
 
-    return .{ .content = output.toOwnedSlice(allocator) catch "Test complete", .is_error = result.term.Exited != 0 };
+    if (stderr.len == 0) {
+        return try allocator.dupe(u8, stdout);
+    }
+
+    return std.fmt.allocPrint(
+        allocator,
+        "[stdout]\n{s}\n\n[stderr]\n{s}",
+        .{ stdout, stderr },
+    );
+}
+
+fn formatTermination(allocator: std.mem.Allocator, term: std.process.Child.Term) ![]const u8 {
+    return switch (term) {
+        .Exited => |code| std.fmt.allocPrint(allocator, "exit {d}", .{code}),
+        .Signal => |sig| std.fmt.allocPrint(allocator, "signal {d}", .{sig}),
+        .Stopped => |sig| std.fmt.allocPrint(allocator, "stopped {d}", .{sig}),
+        .Unknown => |code| std.fmt.allocPrint(allocator, "unknown {d}", .{code}),
+    };
 }

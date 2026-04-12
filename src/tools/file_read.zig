@@ -4,7 +4,10 @@ const registry = @import("registry.zig");
 
 pub const definition = registry.ToolDefinition{
     .name = "file_read",
-    .description = "Read the contents of a file. Returns the file contents with line numbers.",
+    .description = "Read file contents with line numbers. Primary grounding tool before editing existing files. " ++
+        "Prefer reading the smallest relevant slice first with offset/limit, then expand if needed. " ++
+        "Use this before file_diff or file_write on existing files, and reread the exact region after any failed edit or compiler error. " ++
+        "Do not rely on memory for file contents.",
     .input_schema_json =
     \\{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the file to read"},"offset":{"type":"integer","description":"Starting line number (default 0)"},"limit":{"type":"integer","description":"Number of lines to read (default 2000)"}},"required":["path"]}
     ,
@@ -86,6 +89,8 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
         return .{ .content = "Out of memory", .is_error = true };
     var pos: usize = 0;
     var truncated = false;
+    var first_line_returned: ?usize = null;
+    var last_line_returned: ?usize = null;
 
     var line_num: usize = 1;
     var buf: [4096]u8 = undefined;
@@ -102,6 +107,8 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
             if (c == '\n') {
                 const line = data[start..i];
                 if (line_num > offset and line_num <= offset + limit) {
+                    if (first_line_returned == null) first_line_returned = line_num;
+                    last_line_returned = line_num;
                     const written = std.fmt.bufPrint(output[pos..], "{d:>6}| ", .{line_num}) catch break;
                     pos += written.len;
                     if (pos + line.len < output.len) {
@@ -134,6 +141,8 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
     // Emit the final line even when the file does not end with a newline.
     if (!truncated and remaining > 0 and line_num > offset and line_num <= offset + limit) {
         const line = buf[0..remaining];
+        if (first_line_returned == null) first_line_returned = line_num;
+        last_line_returned = line_num;
         const written = blk: {
             const prefix = std.fmt.bufPrint(output[pos..], "{d:>6}| ", .{line_num}) catch {
                 truncated = true;
@@ -154,9 +163,14 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
 
     if (pos == 0) {
         allocator.free(output);
+        const empty = std.fmt.allocPrint(
+            allocator,
+            "FILE READ\nPath: {s}\nRequested lines: {d}-{d}\n\n(empty file or offset past end)",
+            .{ path, offset + 1, offset + limit },
+        ) catch "(empty file or offset past end)";
         return .{
-            .content = "(empty file or offset past end)",
-            .model_content = "(empty file or offset past end)",
+            .content = empty,
+            .model_content = empty,
             .is_error = false,
         };
     }
@@ -170,7 +184,22 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
         }
     }
 
-    const result = allocator.realloc(output, pos) catch output;
+    const body = allocator.realloc(output, pos) catch output;
+    const result = std.fmt.allocPrint(
+        allocator,
+        "FILE READ\nPath: {s}\nRequested lines: {d}-{d}\nReturned lines: {d}-{d}{s}\n\n{s}",
+        .{
+            path,
+            offset + 1,
+            offset + limit,
+            first_line_returned orelse (offset + 1),
+            last_line_returned orelse (offset + 1),
+            if (truncated) "\nStatus: truncated for display buffer" else "",
+            body,
+        },
+    ) catch body;
+
+    if (result.ptr != body.ptr) allocator.free(body);
     return .{
         .content = result,
         // Purpose: preserve the full read for the user while only replaying a compact slice to the model.

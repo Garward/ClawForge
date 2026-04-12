@@ -1,0 +1,5 @@
+    // Pretty-print the startup config (not dumping the whole thing)
+    std.log.info("Config loaded:", .{});
+    std.log.info("  Data dir: {s}", .{config.daemon.data_dir});
+    std.log.info("  Log level: {s}", .{config.daemon.log_level});
+    std.log.info("  Adapters: Web={}", .{config.web.enabled});

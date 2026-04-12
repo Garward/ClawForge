@@ -4,11 +4,13 @@ const registry = @import("registry.zig");
 
 pub const definition = registry.ToolDefinition{
     .name = "file_diff",
-    .description = "Edit a file with a unified diff. The PRIMARY tool for modifying existing files. " ++
-        "Pass the full new content and set apply=true to write. Creates automatic backup before writing. " ++
-        "Always use file_read first to see current content, then file_diff to apply changes.",
+    .description = "Edit a file using search-and-replace. The PRIMARY tool for modifying existing files. " ++
+        "Provide old_text (exact string to find) and new_text (replacement). " ++
+        "For new files, use file_write instead. Always use file_read first to see current content. " ++
+        "If a replacement fails, reread the exact target region and include more unchanged surrounding context. " ++
+        "Do not guess the current file state from memory.",
     .input_schema_json =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the file"},"new_content":{"type":"string","description":"Proposed new content"},"apply":{"type":"boolean","description":"Apply the changes after showing diff","default":false}},"required":["path","new_content"]}
+    \\{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the file"},"old_text":{"type":"string","description":"Exact text to find in the file (must match uniquely)"},"new_text":{"type":"string","description":"Replacement text"},"create_if_missing":{"type":"boolean","description":"Create the file with new_text if it doesn't exist","default":false}},"required":["path","old_text","new_text"]}
     ,
     .requires_confirmation = true,
     .handler = &execute,
@@ -37,18 +39,31 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
         return .{ .content = "Path must be absolute (start with / or ~)", .is_error = true };
     } else raw_path;
 
-    const new_content = blk: {
+    const old_text = blk: {
         if (input == .object) {
-            if (input.object.get("new_content")) |c| {
+            if (input.object.get("old_text")) |c| {
                 if (c == .string) break :blk c.string;
             }
         }
-        return .{ .content = "Missing 'new_content' parameter", .is_error = true };
+        return .{ .content = "Missing 'old_text' parameter", .is_error = true };
     };
 
-    const apply = blk: {
+    if (old_text.len == 0) {
+        return .{ .content = "old_text must not be empty. Provide the exact text to replace — use file_read first to see current content.", .is_error = true };
+    }
+
+    const new_text = blk: {
         if (input == .object) {
-            if (input.object.get("apply")) |a| {
+            if (input.object.get("new_text")) |c| {
+                if (c == .string) break :blk c.string;
+            }
+        }
+        return .{ .content = "Missing 'new_text' parameter", .is_error = true };
+    };
+
+    const create_if_missing = blk: {
+        if (input == .object) {
+            if (input.object.get("create_if_missing")) |a| {
                 if (a == .bool) break :blk a.bool;
             }
         }
@@ -59,82 +74,120 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
         return .{ .content = "Path traversal not allowed", .is_error = true };
     }
 
-    const existed_before = fileExists(path);
-    const current_content = readFileIfExists(allocator, path) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Error reading file: {s}", .{@errorName(err)}) catch
+    // Read current file
+    const current_content = readFile(allocator, path) catch |err| {
+        if (err == error.FileNotFound and create_if_missing) {
+            // Create new file with new_text as content
+            atomicWriteAbsolute(path, new_text) catch |write_err| {
+                const msg = std.fmt.allocPrint(allocator, "Failed to create {s}: {s}", .{ path, @errorName(write_err) }) catch
+                    return .{ .content = "Failed to create file", .is_error = true };
+                return .{ .content = msg, .is_error = true };
+            };
+            const msg = std.fmt.allocPrint(
+                allocator,
+                "FILE DIFF APPLIED\nPath: {s}\nAction: created new file\nBytes written: {d}\n\nPreview:\n{s}",
+                .{ path, new_text.len, previewText(new_text, 240) },
+            ) catch
+                return .{ .content = "File created", .is_error = false };
+            return .{
+                .content = msg,
+                .model_content = registry.compactForModel(allocator, "file_diff create result", msg, 1200, 600),
+                .is_error = false,
+            };
+        }
+        const msg = std.fmt.allocPrint(allocator, "Error reading {s}: {s}", .{ path, @errorName(err) }) catch
             return .{ .content = "Error reading file", .is_error = true };
         return .{ .content = msg, .is_error = true };
     };
-    defer if (current_content) |buf| allocator.free(buf);
+    defer allocator.free(current_content);
 
-    const diff_output = buildUnifiedDiff(allocator, path, current_content orelse "", new_content) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Unified diff generation failed: {s}", .{@errorName(err)}) catch
-            return .{ .content = "Unified diff generation failed", .is_error = true };
+    // Find the old_text in the file
+    const match_pos = std.mem.indexOf(u8, current_content, old_text) orelse {
+        // Show a helpful snippet of the file around where the text might be
+        const preview_len = @min(current_content.len, 500);
+        const msg = std.fmt.allocPrint(
+            allocator,
+            "FILE DIFF FAILED\nPath: {s}\nReason: old_text not found\nHint: the replacement anchor must match exactly, including whitespace.\nNext step: rerun file_read on the exact target region and copy more unchanged surrounding context into old_text.\n\nFile start preview:\n{s}{s}",
+            .{ path, current_content[0..preview_len], if (current_content.len > 500) "\n...(truncated)" else "" },
+        ) catch return .{ .content = "old_text not found in file", .is_error = true };
         return .{ .content = msg, .is_error = true };
     };
 
-    if (!apply) {
-        return .{
-            .content = diff_output,
-            .model_content = registry.compactForModel(allocator, "file_diff preview", diff_output, 5000, 1500),
-            .is_error = false,
-        };
+    // Check for uniqueness — old_text must match exactly once
+    if (std.mem.indexOf(u8, current_content[match_pos + old_text.len ..], old_text) != null) {
+        const msg = std.fmt.allocPrint(
+            allocator,
+            "FILE DIFF FAILED\nPath: {s}\nReason: old_text matched multiple locations\nHint: include more unchanged surrounding context so the match is unique.\nNext step: reread a narrower file slice around the intended location, then retry with a more specific old_text.",
+            .{path},
+        ) catch return .{ .content = "old_text matches multiple locations", .is_error = true };
+        return .{ .content = msg, .is_error = true };
     }
 
-    var backup_path: ?[]u8 = null;
-    defer if (backup_path) |bp| allocator.free(bp);
-    if (existed_before) {
-        backup_path = createBackup(allocator, path) catch |err| {
-            const msg = std.fmt.allocPrint(
-                allocator,
-                "Backup failed for {s}: {s}. Aborting apply to protect the original file.",
-                .{ path, @errorName(err) },
-            ) catch "Backup failed";
-            return .{ .content = msg, .is_error = true };
-        };
-    }
+    // Build new content: before + new_text + after
+    const before = current_content[0..match_pos];
+    const after = current_content[match_pos + old_text.len ..];
+    const result_content = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ before, new_text, after }) catch
+        return .{ .content = "Failed to build replacement", .is_error = true };
+    defer allocator.free(result_content);
 
-    atomicWriteAbsolute(path, new_content) catch |err| {
-        const msg = std.fmt.allocPrint(allocator, "Applying diff failed for {s}: {s}", .{ path, @errorName(err) }) catch
-            return .{ .content = "Apply failed", .is_error = true };
+    // Backup
+    _ = createBackup(allocator, path) catch |err| {
+        const msg = std.fmt.allocPrint(
+            allocator,
+            "Backup failed for {s}: {s}. Aborting to protect original.",
+            .{ path, @errorName(err) },
+        ) catch "Backup failed";
         return .{ .content = msg, .is_error = true };
     };
 
-    const result = if (backup_path) |bp|
-        std.fmt.allocPrint(
-            allocator,
-            "{s}\n\nChanges applied successfully.\nBackup created: {s}",
-            .{ diff_output, bp },
-        ) catch diff_output
-    else
-        std.fmt.allocPrint(
-            allocator,
-            "{s}\n\nChanges applied successfully.\nCreated new file: {s}",
-            .{ diff_output, path },
-        ) catch diff_output;
+    // Write
+    atomicWriteAbsolute(path, result_content) catch |err| {
+        const msg = std.fmt.allocPrint(allocator, "Write failed for {s}: {s}", .{ path, @errorName(err) }) catch
+            return .{ .content = "Write failed", .is_error = true };
+        return .{ .content = msg, .is_error = true };
+    };
+
+    // Build a concise result showing exactly what changed.
+    const context_before = match_pos -| 80;
+    const context_after_end = @min(match_pos + old_text.len + 80, current_content.len);
+    const bytes_delta = @as(i64, @intCast(new_text.len)) - @as(i64, @intCast(old_text.len));
+    const msg = std.fmt.allocPrint(
+        allocator,
+        "FILE DIFF APPLIED\nPath: {s}\nMatch offset: {d}\nOld bytes: {d}\nNew bytes: {d}\nNet byte delta: {d}\n\nOLD:\n{s}\n\nNEW:\n{s}\n\nMATCH CONTEXT:\n...{s}[REPLACED]{s}...",
+        .{
+            path,
+            match_pos,
+            old_text.len,
+            new_text.len,
+            bytes_delta,
+            previewText(old_text, 320),
+            previewText(new_text, 320),
+            current_content[context_before..match_pos],
+            current_content[match_pos + old_text.len .. context_after_end],
+        },
+    ) catch return .{ .content = "Edit applied successfully", .is_error = false };
 
     return .{
-        .content = result,
-        .model_content = registry.compactForModel(allocator, "file_diff apply result", result, 5000, 1500),
+        .content = msg,
+        .model_content = registry.compactForModel(allocator, "file_diff result", msg, 1400, 800),
         .is_error = false,
     };
 }
 
-fn fileExists(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
-    return true;
+fn previewText(text: []const u8, max_len: usize) []const u8 {
+    if (text.len <= max_len) return text;
+    return text[0..max_len];
 }
 
-fn readFileIfExists(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return null,
+        error.FileNotFound => return error.FileNotFound,
         else => return err,
     };
     defer file.close();
-
-    const file_size = try file.getEndPos();
-    if (file_size > 10 * 1024 * 1024) return error.FileTooBig;
-    return try file.readToEndAlloc(allocator, @intCast(file_size + 1));
+    const size = try file.getEndPos();
+    if (size > 10 * 1024 * 1024) return error.FileTooBig;
+    return try file.readToEndAlloc(allocator, @intCast(size + 1));
 }
 
 fn createBackup(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -156,57 +209,4 @@ fn atomicWriteAbsolute(path: []const u8, content: []const u8) !void {
 
     try atomic_file.file_writer.interface.writeAll(content);
     try atomic_file.finish();
-}
-
-fn buildUnifiedDiff(allocator: std.mem.Allocator, path: []const u8, current_content: []const u8, new_content: []const u8) ![]u8 {
-    if (std.mem.eql(u8, current_content, new_content)) {
-        return std.fmt.allocPrint(allocator, "No changes needed for {s}", .{path});
-    }
-
-    const timestamp = std.time.timestamp();
-    const old_tmp = try std.fmt.allocPrint(allocator, "/tmp/clawforge-diff-old-{d}", .{timestamp});
-    defer allocator.free(old_tmp);
-    const new_tmp = try std.fmt.allocPrint(allocator, "/tmp/clawforge-diff-new-{d}", .{timestamp});
-    defer allocator.free(new_tmp);
-    defer std.fs.deleteFileAbsolute(old_tmp) catch {};
-    defer std.fs.deleteFileAbsolute(new_tmp) catch {};
-
-    {
-        const file = try std.fs.createFileAbsolute(old_tmp, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(current_content);
-    }
-    {
-        const file = try std.fs.createFileAbsolute(new_tmp, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(new_content);
-    }
-
-    const old_label = if (current_content.len == 0)
-        try std.fmt.allocPrint(allocator, "{s} (missing)", .{path})
-    else
-        try std.fmt.allocPrint(allocator, "{s} (current)", .{path});
-    defer allocator.free(old_label);
-
-    const new_label = if (new_content.len == 0)
-        try std.fmt.allocPrint(allocator, "{s} (empty)", .{path})
-    else
-        try std.fmt.allocPrint(allocator, "{s} (proposed)", .{path});
-    defer allocator.free(new_label);
-
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "diff", "-u", "--label", old_label, "--label", new_label, old_tmp, new_tmp },
-        .max_output_bytes = 512 * 1024,
-    });
-    defer allocator.free(result.stderr);
-
-    if (result.term.Exited == 0 or result.term.Exited == 1) {
-        if (result.stdout.len > 0) return result.stdout;
-        allocator.free(result.stdout);
-        return std.fmt.allocPrint(allocator, "No changes needed for {s}", .{path});
-    }
-
-    defer allocator.free(result.stdout);
-    return error.DiffFailed;
 }
