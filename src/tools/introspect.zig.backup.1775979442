@@ -499,31 +499,3 @@ fn buildSessionsQuery(allocator: std.mem.Allocator, date: ?[]const u8, limit: []
     parts.appendSlice(allocator, ";") catch return null;
     return parts.items;
 }
-
-fn buildMetricsQuery(allocator: std.mem.Allocator, session_filter: ?[]const u8) ?[]const u8 {
-    var parts: std.ArrayList(u8) = .{};
-    
-    parts.appendSlice(allocator, "SELECT ") catch return null;
-    parts.appendSlice(allocator, "'session_id' as metric, s.session_id as value, ") catch return null;
-    parts.appendSlice(allocator, "'token_usage' as details, ") catch return null;
-    parts.appendSlice(allocator, "COALESCE(SUM(m.input_tokens), 0) as input_tokens, ") catch return null;
-    parts.appendSlice(allocator, "COALESCE(SUM(m.output_tokens), 0) as output_tokens, ") catch return null;
-    parts.appendSlice(allocator, "COALESCE(SUM(m.input_tokens + m.output_tokens), 0) as total_tokens, ") catch return null;
-    parts.appendSlice(allocator, "COUNT(m.id) as message_count ") catch return null;
-    parts.appendSlice(allocator, "FROM sessions s ") catch return null;
-    parts.appendSlice(allocator, "LEFT JOIN messages m ON s.session_id = m.session_id ") catch return null;
-    
-    if (session_filter) |sf| {
-        parts.appendSlice(allocator, "WHERE s.session_id = '") catch return null;
-        appendEscaped(&parts, allocator, sf);
-        parts.appendSlice(allocator, "' ") catch return null;
-    } else {
-        // Get current session by default
-        parts.appendSlice(allocator, "WHERE s.session_id = (SELECT session_id FROM sessions ORDER BY updated_at DESC LIMIT 1) ") catch return null;
-    }
-    
-    parts.appendSlice(allocator, "GROUP BY s.session_id ") catch return null;
-    parts.appendSlice(allocator, "ORDER BY s.updated_at DESC;") catch return null;
-    
-    return parts.items;
-}

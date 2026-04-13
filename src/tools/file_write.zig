@@ -35,7 +35,7 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
         owned_path = expanded;
         break :blk expanded;
     } else if (raw_path.len == 0 or raw_path[0] != '/') {
-        return .{ .content = "Path must be absolute (start with / or ~)", .is_error = true };
+        return .{ .content = "Path must be absolute (start with / or ~). Use bash 'pwd' if needed.", .is_error = true };
     } else raw_path;
 
     const content = blk: {

@@ -43,14 +43,17 @@ class MemeGenerator:
         # Try environment variables first
         username = os.getenv('IMGFLIP_USERNAME')
         password = os.getenv('IMGFLIP_PASSWORD')
-        
-        # If not found, try loading from ~/.env file
+
+        # If not found, try loading from ClawForge .env then ~/.env
         if not username or not password:
-            env_file = os.path.expanduser('~/.env')
-            env_vars = self._load_env_file(env_file)
-            username = username or env_vars.get('IMGFLIP_USERNAME')
-            password = password or env_vars.get('IMGFLIP_PASSWORD')
-        
+            script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            for env_path in [os.path.join(script_dir, '.env'), os.path.expanduser('~/.env')]:
+                env_vars = self._load_env_file(env_path)
+                username = username or env_vars.get('IMGFLIP_USERNAME')
+                password = password or env_vars.get('IMGFLIP_PASSWORD')
+                if username and password:
+                    break
+
         return username, password
 
     def get_context_templates(self, context: str) -> List[str]:
@@ -154,7 +157,7 @@ class MemeGenerator:
             if not self.username or not self.password:
                 return {
                     "success": False,
-                    "error": "Imgflip credentials not found. Set IMGFLIP_USERNAME and IMGFLIP_PASSWORD in ~/.env file"
+                    "error": "Imgflip credentials not found. Set IMGFLIP_USERNAME and IMGFLIP_PASSWORD in ClawForge/.env"
                 }
             
             # Select template

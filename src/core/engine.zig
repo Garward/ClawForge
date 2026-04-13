@@ -566,6 +566,9 @@ pub const Engine = struct {
         /// Peak single-round input tokens (actual context window size).
         /// input_tokens is cumulative across all tool rounds.
         context_tokens: u32,
+        /// Comma-separated background job IDs spawned via summon_subagent during this turn.
+        /// null when nothing was spawned. Caller owns the allocation.
+        spawned_jobs: ?[]const u8 = null,
     };
 
     pub const ToolCallRecord = struct {
@@ -586,9 +589,15 @@ pub const Engine = struct {
     pub const StreamEmitter = struct {
         ctx: *anyopaque,
         emitFn: *const fn (ctx: *anyopaque, response: common.Response) void,
+        isCancelledFn: ?*const fn (ctx: *anyopaque) bool = null,
 
         pub fn emit(self: StreamEmitter, response: common.Response) void {
             self.emitFn(self.ctx, response);
+        }
+
+        pub fn isCancelled(self: StreamEmitter) bool {
+            if (self.isCancelledFn) |f| return f(self.ctx);
+            return false;
         }
     };
 
@@ -619,7 +628,7 @@ pub const Engine = struct {
 
     pub fn process(self: *Engine, request: common.Request, emitter: ?StreamEmitter, confirmer: ?ToolConfirmCallback) Result {
         return switch (request) {
-            .chat => |req| self.processChat(req, emitter, confirmer),
+            .chat => |req| if (req.background) self.enqueueBackgroundChat(req) else self.processChat(req, emitter, confirmer),
             .session_list => self.processSessionList(),
             .session_create => |req| self.processSessionCreate(req),
             .session_switch => |id| self.processSessionSwitch(id),
@@ -655,8 +664,12 @@ pub const Engine = struct {
             self.files_read_this_turn.clearRetainingCapacity();
         }
 
-        // Get or create session
-        var sess = self.session_store.getActiveSession() orelse blk: {
+        // Get session: explicit session_id > active session > create new
+        var sess = blk: {
+            if (chat_req.session_id) |sid| {
+                if (self.session_store.getSession(sid) catch null) |s| break :blk s;
+            }
+            if (self.session_store.getActiveSession()) |s| break :blk s;
             break :blk self.session_store.createSession(null) catch {
                 return .{ .response = .{ .error_resp = .{
                     .code = "SESSION_ERROR",
@@ -709,7 +722,7 @@ pub const Engine = struct {
         const system_prompt: ?[]const u8 = self.buildSystemPrompt(
             &sess.id,
             sess.system_prompt,
-            null, // TODO: adapter provides cwd/channel info via ChatRequest
+            chat_req.adapter_context,
             chat_req.message,
         ) catch sess.system_prompt;
 
@@ -719,9 +732,21 @@ pub const Engine = struct {
             owned_tool_defs.deinit(self.allocator);
         }
 
-        // Always send all tools — the schema cost difference (~650 tokens) is trivial
-        // vs the risk of the model not knowing a tool exists.
-        const initial_tools = self.tool_registry.getToolDefinitions();
+        // Tool selection: allowed_tools filter > all enabled tools
+        const initial_tools = if (chat_req.allowed_tools) |at| blk: {
+            var names: [32][]const u8 = undefined;
+            var count: usize = 0;
+            var iter = std.mem.splitScalar(u8, at, ',');
+            while (iter.next()) |name| {
+                const trimmed = std.mem.trim(u8, name, " ");
+                if (trimmed.len > 0 and count < 32) {
+                    names[count] = trimmed;
+                    count += 1;
+                }
+            }
+            break :blk if (count > 0) self.tool_registry.getToolDefinitionsFiltered(names[0..count]) else null;
+        } else self.tool_registry.getToolDefinitions();
+
         if (initial_tools) |defs| {
             owned_tool_defs.append(self.allocator, defs) catch {};
         }
@@ -731,7 +756,7 @@ pub const Engine = struct {
             .max_tokens = self.config.api.max_tokens,
             .messages = msgs,
             .system = system_prompt,
-            .tools = initial_tools,
+            .tools = if (chat_req.no_tools) null else initial_tools,
             .stream = true,
         };
 
@@ -759,6 +784,11 @@ pub const Engine = struct {
         var tool_log: std.ArrayList(u8) = .{};
         defer tool_log.deinit(self.allocator);
 
+        // Background job IDs spawned via summon_subagent during this chat turn.
+        // Each entry is exactly 36 chars (a UUID).
+        var spawned_subagent_ids: std.ArrayList([36]u8) = .{};
+        defer spawned_subagent_ids.deinit(self.allocator);
+
         // Collect response arenas — freed after the tool loop is done.
         // Each API call returns a response with an arena; we can't free it
         // until the next round has consumed the tool_use data from it.
@@ -771,8 +801,18 @@ pub const Engine = struct {
             response_arenas.deinit(self.allocator);
         }
 
+        var cancelled = false;
         var tool_round: usize = 0;
         while (tool_round < 100) : (tool_round += 1) {
+            // Check if the client disconnected (SSE write failed)
+            if (emitter) |em| {
+                if (em.isCancelled()) {
+                    std.log.info("Stream cancelled by client at tool round {d}", .{tool_round});
+                    cancelled = true;
+                    break;
+                }
+            }
+
             std.log.info("Tool round {d}, emitter={}, msgs={d}", .{ tool_round, emitter != null, current_request.messages.len });
             self.logPromptBudget(tool_round, current_request);
 
@@ -837,6 +877,15 @@ pub const Engine = struct {
             }
             final_stop_reason = api_response.stop_reason;
 
+            // Check cancellation after API call (text delta writes may have failed mid-stream)
+            if (emitter) |em| {
+                if (em.isCancelled()) {
+                    std.log.info("Stream cancelled after API response at tool round {d}", .{tool_round});
+                    cancelled = true;
+                    break;
+                }
+            }
+
             // Check if the response has tool use requests
             const is_tool_use = api_response.stop_reason != null and
                 std.mem.eql(u8, api_response.stop_reason.?, "tool_use") and
@@ -865,6 +914,15 @@ pub const Engine = struct {
                 // User message: tool_result for each tool call
                 var result_blocks: std.ArrayList(api.messages.ContentBlock) = .{};
                 for (api_response.tool_use) |tool_call| {
+                    // Check cancellation before each tool execution
+                    if (emitter) |em| {
+                        if (em.isCancelled()) {
+                            std.log.info("Stream cancelled before executing tool {s}", .{tool_call.name});
+                            cancelled = true;
+                            break;
+                        }
+                    }
+
                     // Emit tool use info
                     if (emitter) |em| {
                         em.emit(.{ .stream_tool_use = .{
@@ -888,6 +946,9 @@ pub const Engine = struct {
                     const tool_res = if (declined) blk: {
                         std.log.info("Tool {s} declined by user", .{tool_call.name});
                         break :blk tools.ToolResult{ .content = TOOL_DECLINED_MSG, .is_error = true };
+                    } else if (std.mem.eql(u8, tool_call.name, "summon_subagent")) blk: {
+                        std.log.info("Special tool: summon_subagent", .{});
+                        break :blk self.handleSummonSubagent(tool_call.input, &sess.id, &spawned_subagent_ids);
                     } else blk: {
                         std.log.info("Executing tool: {s}", .{tool_call.name});
                         break :blk self.executeToolParsedCached(tool_call.name, tool_call.input, tool_call.input_json);
@@ -958,6 +1019,8 @@ pub const Engine = struct {
                     } }) catch {};
                 }
 
+                if (cancelled) break;
+
                 // Extend messages for next API round
                 const prev = current_request.messages;
                 const extended = self.allocator.alloc(api.messages.Message, prev.len + 2) catch break;
@@ -1016,9 +1079,19 @@ pub const Engine = struct {
             }
         }
 
+        if (cancelled) {
+            final_stop_reason = "cancelled";
+            // Append cancellation note so the stored message is self-documenting
+            if (text_parts.items.len > 0) {
+                text_parts.appendSlice(self.allocator, "\n\n[Response stopped by user]") catch {};
+            } else if (tool_log.items.len > 0) {
+                text_parts.appendSlice(self.allocator, "[Response stopped by user during tool execution]") catch {};
+            }
+        }
+
         // If we exhausted tool rounds without a final text response, make one more
         // API call with tools disabled to force a text summary of everything so far.
-        if (text_parts.items.len == 0 and tool_log.items.len > 0) {
+        if (!cancelled and text_parts.items.len == 0 and tool_log.items.len > 0) {
             std.log.info("Tool loop exhausted without text — forcing final summary call", .{});
             var final_req = current_request;
             final_req.tools = null; // No tools → model must respond with text
@@ -1073,6 +1146,18 @@ pub const Engine = struct {
         const result_model = self.allocator.dupe(u8, model) catch "unknown";
         self.session_store.freeSessionInfo(&sess);
 
+        // Serialize spawned subagent IDs as a comma-joined string for the response payload.
+        const spawned_jobs_str: ?[]const u8 = if (spawned_subagent_ids.items.len > 0) blk: {
+            const total_len = spawned_subagent_ids.items.len * 37; // 36 + comma
+            var out: std.ArrayList(u8) = .{};
+            out.ensureTotalCapacity(self.allocator, total_len) catch break :blk null;
+            for (spawned_subagent_ids.items, 0..) |id, i| {
+                if (i > 0) out.append(self.allocator, ',') catch {};
+                out.appendSlice(self.allocator, &id) catch {};
+            }
+            break :blk out.toOwnedSlice(self.allocator) catch null;
+        } else null;
+
         return .{ .chat = .{
             .text = final_text,
             .model = result_model,
@@ -1080,7 +1165,75 @@ pub const Engine = struct {
             .input_tokens = total_input_tokens,
             .context_tokens = context_tokens,
             .output_tokens = total_output_tokens,
+            .spawned_jobs = spawned_jobs_str,
         } };
+    }
+
+    /// Handle a summon_subagent tool call by enqueueing a BackgroundChatJob.
+    /// The subagent inherits the parent's session so it sees the same persona/history.
+    fn handleSummonSubagent(
+        self: *Engine,
+        input: std.json.Value,
+        parent_session_id: *const [36]u8,
+        spawned_ids: *std.ArrayList([36]u8),
+    ) tools.ToolResult {
+        const wp = self.worker_pool orelse return .{
+            .content = "summon_subagent unavailable: no worker pool configured",
+            .is_error = true,
+        };
+
+        if (input != .object) return .{
+            .content = "summon_subagent: input must be an object with a 'task' field",
+            .is_error = true,
+        };
+
+        const task_val = input.object.get("task") orelse return .{
+            .content = "summon_subagent: missing required 'task' field",
+            .is_error = true,
+        };
+        if (task_val != .string or task_val.string.len == 0) return .{
+            .content = "summon_subagent: 'task' must be a non-empty string",
+            .is_error = true,
+        };
+
+        const model_val: ?[]const u8 = if (input.object.get("model")) |m|
+            (if (m == .string and m.string.len > 0) m.string else null)
+        else
+            null;
+
+        const task_dup = self.allocator.dupe(u8, task_val.string) catch return .{
+            .content = "summon_subagent: out of memory",
+            .is_error = true,
+        };
+        const model_dup: ?[]const u8 = if (model_val) |m|
+            (self.allocator.dupe(u8, m) catch null)
+        else
+            null;
+
+        var job_id: [36]u8 = undefined;
+        generateUUID(&job_id);
+
+        wp.enqueueBackgroundChat(.{
+            .job_id = job_id,
+            .message = task_dup,
+            .session_id = parent_session_id.*,
+            .model_override = model_dup,
+            .callback_channel = null,
+            .allowed_tools = null,
+            .cancelled = std.atomic.Value(bool).init(false),
+        });
+
+        spawned_ids.append(self.allocator, job_id) catch {};
+
+        std.log.info("Spawned subagent job {s}", .{job_id});
+
+        const result_text = std.fmt.allocPrint(
+            self.allocator,
+            "Subagent dispatched. Job ID: {s}. The user will receive the result automatically when it completes — you do not need to wait.",
+            .{job_id},
+        ) catch "Subagent dispatched.";
+
+        return .{ .content = result_text, .is_error = false };
     }
 
     /// Post-response hooks. Run after every chat response.
@@ -1137,6 +1290,139 @@ pub const Engine = struct {
 
         // Hook 5: Auto-detect project attachment (future — semantic detection)
         // Hook 6: Context snapshot at checkpoints (future)
+    }
+
+    // ================================================================
+    // BACKGROUND CHAT — enqueue to worker pool for async processing
+    // ================================================================
+
+    fn enqueueBackgroundChat(self: *Engine, req: common.Request.ChatRequest) Result {
+        const wp = self.worker_pool orelse {
+            return .{ .response = .{ .error_resp = .{
+                .code = "NO_WORKER_POOL",
+                .message = "Background chat requires worker pool",
+            } } };
+        };
+
+        // Resolve session: explicit > active > create new
+        const session_id = blk: {
+            if (req.session_id) |sid| {
+                if (sid.len == 36) {
+                    var buf: [36]u8 = undefined;
+                    @memcpy(&buf, sid[0..36]);
+                    break :blk buf;
+                }
+            }
+            if (self.session_store.getActiveSession()) |s| break :blk s.id;
+            const new_sess = self.session_store.createSession(null) catch {
+                return .{ .response = .{ .error_resp = .{
+                    .code = "SESSION_ERROR",
+                    .message = "Failed to create session for background job",
+                } } };
+            };
+            break :blk new_sess.id;
+        };
+
+        var job_id: [36]u8 = undefined;
+        generateUUID(&job_id);
+
+        wp.enqueueBackgroundChat(.{
+            .job_id = job_id,
+            .message = self.allocator.dupe(u8, req.message) catch {
+                return .{ .response = .{ .error_resp = .{
+                    .code = "OOM",
+                    .message = "Failed to allocate background job",
+                } } };
+            },
+            .session_id = session_id,
+            .model_override = if (req.model_override) |mo|
+                (self.allocator.dupe(u8, mo) catch null)
+            else
+                null,
+            .callback_channel = if (req.callback_channel) |cc|
+                (self.allocator.dupe(u8, cc) catch null)
+            else
+                null,
+            .allowed_tools = if (req.allowed_tools) |at|
+                (self.allocator.dupe(u8, at) catch null)
+            else
+                null,
+            .cancelled = std.atomic.Value(bool).init(false),
+        });
+
+        return .{ .response = .{ .background_queued = .{
+            .job_id = &job_id,
+            .session_id = &session_id,
+        } } };
+    }
+
+    fn generateUUID(buf: *[36]u8) void {
+        var random_bytes: [16]u8 = undefined;
+        std.crypto.random.bytes(&random_bytes);
+        random_bytes[6] = (random_bytes[6] & 0x0f) | 0x40;
+        random_bytes[8] = (random_bytes[8] & 0x3f) | 0x80;
+        const hex = "0123456789abcdef";
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < 16) : (i += 1) {
+            if (i == 4 or i == 6 or i == 8 or i == 10) {
+                buf[j] = '-';
+                j += 1;
+            }
+            buf[j] = hex[random_bytes[i] >> 4];
+            buf[j + 1] = hex[random_bytes[i] & 0x0f];
+            j += 2;
+        }
+    }
+
+    /// Callback for the background chat worker thread. Matches the function
+    /// signature expected by WorkerPool.setBackgroundChatContext.
+    pub fn backgroundChatCallback(
+        ctx: *anyopaque,
+        message: []const u8,
+        session_id: ?[]const u8,
+        model_override: ?[]const u8,
+        allowed_tools: ?[]const u8,
+        confirm_ctx: ?*anyopaque,
+        confirm_fn: ?*const fn (ctx: *anyopaque, tool_name: []const u8, tool_id: []const u8, input_preview: []const u8) bool,
+    ) workers.BackgroundChatOutput {
+        const self: *Engine = @ptrCast(@alignCast(ctx));
+        const confirmer: ?ToolConfirmCallback = if (confirm_ctx != null and confirm_fn != null)
+            .{ .ctx = confirm_ctx.?, .confirmFn = confirm_fn.? }
+        else
+            null;
+        const result = self.process(.{ .chat = .{
+            .message = message,
+            .session_id = session_id,
+            .model_override = model_override,
+            .allowed_tools = allowed_tools,
+            .adapter_context = "You are running as a background agent. " ++
+                "Investigate thoroughly using file_read before making changes. " ++
+                "When you are ready to modify files or run commands, clearly state your plan first, " ++
+                "then proceed. The user will be prompted to approve the first mutation — " ++
+                "after approval, you have full autonomy to iterate (edit, build, test, fix) " ++
+                "until the task is complete.",
+            .stream = false,
+            .no_tools = false,
+            .background = false,
+        } }, null, confirmer);
+
+        return switch (result) {
+            .chat => |chat| .{
+                .ok = true,
+                .text = chat.text,
+                .model = chat.model,
+                .input_tokens = chat.input_tokens,
+                .output_tokens = chat.output_tokens,
+            },
+            .response => |resp| .{
+                .ok = false,
+                .error_message = switch (resp) {
+                    .error_resp => |e| e.message,
+                    else => "unexpected response type",
+                },
+            },
+        };
     }
 
     // ================================================================

@@ -22,11 +22,33 @@ pub const WorkerPool = struct {
     summarize_queue: Queue(SummarizeJob),
     extract_queue: Queue(ExtractJob),
     embed_queue: Queue(EmbedJob),
+    background_chat_queue: Queue(BackgroundChatJob),
 
     // Threads
     summarize_thread: ?std.Thread = null,
     extract_thread: ?std.Thread = null,
     embed_thread: ?std.Thread = null,
+    background_chat_thread: ?std.Thread = null,
+
+    // Background chat worker context (set via setBackgroundChatContext)
+    bg_process_fn: ?*const fn (
+        ctx: *anyopaque,
+        message: []const u8,
+        session_id: ?[]const u8,
+        model_override: ?[]const u8,
+        allowed_tools: ?[]const u8,
+        confirm_ctx: ?*anyopaque,
+        confirm_fn: ?*const fn (ctx: *anyopaque, tool_name: []const u8, tool_id: []const u8, input_preview: []const u8) bool,
+    ) BackgroundChatOutput = null,
+    bg_process_ctx: ?*anyopaque = null,
+
+    // Background job result store
+    result_store: ResultStore = .{},
+
+    // Tool confirmation gate (one at a time — single background thread)
+    confirmation_mutex: std.Thread.Mutex = .{},
+    confirmation_cond: std.Thread.Condition = .{},
+    current_confirmation: ?PendingConfirmation = null,
 
     running: bool = false,
 
@@ -44,6 +66,7 @@ pub const WorkerPool = struct {
             .summarize_queue = Queue(SummarizeJob).init(),
             .extract_queue = Queue(ExtractJob).init(),
             .embed_queue = Queue(EmbedJob).init(),
+            .background_chat_queue = Queue(BackgroundChatJob).init(),
         };
     }
 
@@ -79,6 +102,14 @@ pub const WorkerPool = struct {
             }
         }
 
+        if (self.bg_process_fn != null) {
+            if (std.Thread.spawn(.{}, runBackgroundChatWorker, .{self})) |t| {
+                self.background_chat_thread = t;
+            } else |err| {
+                std.log.err("Failed to spawn background chat worker: {}", .{err});
+            }
+        }
+
         std.log.info("Worker pool started", .{});
     }
 
@@ -90,6 +121,7 @@ pub const WorkerPool = struct {
         self.summarize_queue.signal();
         self.extract_queue.signal();
         self.embed_queue.signal();
+        self.background_chat_queue.signal();
 
         if (self.summarize_thread) |t| {
             t.join();
@@ -102,6 +134,10 @@ pub const WorkerPool = struct {
         if (self.embed_thread) |t| {
             t.join();
             self.embed_thread = null;
+        }
+        if (self.background_chat_thread) |t| {
+            t.join();
+            self.background_chat_thread = null;
         }
 
         std.log.info("Worker pool stopped", .{});
@@ -158,7 +194,105 @@ pub const WorkerPool = struct {
             .summarize = self.summarize_queue.len(),
             .extract = self.extract_queue.len(),
             .embed = self.embed_queue.len(),
+            .background_chat = self.background_chat_queue.len(),
         };
+    }
+
+    /// Queue a background chat job (runs full tool loop on dedicated thread).
+    pub fn enqueueBackgroundChat(self: *WorkerPool, job: BackgroundChatJob) void {
+        self.background_chat_queue.push(job);
+    }
+
+    /// Get result for a background job by ID.
+    pub fn getBackgroundResult(self: *WorkerPool, job_id: *const [36]u8) ?BackgroundChatResult {
+        return self.result_store.get(job_id);
+    }
+
+    /// Cancel a background job by setting its cancelled flag.
+    pub fn cancelBackgroundJob(self: *WorkerPool, job_id: *const [36]u8) bool {
+        // Check the queue for pending jobs
+        self.background_chat_queue.mutex.lock();
+        defer self.background_chat_queue.mutex.unlock();
+        var idx = self.background_chat_queue.head;
+        var checked: usize = 0;
+        while (checked < self.background_chat_queue.count) : (checked += 1) {
+            if (std.mem.eql(u8, &self.background_chat_queue.items[idx].job_id, job_id)) {
+                self.background_chat_queue.items[idx].cancelled.store(true, .release);
+                return true;
+            }
+            idx = (idx + 1) % Queue(BackgroundChatJob).CAPACITY;
+        }
+        return false;
+    }
+
+    /// Wire background chat context. Called from main.zig after engine init.
+    pub fn setBackgroundChatContext(
+        self: *WorkerPool,
+        ctx: *anyopaque,
+        process_fn: *const fn (
+            ctx: *anyopaque,
+            message: []const u8,
+            session_id: ?[]const u8,
+            model_override: ?[]const u8,
+            allowed_tools: ?[]const u8,
+            confirm_ctx: ?*anyopaque,
+            confirm_fn: ?*const fn (ctx: *anyopaque, tool_name: []const u8, tool_id: []const u8, input_preview: []const u8) bool,
+        ) BackgroundChatOutput,
+    ) void {
+        self.bg_process_ctx = ctx;
+        self.bg_process_fn = process_fn;
+    }
+
+    /// Block until user approves/denies a tool, or 60s timeout (auto-deny).
+    pub fn waitForConfirmation(self: *WorkerPool, job_id: *const [36]u8, tool_name: []const u8, tool_id: []const u8, input_preview: []const u8) bool {
+        self.confirmation_mutex.lock();
+        defer self.confirmation_mutex.unlock();
+
+        self.current_confirmation = .{
+            .job_id = job_id.*,
+            .tool_name = tool_name,
+            .tool_id = tool_id,
+            .input_preview = input_preview,
+            .approved = null,
+        };
+
+        var waited: u64 = 0;
+        const max_wait: u64 = 60;
+        while (waited < max_wait) : (waited += 1) {
+            if (self.current_confirmation) |c| {
+                if (c.approved != null) break;
+            } else break;
+            self.confirmation_cond.timedWait(&self.confirmation_mutex, std.time.ns_per_s) catch {};
+        }
+
+        const approved = if (self.current_confirmation) |c| c.approved orelse false else false;
+        self.current_confirmation = null;
+        return approved;
+    }
+
+    /// Resolve a pending confirmation from an API call.
+    pub fn resolveConfirmation(self: *WorkerPool, job_id: *const [36]u8, tool_id: []const u8, approved: bool) bool {
+        self.confirmation_mutex.lock();
+        defer self.confirmation_mutex.unlock();
+
+        if (self.current_confirmation) |*c| {
+            if (std.mem.eql(u8, &c.job_id, job_id) and std.mem.eql(u8, c.tool_id, tool_id)) {
+                c.approved = approved;
+                self.confirmation_cond.signal();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Check if there's a pending confirmation for a given job.
+    pub fn getPendingConfirmation(self: *WorkerPool, job_id: *const [36]u8) ?PendingConfirmation {
+        self.confirmation_mutex.lock();
+        defer self.confirmation_mutex.unlock();
+        if (self.current_confirmation) |c| {
+            if (std.mem.eql(u8, &c.job_id, job_id) and c.approved == null) return c;
+        }
+        return null;
     }
 
     // ================================================================
@@ -260,6 +394,102 @@ pub const WorkerPool = struct {
         }
         std.log.info("Embed worker stopped", .{});
     }
+
+    const BgConfirmCtx = struct {
+        pool: *WorkerPool,
+        job_id: *const [36]u8,
+        job_approved: bool = false,
+    };
+
+    fn bgConfirmCallback(ctx_ptr: *anyopaque, tool_name: []const u8, tool_id: []const u8, input_preview: []const u8) bool {
+        const confirm_ctx: *BgConfirmCtx = @ptrCast(@alignCast(ctx_ptr));
+        if (confirm_ctx.job_approved) return true;
+        const approved = confirm_ctx.pool.waitForConfirmation(confirm_ctx.job_id, tool_name, tool_id, input_preview);
+        if (approved) confirm_ctx.job_approved = true;
+        return approved;
+    }
+
+    fn runBackgroundChatWorker(self: *WorkerPool) void {
+        std.log.info("Background chat worker started", .{});
+
+        const process_fn = self.bg_process_fn orelse {
+            std.log.err("Background chat: no process function configured", .{});
+            return;
+        };
+        const process_ctx = self.bg_process_ctx orelse return;
+
+        while (self.running) {
+            if (self.background_chat_queue.pop()) |job| {
+                if (job.cancelled.load(.acquire)) {
+                    self.freeJobStrings(job);
+                    continue;
+                }
+
+                std.log.info("Background chat: processing job {s}", .{job.job_id[0..8]});
+
+                var confirm_ctx = BgConfirmCtx{ .pool = self, .job_id = &job.job_id };
+                const output = process_fn(
+                    process_ctx,
+                    job.message,
+                    &job.session_id,
+                    job.model_override,
+                    job.allowed_tools,
+                    @ptrCast(&confirm_ctx),
+                    &bgConfirmCallback,
+                );
+
+                if (output.ok) {
+                    self.result_store.put(.{
+                        .job_id = job.job_id,
+                        .status = .completed,
+                        .text = output.text,
+                        .model = output.model,
+                        .input_tokens = output.input_tokens,
+                        .output_tokens = output.output_tokens,
+                        .callback_channel = job.callback_channel,
+                        .timestamp = std.time.timestamp(),
+                    });
+                    std.log.info("Background chat: job {s} completed ({d} in / {d} out tokens)", .{
+                        job.job_id[0..8], output.input_tokens, output.output_tokens,
+                    });
+                } else {
+                    self.result_store.put(.{
+                        .job_id = job.job_id,
+                        .status = .failed,
+                        .text = output.error_message,
+                        .model = null,
+                        .input_tokens = 0,
+                        .output_tokens = 0,
+                        .callback_channel = job.callback_channel,
+                        .timestamp = std.time.timestamp(),
+                    });
+                    std.log.err("Background chat: job {s} failed: {s}", .{
+                        job.job_id[0..8], output.error_message orelse "unknown error",
+                    });
+                }
+
+                // Free owned job strings (message, model_override)
+                // callback_channel ownership transfers to the result
+                self.allocator.free(job.message);
+                if (job.model_override) |mo| self.allocator.free(mo);
+            } else {
+                self.background_chat_queue.waitOrTimeout(100_000_000);
+            }
+        }
+
+        // Drain remaining jobs
+        while (self.background_chat_queue.pop()) |job| {
+            self.freeJobStrings(job);
+        }
+        std.log.info("Background chat worker stopped", .{});
+    }
+
+    fn freeJobStrings(self: *WorkerPool, job: BackgroundChatJob) void {
+        self.allocator.free(job.message);
+        if (job.model_override) |mo| self.allocator.free(mo);
+        if (job.callback_channel) |cc| self.allocator.free(cc);
+        if (job.allowed_tools) |at| self.allocator.free(at);
+    }
 };
 
 // ================================================================
@@ -291,6 +521,92 @@ pub const QueueDepths = struct {
     summarize: usize,
     extract: usize,
     embed: usize,
+    background_chat: usize,
+};
+
+pub const BackgroundChatOutput = struct {
+    ok: bool,
+    text: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    error_message: ?[]const u8 = null,
+    input_tokens: u32 = 0,
+    output_tokens: u32 = 0,
+};
+
+pub const BackgroundChatJob = struct {
+    job_id: [36]u8,
+    message: []const u8,
+    session_id: [36]u8,
+    model_override: ?[]const u8,
+    callback_channel: ?[]const u8,
+    allowed_tools: ?[]const u8,
+    cancelled: std.atomic.Value(bool),
+};
+
+pub const BackgroundChatResult = struct {
+    job_id: [36]u8,
+    status: enum { completed, failed, cancelled },
+    text: ?[]const u8,
+    model: ?[]const u8,
+    input_tokens: u32,
+    output_tokens: u32,
+    callback_channel: ?[]const u8,
+    timestamp: i64,
+};
+
+pub const PendingConfirmation = struct {
+    job_id: [36]u8,
+    tool_name: []const u8,
+    tool_id: []const u8,
+    input_preview: []const u8,
+    approved: ?bool,
+};
+
+pub const ResultStore = struct {
+    const MAX_RESULTS = 64;
+
+    results: [MAX_RESULTS]?BackgroundChatResult = [_]?BackgroundChatResult{null} ** MAX_RESULTS,
+    mutex: std.Thread.Mutex = .{},
+
+    pub fn put(self: *ResultStore, result: BackgroundChatResult) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Find empty slot or evict oldest
+        var oldest_idx: usize = 0;
+        var oldest_ts: i64 = std.math.maxInt(i64);
+        for (self.results, 0..) |entry, i| {
+            if (entry == null) {
+                self.results[i] = result;
+                return;
+            }
+            if (entry.?.timestamp < oldest_ts) {
+                oldest_ts = entry.?.timestamp;
+                oldest_idx = i;
+            }
+        }
+        // Evict oldest
+        if (self.results[oldest_idx]) |old| {
+            self.freeResult(old);
+        }
+        self.results[oldest_idx] = result;
+    }
+
+    pub fn get(self: *ResultStore, job_id: *const [36]u8) ?BackgroundChatResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.results) |entry| {
+            if (entry) |r| {
+                if (std.mem.eql(u8, &r.job_id, job_id)) return r;
+            }
+        }
+        return null;
+    }
+
+    fn freeResult(_: ResultStore, _: BackgroundChatResult) void {
+        // Results own their text/model strings via the allocator that created them.
+        // For simplicity, we let the allocator (GPA) track these — they're small and bounded.
+    }
 };
 
 pub const CompactionGate = struct {

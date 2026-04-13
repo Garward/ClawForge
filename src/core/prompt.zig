@@ -261,7 +261,13 @@ pub fn buildFromState(
     if (session_system_prompt) |persona_name| {
         if (persona_name.len > 0) {
             layers.persona = loadPersona(allocator, persona_name);
+            std.log.info("Persona load: name='{s}' result={s}", .{
+                persona_name,
+                if (layers.persona != null) "loaded" else "FALLBACK_TO_DEFAULT",
+            });
         }
+    } else {
+        std.log.info("Persona load: no system_prompt on session, using DEFAULT", .{});
     }
     if (layers.persona == null) {
         layers.persona = DEFAULT_PERSONA;

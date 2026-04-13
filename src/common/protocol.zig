@@ -37,6 +37,14 @@ pub const Request = union(enum) {
         session_id: ?[]const u8 = null,
         model_override: ?[]const u8 = null,
         stream: bool = true,
+        no_tools: bool = false,
+        background: bool = false,
+        callback_channel: ?[]const u8 = null,
+        /// Comma-separated tool names to allow. If set, only these tools are
+        /// offered to the model. Null means all tools are available.
+        allowed_tools: ?[]const u8 = null,
+        /// Adapter-specific context injected into the system prompt.
+        adapter_context: ?[]const u8 = null,
     };
 
     pub const SessionCreateRequest = struct {
@@ -104,6 +112,27 @@ pub const Request = union(enum) {
                 writeEscaped(buf, &pos, req.message);
                 write(buf, &pos, "\",\"stream\":");
                 write(buf, &pos, if (req.stream) "true" else "false");
+                if (req.no_tools) {
+                    write(buf, &pos, ",\"no_tools\":true");
+                }
+                if (req.background) {
+                    write(buf, &pos, ",\"background\":true");
+                }
+                if (req.session_id) |sid| {
+                    write(buf, &pos, ",\"session_id\":\"");
+                    write(buf, &pos, sid);
+                    write(buf, &pos, "\"");
+                }
+                if (req.model_override) |mo| {
+                    write(buf, &pos, ",\"model_override\":\"");
+                    write(buf, &pos, mo);
+                    write(buf, &pos, "\"");
+                }
+                if (req.callback_channel) |cc| {
+                    write(buf, &pos, ",\"callback_channel\":\"");
+                    writeEscaped(buf, &pos, cc);
+                    write(buf, &pos, "\"");
+                }
                 write(buf, &pos, "}}");
             },
             .session_list => {
@@ -248,6 +277,9 @@ pub const Response = union(enum) {
     // Project responses
     project_list: []const ProjectSummary,
     project_info: ProjectInfoResp,
+    // Background job responses
+    background_queued: BackgroundQueued,
+    background_result: BackgroundResultResp,
 
     pub const StreamStart = struct {
         message_id: []const u8,
@@ -334,6 +366,21 @@ pub const Response = union(enum) {
         status: []const u8 = "active",
         rolling_summary: ?[]const u8 = null,
         rolling_state: ?[]const u8 = null,
+    };
+
+    pub const BackgroundQueued = struct {
+        job_id: []const u8,
+        session_id: []const u8,
+    };
+
+    pub const BackgroundResultResp = struct {
+        job_id: []const u8,
+        status: []const u8,
+        text: ?[]const u8 = null,
+        model: ?[]const u8 = null,
+        input_tokens: u32 = 0,
+        output_tokens: u32 = 0,
+        callback_channel: ?[]const u8 = null,
     };
 
     pub fn serialize(self: Response, allocator: std.mem.Allocator) ![]u8 {
@@ -585,6 +632,40 @@ pub const Response = union(enum) {
                     write(buf, &pos, "}");
                 }
                 write(buf, &pos, "]}");
+            },
+            .background_queued => |bg| {
+                write(buf, &pos, "{\"background_queued\":{\"job_id\":\"");
+                write(buf, &pos, bg.job_id);
+                write(buf, &pos, "\",\"session_id\":\"");
+                write(buf, &pos, bg.session_id);
+                write(buf, &pos, "\"}}");
+            },
+            .background_result => |bg| {
+                write(buf, &pos, "{\"background_result\":{\"job_id\":\"");
+                write(buf, &pos, bg.job_id);
+                write(buf, &pos, "\",\"status\":\"");
+                write(buf, &pos, bg.status);
+                write(buf, &pos, "\",\"text\":");
+                if (bg.text) |t| {
+                    write(buf, &pos, "\"");
+                    writeEscaped(buf, &pos, t);
+                    write(buf, &pos, "\"");
+                } else {
+                    write(buf, &pos, "null");
+                }
+                write(buf, &pos, ",\"model\":");
+                if (bg.model) |m| {
+                    write(buf, &pos, "\"");
+                    write(buf, &pos, m);
+                    write(buf, &pos, "\"");
+                } else {
+                    write(buf, &pos, "null");
+                }
+                write(buf, &pos, ",\"input_tokens\":");
+                writeNum(buf, &pos, bg.input_tokens);
+                write(buf, &pos, ",\"output_tokens\":");
+                writeNum(buf, &pos, bg.output_tokens);
+                write(buf, &pos, "}}");
             },
             .project_info => |info| {
                 write(buf, &pos, "{\"project_info\":{\"id\":");

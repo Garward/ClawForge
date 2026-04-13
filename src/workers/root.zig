@@ -9,3 +9,6 @@ pub const Embedder = embedder.Embedder;
 pub const WorkerPool = pool.WorkerPool;
 pub const QueueDepths = pool.QueueDepths;
 pub const CompactionGate = pool.CompactionGate;
+pub const BackgroundChatOutput = pool.BackgroundChatOutput;
+pub const BackgroundChatResult = pool.BackgroundChatResult;
+pub const PendingConfirmation = pool.PendingConfirmation;

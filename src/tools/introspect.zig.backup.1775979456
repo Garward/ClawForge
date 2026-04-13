@@ -515,7 +515,7 @@ fn buildMetricsQuery(allocator: std.mem.Allocator, session_filter: ?[]const u8) 
     
     if (session_filter) |sf| {
         parts.appendSlice(allocator, "WHERE s.session_id = '") catch return null;
-        appendEscaped(&parts, allocator, sf);
+        escapeSql(&parts, allocator, sf);
         parts.appendSlice(allocator, "' ") catch return null;
     } else {
         // Get current session by default

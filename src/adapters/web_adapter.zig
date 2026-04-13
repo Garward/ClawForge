@@ -1,6 +1,7 @@
 const std = @import("std");
 const common = @import("common");
 const core = @import("core");
+const storage = @import("storage");
 const adapter_mod = @import("adapter.zig");
 
 /// Web adapter: HTTP server with JSON API and SSE streaming.
@@ -103,6 +104,10 @@ pub const WebAdapter = struct {
             try self.serveIndex(conn.stream);
         } else if (std.mem.eql(u8, path, "/api/chat/stream")) {
             try self.handleApiChatStream(conn.stream, method, body);
+        } else if (std.mem.eql(u8, path, "/api/chat/background")) {
+            try self.handleApiChatBackground(conn.stream, method, body);
+        } else if (std.mem.startsWith(u8, path, "/api/background")) {
+            try self.handleApiBackground(conn.stream, method, path, body);
         } else if (std.mem.startsWith(u8, path, "/api/chat")) {
             try self.handleApiChat(conn.stream, method, body);
         } else if (std.mem.startsWith(u8, path, "/api/messages")) {
@@ -117,14 +122,16 @@ pub const WebAdapter = struct {
             try self.handleApiProjects(conn.stream);
         } else if (std.mem.startsWith(u8, path, "/api/tools/register")) {
             try self.handleApiToolRegister(conn.stream, body);
+        } else if (std.mem.eql(u8, path, "/api/tools/autoapprove")) {
+            try self.handleApiToolAutoApprove(conn.stream, method, body);
         } else if (std.mem.eql(u8, path, "/api/tools")) {
             if (std.mem.eql(u8, method, "POST")) {
                 try self.handleApiToolToggle(conn.stream, body);
             } else {
                 try self.handleApiTools(conn.stream);
             }
-        } else if (std.mem.eql(u8, path, "/api/persona")) {
-            try self.handleApiPersona(conn.stream, method, body);
+        } else if (std.mem.startsWith(u8, path, "/api/persona")) {
+            try self.handleApiPersona(conn.stream, method, path, body);
         } else {
             try self.serve404(conn.stream);
         }
@@ -165,7 +172,20 @@ pub const WebAdapter = struct {
             return;
         };
 
-        const result = self.engine.process(.{ .chat = .{ .message = message } }, null, null);
+        const no_tools = if (parsed.value.object.get("no_tools")) |v| (v == .bool and v.bool) else false;
+        const session_id = if (parsed.value.object.get("session_id")) |v| (if (v == .string) v.string else null) else null;
+        const model_override = if (parsed.value.object.get("model_override")) |v| (if (v == .string) v.string else null) else null;
+        const allowed_tools = if (parsed.value.object.get("allowed_tools")) |v| (if (v == .string) v.string else null) else null;
+        const adapter_context = if (parsed.value.object.get("adapter_context")) |v| (if (v == .string) v.string else null) else null;
+
+        const result = self.engine.process(.{ .chat = .{
+            .message = message,
+            .session_id = session_id,
+            .model_override = model_override,
+            .no_tools = no_tools,
+            .allowed_tools = allowed_tools,
+            .adapter_context = adapter_context,
+        } }, null, null);
 
         switch (result) {
             .chat => |chat| {
@@ -199,7 +219,24 @@ pub const WebAdapter = struct {
                 json_out.appendSlice(self.allocator, ",\"context_tokens\":") catch {};
                 const ctx_str = std.fmt.bufPrint(&num_buf, "{d}", .{chat.context_tokens}) catch "0";
                 json_out.appendSlice(self.allocator, ctx_str) catch {};
-                json_out.appendSlice(self.allocator, "}}") catch {};
+                json_out.appendSlice(self.allocator, "}") catch {};
+
+                // Surface spawned subagent job IDs so adapters can poll them.
+                if (chat.spawned_jobs) |jobs_csv| {
+                    json_out.appendSlice(self.allocator, ",\"spawned_jobs\":[") catch {};
+                    var first_job = true;
+                    var iter = std.mem.splitScalar(u8, jobs_csv, ',');
+                    while (iter.next()) |jid| {
+                        if (jid.len == 0) continue;
+                        if (!first_job) json_out.append(self.allocator, ',') catch {};
+                        first_job = false;
+                        json_out.append(self.allocator, '"') catch {};
+                        json_out.appendSlice(self.allocator, jid) catch {};
+                        json_out.append(self.allocator, '"') catch {};
+                    }
+                    json_out.append(self.allocator, ']') catch {};
+                }
+                json_out.append(self.allocator, '}') catch {};
 
                 try self.sendHttp(stream, "200 OK", "application/json", json_out.items);
             },
@@ -216,19 +253,207 @@ pub const WebAdapter = struct {
         }
     }
 
+    fn handleApiChatBackground(self: *WebAdapter, stream: std.net.Stream, method: []const u8, body: []const u8) !void {
+        if (!std.mem.eql(u8, method, "POST")) {
+            try self.sendHttp(stream, "405 Method Not Allowed", "text/plain", "Method Not Allowed");
+            return;
+        }
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{
+            .allocate = .alloc_always,
+        }) catch {
+            try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Invalid JSON\"}");
+            return;
+        };
+        defer parsed.deinit();
+
+        const message = if (parsed.value.object.get("message")) |m| (if (m == .string) m.string else null) else null;
+        if (message == null) {
+            try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Missing message\"}");
+            return;
+        }
+
+        const session_id = if (parsed.value.object.get("session_id")) |v| (if (v == .string) v.string else null) else null;
+        const model_override = if (parsed.value.object.get("model_override")) |v| (if (v == .string) v.string else null) else null;
+        const callback_channel = if (parsed.value.object.get("callback_channel")) |v| (if (v == .string) v.string else null) else null;
+        const allowed_tools = if (parsed.value.object.get("allowed_tools")) |v| (if (v == .string) v.string else null) else null;
+
+        const result = self.engine.process(.{ .chat = .{
+            .message = message.?,
+            .session_id = session_id,
+            .model_override = model_override,
+            .callback_channel = callback_channel,
+            .allowed_tools = allowed_tools,
+            .background = true,
+        } }, null, null);
+
+        switch (result) {
+            .response => |resp| switch (resp) {
+                .background_queued => |bg| {
+                    var out: [256]u8 = undefined;
+                    const json_resp = std.fmt.bufPrint(&out, "{{\"ok\":true,\"job_id\":\"{s}\",\"session_id\":\"{s}\"}}", .{ bg.job_id, bg.session_id }) catch "{\"ok\":true}";
+                    try self.sendHttp(stream, "200 OK", "application/json", json_resp);
+                },
+                .error_resp => |err| {
+                    var err_buf: [256]u8 = undefined;
+                    const err_json = std.fmt.bufPrint(&err_buf, "{{\"error\":\"{s}\"}}", .{err.message}) catch "{\"error\":\"Internal error\"}";
+                    try self.sendHttp(stream, "500 Internal Server Error", "application/json", err_json);
+                },
+                else => try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Unexpected response\"}"),
+            },
+            else => try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Unexpected result\"}"),
+        }
+    }
+
+    fn handleApiBackground(self: *WebAdapter, stream: std.net.Stream, method: []const u8, path: []const u8, body: []const u8) !void {
+        if (!std.mem.eql(u8, method, "POST")) {
+            try self.sendHttp(stream, "405 Method Not Allowed", "text/plain", "Method Not Allowed");
+            return;
+        }
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{
+            .allocate = .alloc_always,
+        }) catch {
+            try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Invalid JSON\"}");
+            return;
+        };
+        defer parsed.deinit();
+
+        const job_id_str = if (parsed.value.object.get("job_id")) |v| (if (v == .string) v.string else null) else null;
+        if (job_id_str == null or job_id_str.?.len != 36) {
+            try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Missing or invalid job_id\"}");
+            return;
+        }
+        var job_id: [36]u8 = undefined;
+        @memcpy(&job_id, job_id_str.?[0..36]);
+
+        if (std.mem.endsWith(u8, path, "/cancel")) {
+            // Cancel endpoint
+            const wp = self.engine.worker_pool orelse {
+                try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"No worker pool\"}");
+                return;
+            };
+            _ = wp.cancelBackgroundJob(&job_id);
+            try self.sendHttp(stream, "200 OK", "application/json", "{\"ok\":true}");
+            return;
+        }
+
+        if (std.mem.endsWith(u8, path, "/confirm")) {
+            const wp = self.engine.worker_pool orelse {
+                try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"No worker pool\"}");
+                return;
+            };
+            const tool_id_str = if (parsed.value.object.get("tool_id")) |v| (if (v == .string) v.string else null) else null;
+            if (tool_id_str == null) {
+                try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Missing tool_id\"}");
+                return;
+            }
+            const approved_val = if (parsed.value.object.get("approved")) |v| (if (v == .bool) v.bool else null) else null;
+            if (approved_val == null) {
+                try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Missing approved (bool)\"}");
+                return;
+            }
+            const resolved = wp.resolveConfirmation(&job_id, tool_id_str.?, approved_val.?);
+            if (resolved) {
+                try self.sendHttp(stream, "200 OK", "application/json", "{\"ok\":true}");
+            } else {
+                try self.sendHttp(stream, "404 Not Found", "application/json", "{\"error\":\"No matching pending confirmation\"}");
+            }
+            return;
+        }
+
+        // Status endpoint (default)
+        const wp = self.engine.worker_pool orelse {
+            try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"No worker pool\"}");
+            return;
+        };
+
+        if (wp.getBackgroundResult(&job_id)) |result| {
+            var out: std.ArrayList(u8) = .{};
+            defer out.deinit(self.allocator);
+
+            const status_str = switch (result.status) {
+                .completed => "completed",
+                .failed => "failed",
+                .cancelled => "cancelled",
+            };
+
+            out.appendSlice(self.allocator, "{\"status\":\"") catch {};
+            out.appendSlice(self.allocator, status_str) catch {};
+            out.appendSlice(self.allocator, "\",\"text\":") catch {};
+            if (result.text) |t| {
+                out.appendSlice(self.allocator, "\"") catch {};
+                for (t) |ch| {
+                    switch (ch) {
+                        '"' => out.appendSlice(self.allocator, "\\\"") catch {},
+                        '\\' => out.appendSlice(self.allocator, "\\\\") catch {},
+                        '\n' => out.appendSlice(self.allocator, "\\n") catch {},
+                        '\r' => out.appendSlice(self.allocator, "\\r") catch {},
+                        else => out.append(self.allocator, ch) catch {},
+                    }
+                }
+                out.appendSlice(self.allocator, "\"") catch {};
+            } else {
+                out.appendSlice(self.allocator, "null") catch {};
+            }
+            out.appendSlice(self.allocator, ",\"model\":") catch {};
+            if (result.model) |m| {
+                out.appendSlice(self.allocator, "\"") catch {};
+                out.appendSlice(self.allocator, m) catch {};
+                out.appendSlice(self.allocator, "\"") catch {};
+            } else {
+                out.appendSlice(self.allocator, "null") catch {};
+            }
+            var num_buf: [32]u8 = undefined;
+            out.appendSlice(self.allocator, ",\"input_tokens\":") catch {};
+            out.appendSlice(self.allocator, std.fmt.bufPrint(&num_buf, "{d}", .{result.input_tokens}) catch "0") catch {};
+            out.appendSlice(self.allocator, ",\"output_tokens\":") catch {};
+            out.appendSlice(self.allocator, std.fmt.bufPrint(&num_buf, "{d}", .{result.output_tokens}) catch "0") catch {};
+            out.appendSlice(self.allocator, "}") catch {};
+            try self.sendHttp(stream, "200 OK", "application/json", out.items);
+        } else {
+            // No result yet — check for pending tool confirmation
+            if (wp.getPendingConfirmation(&job_id)) |conf| {
+                var out: std.ArrayList(u8) = .{};
+                defer out.deinit(self.allocator);
+                out.appendSlice(self.allocator, "{\"status\":\"pending\",\"pending_confirmation\":{\"tool_name\":\"") catch {};
+                out.appendSlice(self.allocator, conf.tool_name) catch {};
+                out.appendSlice(self.allocator, "\",\"tool_id\":\"") catch {};
+                out.appendSlice(self.allocator, conf.tool_id) catch {};
+                out.appendSlice(self.allocator, "\",\"input_preview\":") catch {};
+                out.appendSlice(self.allocator, "\"") catch {};
+                for (conf.input_preview) |ch| {
+                    switch (ch) {
+                        '"' => out.appendSlice(self.allocator, "\\\"") catch {},
+                        '\\' => out.appendSlice(self.allocator, "\\\\") catch {},
+                        '\n' => out.appendSlice(self.allocator, "\\n") catch {},
+                        '\r' => out.appendSlice(self.allocator, "\\r") catch {},
+                        else => out.append(self.allocator, ch) catch {},
+                    }
+                }
+                out.appendSlice(self.allocator, "\"}}") catch {};
+                try self.sendHttp(stream, "200 OK", "application/json", out.items);
+            } else {
+                try self.sendHttp(stream, "200 OK", "application/json", "{\"status\":\"pending\"}");
+            }
+        }
+    }
+
     /// SSE emitter context — holds the HTTP stream and allocator for building SSE events.
     const SSEContext = struct {
         stream: std.net.Stream,
         allocator: std.mem.Allocator,
+        cancelled: bool = false,
     };
 
     /// Callback that writes Response events as SSE to the HTTP stream in real time.
+    /// Sets cancelled=true on the context when a write fails (client disconnected).
     fn sseEmitCallback(ctx: *anyopaque, response: common.Response) void {
         const sse_ctx: *SSEContext = @ptrCast(@alignCast(ctx));
+        if (sse_ctx.cancelled) return;
 
         switch (response) {
             .stream_text => |text| {
-                // Build SSE event: data: {"type":"text","text":"...delta..."}\n\n
                 var buf: std.ArrayList(u8) = .{};
                 defer buf.deinit(sse_ctx.allocator);
                 buf.appendSlice(sse_ctx.allocator, "data: {\"type\":\"text\",\"text\":\"") catch return;
@@ -242,7 +467,9 @@ pub const WebAdapter = struct {
                     }
                 }
                 buf.appendSlice(sse_ctx.allocator, "\"}\n\n") catch return;
-                _ = sse_ctx.stream.write(buf.items) catch {};
+                sse_ctx.stream.writeAll(buf.items) catch {
+                    sse_ctx.cancelled = true;
+                };
             },
             .stream_tool_use => |tool| {
                 var buf: std.ArrayList(u8) = .{};
@@ -252,7 +479,6 @@ pub const WebAdapter = struct {
                 buf.appendSlice(sse_ctx.allocator, "\",\"tool_id\":\"") catch return;
                 buf.appendSlice(sse_ctx.allocator, tool.tool_id) catch return;
                 buf.appendSlice(sse_ctx.allocator, "\",\"input\":\"") catch return;
-                // JSON-escape the input
                 for (tool.input) |ch| {
                     switch (ch) {
                         '"' => buf.appendSlice(sse_ctx.allocator, "\\\"") catch {},
@@ -263,7 +489,9 @@ pub const WebAdapter = struct {
                     }
                 }
                 buf.appendSlice(sse_ctx.allocator, "\"}\n\n") catch return;
-                _ = sse_ctx.stream.write(buf.items) catch {};
+                sse_ctx.stream.writeAll(buf.items) catch {
+                    sse_ctx.cancelled = true;
+                };
             },
             .stream_tool_result => |result| {
                 var buf: std.ArrayList(u8) = .{};
@@ -272,7 +500,6 @@ pub const WebAdapter = struct {
                 buf.appendSlice(sse_ctx.allocator, result.tool_id) catch return;
                 buf.appendSlice(sse_ctx.allocator, "\",\"is_error\":") catch return;
                 buf.appendSlice(sse_ctx.allocator, if (result.is_error) "true" else "false") catch return;
-                // Include truncated result for dropdown
                 buf.appendSlice(sse_ctx.allocator, ",\"result\":\"") catch return;
                 const max_result = @min(result.result.len, 2000);
                 for (result.result[0..max_result]) |ch| {
@@ -281,14 +508,23 @@ pub const WebAdapter = struct {
                         '\\' => buf.appendSlice(sse_ctx.allocator, "\\\\") catch {},
                         '\n' => buf.appendSlice(sse_ctx.allocator, "\\n") catch {},
                         '\r' => buf.appendSlice(sse_ctx.allocator, "\\r") catch {},
-                        else => if (ch >= 0x20) { buf.append(sse_ctx.allocator, ch) catch {}; },
+                        else => if (ch >= 0x20) {
+                            buf.append(sse_ctx.allocator, ch) catch {};
+                        },
                     }
                 }
                 buf.appendSlice(sse_ctx.allocator, "\"}\n\n") catch return;
-                _ = sse_ctx.stream.write(buf.items) catch {};
+                sse_ctx.stream.writeAll(buf.items) catch {
+                    sse_ctx.cancelled = true;
+                };
             },
             else => {},
         }
+    }
+
+    fn sseIsCancelled(ctx: *anyopaque) bool {
+        const sse_ctx: *SSEContext = @ptrCast(@alignCast(ctx));
+        return sse_ctx.cancelled;
     }
 
     fn handleApiChatStream(self: *WebAdapter, stream: std.net.Stream, method: []const u8, body: []const u8) !void {
@@ -323,12 +559,15 @@ pub const WebAdapter = struct {
         const emitter = core.Engine.StreamEmitter{
             .ctx = @ptrCast(&sse_ctx),
             .emitFn = &sseEmitCallback,
+            .isCancelledFn = &sseIsCancelled,
         };
 
         // Hold the compaction gate open for the entire SSE session so background
         // summarization cannot mutate the message store while we are still streaming.
+        const session_id = if (parsed.value.object.get("session_id")) |v| (if (v == .string) v.string else null) else null;
+
         self.engine.beginStreaming();
-        const result = self.engine.process(.{ .chat = .{ .message = message } }, emitter, null);
+        const result = self.engine.process(.{ .chat = .{ .message = message, .session_id = session_id } }, emitter, null);
 
         // After streaming completes, send done event with final metadata
         switch (result) {
@@ -656,6 +895,36 @@ pub const WebAdapter = struct {
         try self.sendHttp(stream, "200 OK", "application/json", "{\"ok\":true}");
     }
 
+    /// GET returns {enabled: bool}. POST {enabled: bool} sets the flag.
+    fn handleApiToolAutoApprove(self: *WebAdapter, stream: std.net.Stream, method: []const u8, body: []const u8) !void {
+        if (std.mem.eql(u8, method, "GET")) {
+            const is_on = self.engine.tool_registry.isAutoApprove();
+            const out = if (is_on) "{\"enabled\":true}" else "{\"enabled\":false}";
+            try self.sendHttp(stream, "200 OK", "application/json", out);
+            return;
+        }
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{
+            .allocate = .alloc_always,
+        }) catch {
+            try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Invalid JSON\"}");
+            return;
+        };
+        defer parsed.deinit();
+
+        const enabled = if (parsed.value.object.get("enabled")) |e| (if (e == .bool) e.bool else null) else null;
+        if (enabled == null) {
+            try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Need enabled field\"}");
+            return;
+        }
+
+        self.engine.tool_registry.setAutoApprove(enabled.?);
+        std.log.info("Tool auto-approve set to {s} via web", .{if (enabled.?) "ON" else "OFF"});
+
+        const out = if (enabled.?) "{\"ok\":true,\"enabled\":true}" else "{\"ok\":true,\"enabled\":false}";
+        try self.sendHttp(stream, "200 OK", "application/json", out);
+    }
+
     fn handleApiTools(self: *WebAdapter, stream: std.net.Stream) !void {
         // Return all registered tools with live enabled status from the registry
         var out: std.ArrayList(u8) = .{};
@@ -736,28 +1005,40 @@ pub const WebAdapter = struct {
         try self.sendHttp(stream, "200 OK", "application/json", "{\"ok\":true}");
     }
 
-    /// GET /api/persona — list personas + current session's active persona name
-    /// POST /api/persona {action, name, content?}
-    ///   action=select: set active persona for session
+    /// GET /api/persona[?session_id=UUID] — list personas + active persona for the session
+    /// POST /api/persona {action, name, content?, session_id?}
+    ///   action=select: set active persona for the given session (or active session if none)
     ///   action=create: create new persona file
     ///   action=delete: delete persona file
-    fn handleApiPersona(self: *WebAdapter, stream: std.net.Stream, method: []const u8, body: []const u8) !void {
+    fn handleApiPersona(self: *WebAdapter, stream: std.net.Stream, method: []const u8, path: []const u8, body: []const u8) !void {
         const prompt_mod = @import("core").prompt;
 
         if (std.mem.eql(u8, method, "GET")) {
-            // Return list of available personas + which one is active
+            // Optional ?session_id=UUID query param scopes the "active persona" lookup
+            const query_session_id: ?[]const u8 = blk: {
+                if (std.mem.indexOf(u8, path, "session_id=")) |idx| {
+                    const sid_start = idx + "session_id=".len;
+                    const rest = path[sid_start..];
+                    const end = std.mem.indexOfAny(u8, rest, "&") orelse rest.len;
+                    if (end > 0) break :blk rest[0..end];
+                }
+                break :blk null;
+            };
+
             const personas = try prompt_mod.listPersonas(self.allocator);
             defer {
                 for (personas) |name| self.allocator.free(name);
                 self.allocator.free(personas);
             }
 
-            // Get active persona name from session
+            // Resolve active persona: explicit session_id wins, else daemon active session
             var active_name: []const u8 = "default";
-            var _sess_info = if (self.engine.session_store.active_session_id) |sid|
-                (self.engine.session_store.getSession(&sid) catch null)
-            else
-                null;
+            var _sess_info: ?storage.SessionInfo = null;
+            if (query_session_id) |sid| {
+                _sess_info = self.engine.session_store.getSession(sid) catch null;
+            } else if (self.engine.session_store.active_session_id) |sid| {
+                _sess_info = self.engine.session_store.getSession(&sid) catch null;
+            }
             if (_sess_info) |si| {
                 if (si.system_prompt) |sp| active_name = sp;
             }
@@ -800,18 +1081,26 @@ pub const WebAdapter = struct {
 
         const action = if (obj.get("action")) |a| (if (a == .string) a.string else "select") else "select";
         const name = if (obj.get("name")) |n| (if (n == .string) n.string else null) else null;
+        const body_session_id: ?[]const u8 = if (obj.get("session_id")) |s| (if (s == .string) s.string else null) else null;
 
         if (std.mem.eql(u8, action, "select")) {
-            // Set active persona for current session (null or "default" = default)
-            const session_id = self.engine.session_store.active_session_id orelse {
-                try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"No active session\"}");
-                return;
-            };
+            // Resolve target session: explicit session_id from body, else daemon active session
             const persona_name: ?[]const u8 = if (name) |n| (if (std.mem.eql(u8, n, "default")) null else n) else null;
-            self.engine.session_store.updateSystemPrompt(&session_id, persona_name) catch {
-                try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Failed to update\"}");
-                return;
-            };
+            if (body_session_id) |sid| {
+                self.engine.session_store.updateSystemPrompt(sid, persona_name) catch {
+                    try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Failed to update\"}");
+                    return;
+                };
+            } else {
+                const session_id = self.engine.session_store.active_session_id orelse {
+                    try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"No active session\"}");
+                    return;
+                };
+                self.engine.session_store.updateSystemPrompt(&session_id, persona_name) catch {
+                    try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Failed to update\"}");
+                    return;
+                };
+            }
             try self.sendHttp(stream, "200 OK", "application/json", "{\"ok\":true}");
         } else if (std.mem.eql(u8, action, "create")) {
             const content = if (obj.get("content")) |c| (if (c == .string) c.string else null) else null;

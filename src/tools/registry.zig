@@ -13,6 +13,25 @@ const meme_tool = @import("meme_tool.zig");
 const rebuild = @import("rebuild.zig");
 const research_tool = @import("research_tool.zig");
 
+/// summon_subagent — special tool. Execution is intercepted by the engine
+/// (it needs worker pool + session context) so this definition has no handler.
+pub const summon_subagent_def = ToolDefinition{
+    .name = "summon_subagent",
+    .description =
+        "Spawn a background subagent worker to handle a task that requires file edits, " ++
+        "shell commands, builds, multi-step tool calls, or any substantive work. Returns a job ID; " ++
+        "the user will receive the subagent's result automatically when it completes — you do not " ++
+        "wait for it. Use this whenever the user asks for code changes, file modifications, " ++
+        "system work, debugging, or anything that needs real tools. Do NOT use it for casual " ++
+        "conversation, simple questions, or things you can answer directly from context. " ++
+        "The subagent inherits the current session's persona and conversation history.",
+    .input_schema_json =
+        \\{"type":"object","properties":{"task":{"type":"string","description":"Clear, specific task description for the subagent. Include file paths, the goal, and any constraints."},"model":{"type":"string","description":"Optional Anthropic model id for the subagent (e.g. 'claude-sonnet-4-6', 'claude-opus-4-6'). Defaults to the daemon's worker model."}},"required":["task"]}
+    ,
+    .requires_confirmation = false,
+    .handler = null,
+};
+
 pub const ToolResult = struct {
     content: []const u8,
     /// Optional compact form that is safe to send back to the LLM in follow-up tool rounds.
@@ -40,6 +59,15 @@ pub const ToolRegistry = struct {
     allocator: std.mem.Allocator,
     tools: std.StringHashMap(ToolDefinition),
     enabled: std.StringHashMap(void),
+    /// Serializes mutations and reads across threads. Both the main engine
+    /// and the background-chat engine share a single registry, and the user
+    /// can toggle tool enablement while a subagent is mid-tool-loop.
+    mutex: std.Thread.Mutex = .{},
+    /// When true, requiresConfirmation() returns false for every tool so
+    /// subagents can run mutating tools without prompting the user.
+    /// Toggled at runtime via /api/tools/autoapprove and the /autoapprove
+    /// Discord slash command.
+    auto_approve: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(allocator: std.mem.Allocator) ToolRegistry {
         return .{
@@ -66,6 +94,7 @@ pub const ToolRegistry = struct {
         try self.register(meme_tool.definition);
         try self.register(rebuild.definition);
         try self.register(research_tool.definition);
+        try self.register(summon_subagent_def);
     }
 
     pub fn register(self: *ToolRegistry, tool: ToolDefinition) !void {
@@ -73,16 +102,22 @@ pub const ToolRegistry = struct {
     }
 
     pub fn enable(self: *ToolRegistry, name: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.tools.contains(name)) {
             try self.enabled.put(name, {});
         }
     }
 
     pub fn disable(self: *ToolRegistry, name: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         _ = self.enabled.remove(name);
     }
 
     pub fn isEnabled(self: *ToolRegistry, name: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.enabled.contains(name);
     }
 
@@ -103,7 +138,16 @@ pub const ToolRegistry = struct {
         return .{ .content = "Tool has no execution handler", .is_error = true };
     }
 
+    pub fn setAutoApprove(self: *ToolRegistry, enabled: bool) void {
+        self.auto_approve.store(enabled, .release);
+    }
+
+    pub fn isAutoApprove(self: *ToolRegistry) bool {
+        return self.auto_approve.load(.acquire);
+    }
+
     pub fn requiresConfirmation(self: *ToolRegistry, name: []const u8) bool {
+        if (self.auto_approve.load(.acquire)) return false;
         if (self.tools.get(name)) |tool| {
             return tool.requires_confirmation;
         }
@@ -111,6 +155,8 @@ pub const ToolRegistry = struct {
     }
 
     pub fn getToolDefinitions(self: *ToolRegistry) ?[]const api_messages.ToolDefinition {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.enabled.count() == 0) return null;
         const count = self.enabled.count();
         const result = self.allocator.alloc(api_messages.ToolDefinition, count) catch return null;
@@ -135,6 +181,8 @@ pub const ToolRegistry = struct {
     /// Purpose: avoid paying schema tokens for tools that are irrelevant to the current turn.
     pub fn getToolDefinitionsFiltered(self: *ToolRegistry, names: []const []const u8) ?[]const api_messages.ToolDefinition {
         if (names.len == 0) return null;
+        self.mutex.lock();
+        defer self.mutex.unlock();
 
         const result = self.allocator.alloc(api_messages.ToolDefinition, names.len) catch return null;
         var idx: usize = 0;

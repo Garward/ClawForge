@@ -14,7 +14,7 @@ pub const definition = registry.ToolDefinition{
         " 'sessions', 'tool_stats', 'tool_history', 'session_stats', 'metrics'." ++
         " For finding relevant past context, prefer 'semantic_search' over 'message_search' — it finds meaning, not just keywords.",
     .input_schema_json =
-        \\{"type":"object","properties":{"mode":{"type":"string","enum":["semantic_search","message_search","message_history","knowledge_search","knowledge_browse","summary_search","summary_history","projects","project_context","sessions","tool_stats","tool_history","session_stats","metrics"],"description":"What to query. Use semantic_search for meaning-based recall across all data."},"query":{"type":"string","description":"Search term (required for *_search modes)"},"source_type":{"type":"string","description":"Filter semantic_search by source: 'message', 'summary', or 'knowledge'"},"category":{"type":"string","description":"Filter knowledge by category"},"session_id":{"type":"string","description":"Filter by session ID"},"project_id":{"type":"string","description":"Filter by project ID or name"},"role":{"type":"string","description":"Filter by role: 'user' or 'assistant'"},"date":{"type":"string","description":"Filter by date (YYYY-MM-DD)"},"tool_name":{"type":"string","description":"Filter by tool name"},"limit":{"type":"integer","description":"Max rows (default 20)"}},"required":["mode"]}
+        \\{"type":"object","properties":{"mode":{"type":"string","enum":["semantic_search","message_search","message_history","knowledge_search","knowledge_browse","summary_search","summary_history","projects","project_context","sessions","tool_stats","tool_history","session_stats"],"description":"What to query. Use semantic_search for meaning-based recall across all data."},"query":{"type":"string","description":"Search term (required for *_search modes)"},"source_type":{"type":"string","description":"Filter semantic_search by source: 'message', 'summary', or 'knowledge'"},"category":{"type":"string","description":"Filter knowledge by category"},"session_id":{"type":"string","description":"Filter by session ID"},"project_id":{"type":"string","description":"Filter by project ID or name"},"role":{"type":"string","description":"Filter by role: 'user' or 'assistant'"},"date":{"type":"string","description":"Filter by date (YYYY-MM-DD)"},"tool_name":{"type":"string","description":"Filter by tool name"},"limit":{"type":"integer","description":"Max rows (default 20)"}},"required":["mode"]}
     ,
     .requires_confirmation = false,
     .handler = &execute,
@@ -78,8 +78,6 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
         buildToolHistoryQuery(allocator, date_filter, tool_filter, limit_str)
     else if (std.mem.eql(u8, mode, "session_stats"))
         buildSessionStatsQuery(allocator, date_filter)
-    else if (std.mem.eql(u8, mode, "metrics"))
-        buildMetricsQuery(allocator, session_filter)
     else
         return .{ .content = "Unknown mode.", .is_error = true };
 
@@ -497,33 +495,5 @@ fn buildSessionsQuery(allocator: std.mem.Allocator, date: ?[]const u8, limit: []
     parts.appendSlice(allocator, " ORDER BY s.updated_at DESC LIMIT ") catch return null;
     parts.appendSlice(allocator, limit) catch return null;
     parts.appendSlice(allocator, ";") catch return null;
-    return parts.items;
-}
-
-fn buildMetricsQuery(allocator: std.mem.Allocator, session_filter: ?[]const u8) ?[]const u8 {
-    var parts: std.ArrayList(u8) = .{};
-    
-    parts.appendSlice(allocator, "SELECT ") catch return null;
-    parts.appendSlice(allocator, "'session_id' as metric, s.session_id as value, ") catch return null;
-    parts.appendSlice(allocator, "'token_usage' as details, ") catch return null;
-    parts.appendSlice(allocator, "COALESCE(SUM(m.input_tokens), 0) as input_tokens, ") catch return null;
-    parts.appendSlice(allocator, "COALESCE(SUM(m.output_tokens), 0) as output_tokens, ") catch return null;
-    parts.appendSlice(allocator, "COALESCE(SUM(m.input_tokens + m.output_tokens), 0) as total_tokens, ") catch return null;
-    parts.appendSlice(allocator, "COUNT(m.id) as message_count ") catch return null;
-    parts.appendSlice(allocator, "FROM sessions s ") catch return null;
-    parts.appendSlice(allocator, "LEFT JOIN messages m ON s.session_id = m.session_id ") catch return null;
-    
-    if (session_filter) |sf| {
-        parts.appendSlice(allocator, "WHERE s.session_id = '") catch return null;
-        appendEscaped(&parts, allocator, sf);
-        parts.appendSlice(allocator, "' ") catch return null;
-    } else {
-        // Get current session by default
-        parts.appendSlice(allocator, "WHERE s.session_id = (SELECT session_id FROM sessions ORDER BY updated_at DESC LIMIT 1) ") catch return null;
-    }
-    
-    parts.appendSlice(allocator, "GROUP BY s.session_id ") catch return null;
-    parts.appendSlice(allocator, "ORDER BY s.updated_at DESC;") catch return null;
-    
     return parts.items;
 }

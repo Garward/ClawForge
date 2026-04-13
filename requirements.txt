@@ -1,0 +1,7 @@
+# Discord bridge
+discord.py>=2.3
+aiohttp>=3.9
+
+# Python tools (research_tool.py)
+requests>=2.31
+beautifulsoup4>=4.12

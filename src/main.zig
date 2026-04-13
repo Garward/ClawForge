@@ -64,6 +64,12 @@ pub fn main() !void {
     try storage.runMigrations(&database.conn);
     std.log.info("Database initialized", .{});
 
+    // Reserve capacity up front so openConnection() can't reallocate extra_conns
+    // after pointers have been handed out to worker threads. Existing workers
+    // (summarize, extract, embed) plus the background-chat engine need 4 slots;
+    // round up to 8 for safety.
+    try database.extra_conns.ensureTotalCapacity(allocator, 8);
+
     // Set up default namespace
     var ns = storage.Namespaces.init(&database.conn);
     const cli_ns_id = try ns.ensurePath("default/cli");
@@ -189,6 +195,41 @@ pub fn main() !void {
     var skill_store = storage.SkillStore.init(&database.conn, allocator, cli_ns_id);
     engine.setSkillStore(&skill_store);
 
+    // ================================================================
+    // BACKGROUND CHAT ENGINE — second Engine instance with its own
+    // SQLite connection and its own per-engine stores. Runs on the
+    // background-chat worker thread so dispatcher chats on the main/web
+    // thread can proceed in parallel. Both engines share the same DB file
+    // (SQLite WAL handles MVCC), the tool registry (internally mutexed),
+    // and the worker pool (internally mutexed queues).
+    // ================================================================
+    const bg_chat_conn = try database.openConnection();
+    var bg_session_store = storage.SessionStore.init(bg_chat_conn, allocator, cli_ns_id, config.api.default_model);
+    var bg_message_store = storage.MessageStore.init(bg_chat_conn, allocator);
+    var bg_project_store = storage.ProjectStore.init(bg_chat_conn, allocator, cli_ns_id);
+    var bg_summary_store = storage.SummaryStore.init(bg_chat_conn, allocator, cli_ns_id);
+    var bg_knowledge_store = storage.KnowledgeStore.init(bg_chat_conn, allocator, cli_ns_id);
+    var bg_skill_store = storage.SkillStore.init(bg_chat_conn, allocator, cli_ns_id);
+    var bg_embedding_store = storage.EmbeddingStore.init(bg_chat_conn, allocator, cli_ns_id);
+    var bg_hybrid_search = core.HybridSearch.init(allocator, bg_chat_conn, &bg_embedding_store, cli_ns_id);
+
+    var bg_engine = core.Engine.init(
+        allocator,
+        &config,
+        default_provider,
+        &bg_session_store,
+        &bg_message_store,
+        &bg_project_store,
+        &tool_registry,
+        &auth_store,
+        auth_profiles_path,
+    );
+    bg_engine.setProviderRegistry(&provider_registry);
+    bg_engine.setSummarizer(&summarizer_worker, &bg_summary_store);
+    bg_engine.setExtractor(&extractor_worker, &bg_knowledge_store);
+    bg_engine.setSearch(&embedder_worker, &bg_hybrid_search);
+    bg_engine.setSkillStore(&bg_skill_store);
+
     // Create and start the worker pool (async background processing).
     // Each worker has its own DB connection — WAL mode handles concurrent reads,
     // SQLite serializes writes via busy_timeout.
@@ -199,14 +240,24 @@ pub fn main() !void {
         &embedder_worker,
     );
     engine.setWorkerPool(&worker_pool);
+    bg_engine.setWorkerPool(&worker_pool);
+    // Background chat worker calls into bg_engine (NOT main engine) so its
+    // SQLite connection and per-turn state are isolated from the web thread.
+    worker_pool.setBackgroundChatContext(@ptrCast(&bg_engine), &core.Engine.backgroundChatCallback);
     worker_pool.start();
     engine.setToolGenerator(&tool_gen);
+    bg_engine.setToolGenerator(&tool_gen);
 
-    // Optimization manager — file cache, result cache, batch processor, context pruner
+    // Optimization manager — file cache, result cache, batch processor, context pruner.
+    // Each engine gets its own; the caches are not thread-safe and context_pruner
+    // holds a message_store pointer that must match the engine's DB connection.
     var opt_manager = core.optimization.OptimizationManager.init(allocator, &message_store);
     defer opt_manager.deinit();
     engine.setOptimizationManager(&opt_manager);
-    std.log.info("Worker pool started (3 threads, per-thread DB connections)", .{});
+    var bg_opt_manager = core.optimization.OptimizationManager.init(allocator, &bg_message_store);
+    defer bg_opt_manager.deinit();
+    bg_engine.setOptimizationManager(&bg_opt_manager);
+    std.log.info("Worker pool started (3 threads + bg chat engine, per-thread DB connections)", .{});
 
     // ================================================================
     // ADAPTER SYSTEM — each adapter runs in its own thread

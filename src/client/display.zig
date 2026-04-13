@@ -186,6 +186,16 @@ pub const Display = struct {
                 }
                 try self.print("  Cooldown enabled: {s}\n", .{if (status.cooldown_enabled) "yes" else "no"});
             },
+            .background_queued => |bg| {
+                try self.printColored(GREEN, "Background job queued: {s}\n", .{bg.job_id});
+                try self.print("  Session: {s}\n", .{bg.session_id});
+            },
+            .background_result => |bg| {
+                try self.printColored(BOLD, "Background job {s}: {s}\n", .{ bg.job_id, bg.status });
+                if (bg.text) |t| {
+                    try self.print("{s}\n", .{t});
+                }
+            },
         }
     }
 
