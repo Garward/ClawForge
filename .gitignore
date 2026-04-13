@@ -11,6 +11,15 @@ zig_api_test
 # Data directory (contains database)
 data/
 
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Personas — only default.txt is public; custom personas stay local
+config/personas/*
+!config/personas/default.txt
+
 # Temporary files
 *.tmp
 *.temp
