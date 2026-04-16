@@ -417,4 +417,53 @@ const migrations = [_]Migration{
         \\END;
         ,
     },
+    .{
+        .description = "Artifacts + artifact_analysis (vision/OCR cache)",
+        .sql =
+        \\CREATE TABLE IF NOT EXISTS artifacts (
+        \\    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\    namespace_id    INTEGER NOT NULL REFERENCES namespaces(id) ON DELETE CASCADE,
+        \\    session_id      TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+        \\    name            TEXT NOT NULL,
+        \\    artifact_type   TEXT NOT NULL,
+        \\    mime_type       TEXT,
+        \\    content_path    TEXT,
+        \\    content_size    INTEGER,
+        \\    content_hash    TEXT,
+        \\    description     TEXT,
+        \\    source          TEXT,
+        \\    created_at      INTEGER NOT NULL,
+        \\    updated_at      INTEGER NOT NULL
+        \\);
+        \\
+        \\CREATE INDEX IF NOT EXISTS idx_artifacts_namespace ON artifacts(namespace_id);
+        \\CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id);
+        \\CREATE INDEX IF NOT EXISTS idx_artifacts_hash ON artifacts(content_hash);
+        \\
+        \\CREATE TABLE IF NOT EXISTS artifact_analysis (
+        \\    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\    artifact_id     INTEGER NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+        \\    content_hash    TEXT NOT NULL,
+        \\    analysis_type   TEXT NOT NULL,
+        \\    detail_level    TEXT NOT NULL DEFAULT 'low',
+        \\    description     TEXT NOT NULL,
+        \\    structured_data TEXT,
+        \\    model_used      TEXT NOT NULL,
+        \\    input_tokens    INTEGER,
+        \\    output_tokens   INTEGER,
+        \\    prompt_used     TEXT,
+        \\    created_at      INTEGER NOT NULL,
+        \\    UNIQUE(content_hash, analysis_type, detail_level)
+        \\);
+        \\
+        \\CREATE INDEX IF NOT EXISTS idx_artifact_analysis_hash ON artifact_analysis(content_hash);
+        \\CREATE INDEX IF NOT EXISTS idx_artifact_analysis_artifact ON artifact_analysis(artifact_id);
+        ,
+    },
+    .{
+        .description = "Add active_plan column to sessions for agent task tracking",
+        .sql =
+        \\ALTER TABLE sessions ADD COLUMN active_plan TEXT;
+        ,
+    },
 };

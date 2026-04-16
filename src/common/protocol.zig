@@ -32,6 +32,18 @@ pub const Request = union(enum) {
         description: ?[]const u8 = null,
     };
 
+    /// A file attachment (usually an image from a Discord upload or web UI).
+    /// Processed by the vision pipeline before the main chat runs — the
+    /// resulting description is injected into the system prompt as text.
+    pub const Attachment = struct {
+        /// Absolute path to the file on disk.
+        path: []const u8,
+        /// MIME type (e.g., "image/png"). Used for the vision call's media_type.
+        mime: []const u8,
+        /// Display name for logging and system-prompt citation.
+        name: []const u8,
+    };
+
     pub const ChatRequest = struct {
         message: []const u8,
         session_id: ?[]const u8 = null,
@@ -45,6 +57,14 @@ pub const Request = union(enum) {
         allowed_tools: ?[]const u8 = null,
         /// Adapter-specific context injected into the system prompt.
         adapter_context: ?[]const u8 = null,
+        /// File attachments (images) to be processed via the vision pipeline.
+        attachments: ?[]const Attachment = null,
+        /// When true, this chat is a subagent execution (spawned by
+        /// summon_subagent). The engine skips loading conversation history
+        /// from the parent session — the subagent sees ONLY its task message,
+        /// not the dispatcher's Discord chatter that it would otherwise
+        /// pattern-match into a chat-style ack.
+        is_subagent: bool = false,
     };
 
     pub const SessionCreateRequest = struct {

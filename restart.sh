@@ -2,9 +2,15 @@
 # Quick daemon restart for testing
 # SIGTERM first to let SQLite checkpoint the WAL cleanly
 pkill -f clawforged 2>/dev/null
+# The Discord bridge is spawned as a child of clawforged but when
+# clawforged is killed the child often gets reparented and orphaned,
+# leaving a duplicate bridge still connected to the Gateway (double
+# replies to every @mention). Kill any stray bridge processes explicitly.
+pkill -f "bridges/discord_bridge.py" 2>/dev/null
 sleep 1
 # Force kill only if it didn't exit gracefully
 pkill -9 -f clawforged 2>/dev/null
+pkill -9 -f "bridges/discord_bridge.py" 2>/dev/null
 sleep 0.3
 rm -f /home/garward/Scripts/Tools/ClawForge/data/clawforge.sock
 cd /home/garward/Scripts/Tools/ClawForge

@@ -42,48 +42,70 @@ immediately benefit from the user's entire history, preferences, and project sta
 - [x] `calc` — safe AST math evaluator, batch expressions, unit conversions, sorting
 - [x] `introspect` — 13 query modes: message_search, message_history, knowledge_search, knowledge_browse, summary_search, summary_history, projects, project_context, semantic_search, sessions, tool_stats, tool_history, session_stats
 
-## In Progress
-
-### Web UI Polish
-- [ ] Tool management: search bar, add/remove tools, runtime enable/disable via API endpoint
-- [ ] Config panel: model selector, system prompt editor
-- [ ] Session naming: auto-name from first message or user rename
-- [ ] Message search within session (Ctrl+F style)
-
 ## Planned
 
 ### Skills System
-- [ ] Reusable instruction templates the system can follow for complex multi-step tasks
 - [ ] "How to create a tool" skill — guides the model through ToolGenerator workflow
-- [ ] Skills stored in DB with category, trigger conditions, instruction text
-- [ ] Model auto-selects applicable skills based on user request
-- [ ] Skills editable via web UI
+- [ ] Model auto-selects applicable skills based on user request (prompt-injection side)
 
 ### Tool Ecosystem
-- [ ] Runtime tool enable/disable API (POST /api/tools/:name/enable|disable)
 - [ ] Tool generator UI: describe capability → LLM generates → sandbox test → approve
+      (backend generator exists in `src/tools/generator.zig` — missing the guided web flow)
 - [ ] Tool marketplace concept: shareable tool definitions between ClawForge instances
-- [ ] Tool analytics: which tools are most used, success rates, avg execution time
+- [ ] Tool analytics dashboard (usage counts + success rates already tracked via
+      `introspect` + `auth_profiles.usage_stats`, but no surfaced UI)
 
 ### Adapters
-- [ ] Discord adapter: bot gateway, guild/channel isolation, reaction-based tool confirmation,
-      StreamEmitter → edit messages with deltas, react emojis for tool status
+- [ ] Discord adapter sub-features: reaction-based tool confirmation, StreamEmitter →
+      edit messages with deltas, react emojis for tool status. Base bot gateway +
+      guild/channel isolation already live via `bridges/discord_bridge.py`.
 - [ ] HTTP API adapter: stateless request/response for external integrations
-- [ ] Each adapter toggleable in config
+      (web adapter doubles as REST but there's no purpose-built stateless adapter)
+- [ ] Per-adapter enable flags in config (only `discord.enabled` exists today)
 
 ### Storage & Search
-- [ ] Artifact storage: files, images, code with content-hash-based LLM analysis caching
 - [ ] GPU batch embedding via ROCm (7900XT): queue + batch for 10-50x throughput
 - [ ] Agentic retrieval: LLM decides what to search based on query decomposition
 - [ ] Re-ranking: top-50 candidates → cross-encoder re-rank to top-10
 - [ ] Matryoshka dimension truncation for speed vs precision tradeoff
 - [ ] Periodic backups with configurable retention
 
+### OpenRouter / Multi-Provider
+- [x] **OpenAI-compatible streaming**: `createMessageStreaming` on `OpenAIClient`
+      parses OpenAI SSE format (text deltas + tool call chunks by index).
+      OpenRouter and OpenAI stream in real time. Ollama still falls back
+      to non-streaming (needs its own impl for `num_ctx` injection).
+- [x] **OpenRouter prompt caching**: `X-Title: ClawForge` + `HTTP-Referer` headers
+      sent on all requests. Cache stats (`cache_read_input_tokens`,
+      `cache_creation_input_tokens`, `prompt_tokens_details.cached_tokens`)
+      parsed from both streaming and non-streaming responses. Surfaced in
+      web UI token footer (green "cached", amber "cache write") and SSE done events.
+- [x] **OpenRouter model costs in web UI**: live fetch from `/api/v1/models` with
+      pricing (`pricing.prompt`, `pricing.completion`). Models returned as objects
+      with `input_cost`/`output_cost` strings. Dropdown shows `($in/$out)` per M
+      tokens next to each model name. Replaces static model list — new models
+      appear automatically.
+
 ### Core
-- [ ] Auto-project detection from conversation content
-- [ ] Multi-round tool loop with proper message history threading (currently breaks after tool round on some edge cases)
-- [ ] Proper CLI adapter tool confirmation flow (currently web-only auto-approve)
+- [ ] Auto-project detection from conversation content (manual `createProject` exists,
+      the semantic-detection hook in `engine.zig` is still a stub)
 - [ ] Rate limiting and token budget enforcement per session/project
+      (token budgets are computed in `prompt.zig` for compaction but not enforced as a
+      hard cap per session/project)
+- [ ] **UTF-8 scrubbing across all providers.** The Anthropic path now routes every
+      outgoing string through `messages.appendJsonEscaped` (UTF-8 validate → replace
+      invalid bytes, truncated sequences, overlong forms, and lone surrogates with
+      U+FFFD) so a single poisoned byte in session history can't 400 every turn
+      forever. `openai_provider.zig` and `ollama_provider.zig` still use their own
+      `writeEscaped` helpers that only handle basic character escapes and will hit
+      the same bug the moment a poisoned session is replayed through them. Fix by
+      making them call the shared helper — ideally move `appendJsonEscaped` to a
+      common utility module (e.g. `src/common/json_escape.zig`) so `api/messages.zig`,
+      `api/anthropic.zig`, `api/openai_provider.zig`, and `api/ollama_provider.zig`
+      all share one chokepoint. Also worth auditing any other hand-built JSON
+      emitters (web adapter SSE, tool result serialization) for the same class of
+      bug. Root cause is usually emoji from Discord or vision-model output that
+      landed in the DB with a lone-surrogate byte pattern.
 
 ## Completed
 
@@ -117,3 +139,59 @@ immediately benefit from the user's entire history, preferences, and project sta
 - [x] Smart model routing (haiku/sonnet/opus with auto mode)
 - [x] Config-driven everything (providers, tiers, compaction, tools)
 - [x] restart.sh convenience script
+
+### Web UI Polish
+- [x] Tool management: search + add/remove + runtime enable/disable via `/api/tools`
+- [x] Config panel: model selector, persona editor, system prompt textarea
+- [x] Session naming: rename via `renameSession()` (`src/storage/sessions.zig`)
+- [x] Message search within session: FTS5-backed `message_search` mode in `introspect` tool
+
+### Skills System (core)
+- [x] Skill struct + `skills` table with FTS triggers (`src/storage/migrations.zig`, `skills.zig`)
+- [x] SkillStore CRUD + skill management panel in web UI (add / toggle / delete)
+- [x] Reusable instruction templates the system can follow for complex multi-step tasks
+
+### Tool Ecosystem (partial)
+- [x] Runtime tool enable/disable API (`POST /api/tools/:name/enable|disable`)
+- [x] Tool generator backend (`src/tools/generator.zig`) — LLM generates → sandbox test → approve lifecycle
+
+### Adapters (base)
+- [x] Discord adapter: bot gateway, guild/channel isolation, slash commands,
+      session-per-channel, `bridges/discord_bridge.py` + adapter registration
+- [x] Image attachments: main-model image blocks + vision-pipeline text supplement
+- [x] Vision pipeline: Haiku description cache keyed on image SHA-256
+
+### Multi-Provider Swap (Phase 1)
+- [x] `resolveProviderForModel()` on Engine — parses `provider:model` prefix,
+      looks up in `ProviderRegistry`, strips prefix, falls back to default
+      provider for bare names
+- [x] Tool loop call sites use the resolved provider per turn (logs provider
+      switch when it deviates from the default)
+- [x] OpenAI provider full rewrite: per-request arena, dynamic ArrayList body
+      buffer, OpenAI content-blocks format (system + history with text/image/
+      tool_use/tool_result), tools array, response parser fills
+      `MessageResponse.tool_use`, UTF-8 safe via shared escaper. Streaming
+      still TODO (falls back to non-streaming).
+- [x] Ollama provider: thin wrapper targeting `{base_url}/v1/chat/completions`
+      that reuses the OpenAI-compat builder/parser — gives Qwen 3, Llama 3.x,
+      and other tool-capable local models the full tool loop for free
+- [x] `OllamaConfig.num_ctx` (default 16384) threaded through as
+      `options.num_ctx` on every request so Ollama doesn't silently truncate
+      to its tiny default window
+- [x] `GET /api/models` endpoint — Anthropic + OpenAI static lists, Ollama
+      queried live via `/api/tags`. Every model string is pre-prefixed with
+      `provider:` so clients can echo it back as a `model_override`
+- [x] Discord `/model` slash command: free-form string with live autocomplete
+      from `/api/models`, `reset` to clear, 128-char cap
+- [x] Fetched `qwen3:4b` (2.3 GB) and `qwen3:30b` (17.3 GB) for local testing
+      via Ollama HTTP `/api/pull`
+
+### Storage & Search
+- [x] Artifact storage: `artifacts` table + `ArtifactStore` with content-hash-based
+      LLM analysis caching (used by the vision pipeline)
+
+### Core
+- [x] Multi-round tool loop with proper message history threading (20-round loop stable)
+- [x] CLI adapter tool confirmation flow (`cli_adapter.zig` confirmTool)
+- [x] UTF-8-safe JSON escaper for the Anthropic path (shared
+      `messages.appendJsonEscaped` used by both `toJson` and `describeImage`)

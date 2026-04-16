@@ -29,6 +29,13 @@ pub const ApiError = error{
     Timeout,
 };
 
+/// Result of a one-shot vision call. `text` is owned by the caller's allocator.
+pub const VisionResult = struct {
+    text: []const u8,
+    input_tokens: u32,
+    output_tokens: u32,
+};
+
 /// Check if a token is an OAuth token (Claude Code subscription token)
 pub fn isOAuthToken(token: []const u8) bool {
     return std.mem.indexOf(u8, token, "sk-ant-oat") != null;
@@ -136,14 +143,48 @@ pub const AnthropicClient = struct {
 
         const body = try request.toJson(arena, self.is_oauth);
 
-        var response_writer = std.Io.Writer.Allocating.init(arena);
-
         var redirect_buffer: [8 * 1024]u8 = undefined;
 
-        const result = if (self.is_oauth)
-            try self.fetchWithOAuth(&client, url, body, &redirect_buffer, &response_writer)
-        else
-            try self.fetchWithApiKey(&client, url, body, &redirect_buffer, &response_writer);
+        // Retry loop: only for transient server-side overload. Idempotent
+        // statuses 529 (overloaded_error) and 503 (service unavailable) are
+        // retried with exponential backoff; everything else falls through
+        // immediately so we don't mask real bugs (400s, auth errors).
+        var response_writer = std.Io.Writer.Allocating.init(arena);
+        var attempt: u32 = 0;
+        const max_attempts: u32 = 3;
+        const retry_delays_ns = [_]u64{
+            2 * std.time.ns_per_s,
+            5 * std.time.ns_per_s,
+        };
+        const result = while (true) {
+            // Reset the response writer each attempt so error bodies from
+            // previous attempts don't get concatenated. The arena keeps the
+            // old allocation until the whole function returns, which is fine.
+            response_writer = std.Io.Writer.Allocating.init(arena);
+
+            const r = if (self.is_oauth)
+                try self.fetchWithOAuth(&client, url, body, &redirect_buffer, &response_writer)
+            else
+                try self.fetchWithApiKey(&client, url, body, &redirect_buffer, &response_writer);
+
+            const status_code = @intFromEnum(r.status);
+            const is_transient = status_code == 529 or status_code == 503;
+            if (!is_transient or attempt + 1 >= max_attempts) break r;
+
+            const err_body = response_writer.written();
+            std.log.warn(
+                "API {d} transient — retry {d}/{d} in {d}s. Body: {s}",
+                .{
+                    status_code,
+                    attempt + 1,
+                    max_attempts,
+                    retry_delays_ns[attempt] / std.time.ns_per_s,
+                    err_body[0..@min(err_body.len, 200)],
+                },
+            );
+            std.Thread.sleep(retry_delays_ns[attempt]);
+            attempt += 1;
+        };
 
         if (result.status != .ok) {
             const err_body = response_writer.written();
@@ -419,6 +460,142 @@ pub const AnthropicClient = struct {
                 .output_tokens = sse_parser.output_tokens,
             },
             .arena = arena_ptr,
+        };
+    }
+
+    /// One-shot vision call: post a single image + text prompt and return
+    /// the model's description. Does NOT use the tool loop or the main
+    /// MessageRequest serializer — builds its own image-aware payload.
+    /// Bytes are base64-encoded inline (Anthropic `image.source.type=base64`).
+    pub fn describeImage(
+        self: *AnthropicClient,
+        model: []const u8,
+        prompt: []const u8,
+        image_bytes: []const u8,
+        mime: []const u8,
+        max_output_tokens: u32,
+    ) !VisionResult {
+        // Per-request arena so all intermediate strings get freed together.
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var client = http.Client{ .allocator = arena };
+
+        var url_buf: [256]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "{s}/v1/messages", .{self.base_url}) catch {
+            return error.InvalidRequest;
+        };
+
+        // Base64 encode the image bytes.
+        const b64_len = std.base64.standard.Encoder.calcSize(image_bytes.len);
+        const b64 = try arena.alloc(u8, b64_len);
+        _ = std.base64.standard.Encoder.encode(b64, image_bytes);
+
+        // Build the JSON body manually. Schema:
+        // { model, max_tokens, stream:false,
+        //   messages: [ { role: "user",
+        //     content: [
+        //       { type: "image", source: { type: "base64", media_type, data } },
+        //       { type: "text", text: "..." }
+        //     ] } ] }
+        var body: std.ArrayList(u8) = .{};
+        defer body.deinit(arena);
+        try body.ensureTotalCapacity(arena, b64.len + 1024);
+
+        const w = struct {
+            fn a(o: *std.ArrayList(u8), al: std.mem.Allocator, s: []const u8) void {
+                o.appendSlice(al, s) catch {};
+            }
+            fn escape(o: *std.ArrayList(u8), al: std.mem.Allocator, s: []const u8) void {
+                // Shared UTF-8-safe escaper: rejects lone surrogates and
+                // invalid sequences that Anthropic's JSON parser would 400 on.
+                messages.appendJsonEscaped(o, al, s);
+            }
+        };
+
+        w.a(&body, arena, "{\"model\":\"");
+        w.a(&body, arena, model);
+        var num_buf: [32]u8 = undefined;
+        w.a(&body, arena, "\",\"max_tokens\":");
+        w.a(&body, arena, std.fmt.bufPrint(&num_buf, "{d}", .{max_output_tokens}) catch "512");
+        w.a(&body, arena, ",\"stream\":false");
+
+        if (self.is_oauth) {
+            // OAuth requires the Claude Code identity system prompt.
+            w.a(&body, arena, ",\"system\":[{\"type\":\"text\",\"text\":\"");
+            w.a(&body, arena, "You are Claude Code, Anthropic's official CLI for Claude.");
+            w.a(&body, arena, "\"}]");
+        }
+
+        w.a(&body, arena, ",\"messages\":[{\"role\":\"user\",\"content\":[");
+        w.a(&body, arena, "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"");
+        w.escape(&body, arena, mime);
+        w.a(&body, arena, "\",\"data\":\"");
+        w.a(&body, arena, b64);
+        w.a(&body, arena, "\"}},");
+        w.a(&body, arena, "{\"type\":\"text\",\"text\":\"");
+        w.escape(&body, arena, prompt);
+        w.a(&body, arena, "\"}]}]}");
+
+        var response_writer = std.Io.Writer.Allocating.init(arena);
+        var redirect_buffer: [8 * 1024]u8 = undefined;
+
+        const result = if (self.is_oauth)
+            try self.fetchWithOAuth(&client, url, body.items, &redirect_buffer, &response_writer)
+        else
+            try self.fetchWithApiKey(&client, url, body.items, &redirect_buffer, &response_writer);
+
+        const response_data = response_writer.written();
+        if (result.status != .ok) {
+            std.log.err("Vision API {d}: {s}", .{
+                @intFromEnum(result.status),
+                response_data[0..@min(response_data.len, 500)],
+            });
+            return self.handleErrorStatus(result.status);
+        }
+
+        const parsed = json.parseFromSlice(json.Value, arena, response_data, .{}) catch {
+            return error.ParseError;
+        };
+        const obj = parsed.value.object;
+
+        // Extract the first text block.
+        var text_out: []const u8 = "";
+        if (obj.get("content")) |content_arr| {
+            if (content_arr == .array) {
+                for (content_arr.array.items) |item| {
+                    if (item != .object) continue;
+                    const item_type = if (item.object.get("type")) |t| (if (t == .string) t.string else "") else "";
+                    if (std.mem.eql(u8, item_type, "text")) {
+                        if (item.object.get("text")) |txt| {
+                            if (txt == .string) text_out = txt.string;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        var in_toks: u32 = 0;
+        var out_toks: u32 = 0;
+        if (obj.get("usage")) |usage| {
+            if (usage == .object) {
+                if (usage.object.get("input_tokens")) |it| if (it == .integer) {
+                    in_toks = @intCast(it.integer);
+                };
+                if (usage.object.get("output_tokens")) |ot| if (ot == .integer) {
+                    out_toks = @intCast(ot.integer);
+                };
+            }
+        }
+
+        // Copy the text out of the arena so it outlives this function.
+        const text_copy = try self.allocator.dupe(u8, text_out);
+        return .{
+            .text = text_copy,
+            .input_tokens = in_toks,
+            .output_tokens = out_toks,
         };
     }
 

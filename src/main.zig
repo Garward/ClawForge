@@ -52,6 +52,9 @@ pub fn main() !void {
     for (config.tools.enabled) |tool_name| {
         tool_registry.enable(tool_name) catch {};
     }
+    // Plan tool is always enabled — it's required by the engine's plan enforcement gate.
+    // Without it the model is deadlocked (can't use tools without a plan, can't plan without the tool).
+    tool_registry.enable("plan") catch {};
     std.log.info("Tools registered", .{});
 
     // Resolve data directory path
@@ -79,6 +82,7 @@ pub fn main() !void {
     var message_store = storage.MessageStore.init(&database.conn, allocator);
     var project_store = storage.ProjectStore.init(&database.conn, allocator, cli_ns_id);
     var summary_store = storage.SummaryStore.init(&database.conn, allocator, cli_ns_id);
+    var artifact_store = storage.ArtifactStore.init(&database.conn, allocator, cli_ns_id);
 
     // Initialize summarizer with its own DB connection for thread safety
     const summarizer_conn = try database.openConnection();
@@ -108,9 +112,17 @@ pub fn main() !void {
     // Create Ollama provider if enabled
     var ollama_client: ?api.OllamaClient = null;
     if (config.ollama.enabled) {
-        ollama_client = api.OllamaClient.init(allocator, config.ollama.base_url, config.ollama.default_model);
+        ollama_client = api.OllamaClient.init(
+            allocator,
+            config.ollama.base_url,
+            config.ollama.default_model,
+            config.ollama.num_ctx,
+        );
         provider_registry.register("ollama", ollama_client.?.provider()) catch {};
-        std.log.info("Ollama provider registered ({s})", .{config.ollama.base_url});
+        std.log.info(
+            "Ollama provider registered ({s}, num_ctx_max={d})",
+            .{ config.ollama.base_url, config.ollama.num_ctx },
+        );
     }
 
     // Create OpenAI provider if enabled
@@ -123,6 +135,24 @@ pub fn main() !void {
         std.log.info("OpenAI provider registered ({s})", .{config.openai.base_url});
     }
     defer if (openai_client) |*oc| oc.deinit();
+
+    // Create OpenRouter provider if enabled (OpenAI-compatible)
+    var openrouter_client: ?api.OpenAIClient = null;
+    if (config.openrouter.enabled) {
+        const openrouter_key = common.config.loadEnvKey(allocator, config.openrouter.api_key_env) catch |err| blk: {
+            std.log.warn("OpenRouter: failed to load key from .env ({s}): {}", .{ config.openrouter.api_key_env, err });
+            break :blk @as([]const u8, "");
+        };
+        if (openrouter_key.len > 0) {
+            openrouter_client = api.OpenAIClient.init(allocator, openrouter_key, config.openrouter.base_url, config.openrouter.default_model);
+            openrouter_client.?.owns_api_key = true;
+            provider_registry.register("openrouter", openrouter_client.?.provider()) catch {};
+            std.log.info("OpenRouter provider registered (model={s})", .{config.openrouter.default_model});
+        } else {
+            std.log.warn("OpenRouter enabled but no API key found — skipping", .{});
+        }
+    }
+    defer if (openrouter_client) |*orc| orc.deinit();
 
     // Map tiers to providers from config
     provider_registry.mapTier("fast", config.routing.fast_provider) catch {};
@@ -212,6 +242,7 @@ pub fn main() !void {
     var bg_skill_store = storage.SkillStore.init(bg_chat_conn, allocator, cli_ns_id);
     var bg_embedding_store = storage.EmbeddingStore.init(bg_chat_conn, allocator, cli_ns_id);
     var bg_hybrid_search = core.HybridSearch.init(allocator, bg_chat_conn, &bg_embedding_store, cli_ns_id);
+    var bg_artifact_store = storage.ArtifactStore.init(bg_chat_conn, allocator, cli_ns_id);
 
     var bg_engine = core.Engine.init(
         allocator,
@@ -229,6 +260,33 @@ pub fn main() !void {
     bg_engine.setExtractor(&extractor_worker, &bg_knowledge_store);
     bg_engine.setSearch(&embedder_worker, &bg_hybrid_search);
     bg_engine.setSkillStore(&bg_skill_store);
+
+    // ================================================================
+    // VISION PIPELINE — image description + cache (per-engine, so each
+    // has its own ArtifactStore/DB connection). Both pipelines share
+    // the same api_client and config.vision.
+    // ================================================================
+    var main_vision = core.VisionPipeline.init(
+        allocator,
+        &config.vision,
+        &api_client,
+        &artifact_store,
+    );
+    defer main_vision.deinit();
+    engine.setVisionPipeline(&main_vision);
+
+    var bg_vision = core.VisionPipeline.init(
+        allocator,
+        &config.vision,
+        &api_client,
+        &bg_artifact_store,
+    );
+    defer bg_vision.deinit();
+    bg_engine.setVisionPipeline(&bg_vision);
+    std.log.info("Vision pipeline wired (model={s}, enabled={})", .{
+        config.vision.model,
+        config.vision.enabled,
+    });
 
     // Create and start the worker pool (async background processing).
     // Each worker has its own DB connection — WAL mode handles concurrent reads,
@@ -282,6 +340,7 @@ pub fn main() !void {
 
     if (config.web.enabled) {
         var wa = adapters.WebAdapter.init(allocator, &config, &engine);
+        wa.setBgEngine(&bg_engine);
         wa.adapter().start() catch |err| {
             std.log.err("Failed to start web adapter: {}", .{err});
         };

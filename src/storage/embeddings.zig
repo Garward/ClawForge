@@ -140,7 +140,7 @@ pub const EmbeddingStore = struct {
             if (scored_count >= scored_buf.len) break;
             if (cand.fp32_blob.len == 0) continue;
 
-            const stored_vec = std.mem.bytesAsSlice(f32, @alignCast(cand.fp32_blob));
+            const stored_vec = std.mem.bytesAsSlice(f32, cand.fp32_blob);
             const score = simd.cosineSimilarity(query_vector, stored_vec);
 
             scored_buf[scored_count] = .{

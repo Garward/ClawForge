@@ -209,6 +209,29 @@ pub const SessionStore = struct {
         try stmt.exec();
     }
 
+    /// Get the active plan for a session. Caller owns the returned memory.
+    pub fn getPlan(self: *SessionStore, id: []const u8) !?[]const u8 {
+        var stmt = try self.conn.prepare("SELECT active_plan FROM sessions WHERE id = ?");
+        defer stmt.deinit();
+        try stmt.bindText(1, id);
+        if (try stmt.step()) {
+            if (stmt.columnOptionalText(0)) |plan| {
+                return try self.allocator.dupe(u8, plan);
+            }
+        }
+        return null;
+    }
+
+    /// Set (or clear) the active plan for a session.
+    pub fn setPlan(self: *SessionStore, id: []const u8, plan: ?[]const u8) !void {
+        var stmt = try self.conn.prepare("UPDATE sessions SET active_plan = ?, updated_at = ? WHERE id = ?");
+        defer stmt.deinit();
+        try stmt.bindOptionalText(1, plan);
+        try stmt.bindInt64(2, std.time.timestamp());
+        try stmt.bindText(3, id);
+        try stmt.exec();
+    }
+
     pub fn setSessionStatus(self: *SessionStore, id: []const u8, status: []const u8) !void {
         var stmt = try self.conn.prepare("UPDATE sessions SET status = ?, updated_at = ? WHERE id = ? AND namespace_id = ?");
         defer stmt.deinit();

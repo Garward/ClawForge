@@ -453,28 +453,10 @@ class ClawForgeBridge(discord.Client):
             log.error("Models GET error: %s", e)
             return []
 
-        # Allowed models: Claude variants, grok-4.1-fast, and ollama models
-        allowed_claude_models = {
-            "claude-3-5-sonnet",
-            "claude-3-opus",
-            "claude-3-haiku",
-            "claude-3-sonnet",
-        }
-
         out: list[str] = []
         for prov in data.get("providers", []):
-            provider_name = prov.get("name", "").lower()
             for m in prov.get("models", []):
-                if not m:
-                    continue
-                # Keep Claude models (bare name from anthropic provider)
-                if provider_name == "anthropic" and m in allowed_claude_models:
-                    out.append(m)
-                # Keep grok-4.1-fast from x-ai provider
-                elif provider_name == "x-ai" and m == "grok-4.1-fast":
-                    out.append(m)
-                # Keep all ollama models
-                elif provider_name == "ollama":
+                if m:
                     out.append(m)
         return out
 

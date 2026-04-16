@@ -10,6 +10,7 @@
            CSS Custom Properties — Forge Theme
            ======================================== */
         :root {
+            color-scheme: dark;
             --bg-deep: #0d0d0d;
             --bg-primary: #1a1a1a;
             --bg-sidebar: #141414;
@@ -52,6 +53,56 @@
            Reset & Base
            ======================================== */
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        /* Custom dropdown (replaces native <select> for dark-mode compat) */
+        .custom-dropdown {
+            position: relative; flex: 1;
+        }
+        .custom-dropdown .dd-selected {
+            background: var(--bg-primary); color: var(--text-primary);
+            border: 1px solid var(--border-subtle); border-radius: var(--radius);
+            padding: 6px 28px 6px 8px; font-size: 13px; cursor: pointer;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            position: relative;
+        }
+        .custom-dropdown .dd-selected::after {
+            content: '\25BE'; position: absolute; right: 8px; top: 50%;
+            transform: translateY(-50%); color: var(--text-muted); font-size: 12px;
+            pointer-events: none;
+        }
+        .custom-dropdown .dd-list {
+            display: none; position: absolute; top: 100%; left: 0; right: 0;
+            max-height: 360px; overflow-y: auto; z-index: 1000;
+            background: var(--bg-primary); border: 1px solid var(--border-subtle);
+            border-top: none; border-radius: 0 0 var(--radius) var(--radius);
+            box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+        }
+        .custom-dropdown.open .dd-list { display: block; }
+        .custom-dropdown .dd-search {
+            width: 100%; padding: 6px 8px; font-size: 12px;
+            background: var(--bg-input); color: var(--text-primary);
+            border: none; border-bottom: 1px solid var(--border-subtle);
+            outline: none; font-family: var(--font-mono);
+            position: sticky; top: 0; z-index: 1;
+        }
+        .custom-dropdown .dd-group-label {
+            padding: 6px 8px 3px; font-size: 10px; font-weight: 600;
+            color: var(--text-muted); text-transform: uppercase;
+            letter-spacing: 0.5px; background: var(--bg-primary);
+            position: sticky; top: 30px; z-index: 1;
+        }
+        .custom-dropdown .dd-item {
+            padding: 5px 8px; font-size: 12px; cursor: pointer;
+            color: var(--text-primary); white-space: nowrap;
+            overflow: hidden; text-overflow: ellipsis;
+        }
+        .custom-dropdown .dd-item:hover { background: var(--bg-hover); }
+        .custom-dropdown .dd-item.active {
+            background: var(--accent-primary); color: #000;
+        }
+        .custom-dropdown .dd-empty {
+            padding: 8px; font-size: 11px; color: var(--text-muted); text-align: center;
+        }
 
         body {
             font-family: var(--font-sans);
@@ -632,6 +683,94 @@
             font-size: 10px;
         }
         .tool-call.expanded .expand-arrow { transform: rotate(90deg); }
+
+        /* Subagent job indicators */
+        .subagent-job {
+            margin: 8px 0;
+            border: 1px solid var(--accent-border);
+            border-radius: var(--radius);
+            padding: 8px 12px;
+            background: var(--bg-hover);
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+        .subagent-job-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .subagent-job-header .job-label { color: var(--accent-primary); font-weight: 600; }
+        .subagent-job-header .job-status { margin-left: auto; }
+        .subagent-job .job-confirm {
+            margin-top: 8px;
+            padding: 8px;
+            background: var(--bg-code);
+            border-radius: var(--radius);
+        }
+        .subagent-job .job-confirm-buttons { margin-top: 6px; display: flex; gap: 8px; }
+        .subagent-job .job-confirm-buttons button {
+            padding: 4px 12px;
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius);
+            cursor: pointer;
+            font-size: 11px;
+        }
+        .subagent-job .btn-approve { background: var(--success); color: #000; border-color: var(--success); }
+        .subagent-job .btn-deny { background: var(--error); color: #fff; border-color: var(--error); }
+
+        .subagent-tool-events {
+            margin-top: 6px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .tool-event {
+            padding: 4px 8px;
+            border-left: 3px solid var(--accent-border);
+            font-size: 11px;
+            font-family: var(--font-mono);
+            background: var(--bg-code);
+            border-radius: 0 var(--radius) var(--radius) 0;
+        }
+        .tool-event.tool-use { border-left-color: var(--accent-primary); }
+        .tool-event.tool-result { border-left-color: var(--success); }
+        .tool-event.tool-error { border-left-color: var(--error); }
+        .tool-event-header {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            color: var(--text-secondary);
+            font-size: 10px;
+            margin-bottom: 2px;
+        }
+        .tool-event-header .tool-event-type { font-weight: 600; text-transform: uppercase; }
+        .tool-event-header .tool-event-name { color: var(--accent-primary); }
+        .tool-event-content {
+            white-space: pre-wrap;
+            word-break: break-all;
+            color: var(--text-primary);
+            max-height: 120px;
+            overflow: hidden;
+            cursor: pointer;
+            position: relative;
+        }
+        .tool-event-content.collapsed::after {
+            content: 'click to expand';
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 24px;
+            background: linear-gradient(transparent, var(--bg-code));
+            text-align: center;
+            font-size: 10px;
+            color: var(--text-muted);
+            line-height: 24px;
+        }
+        .tool-event-content.expanded { max-height: none; }
+
         .tool-input-preview {
             font-family: var(--font-mono);
             font-size: 11px;
@@ -758,6 +897,46 @@
         }
         #send-btn.stop-mode:disabled { background: var(--error); cursor: pointer; opacity: 1; }
         #send-btn.stop-mode:hover { background: #dc2626; }
+
+        /* Attachment preview strip above input */
+        #attachment-previews {
+            display: flex; flex-wrap: wrap; gap: 6px;
+            padding: 0; margin-bottom: 0;
+        }
+        #attachment-previews:empty { display: none; }
+        #attachment-previews .att-thumb {
+            position: relative; width: 64px; height: 64px;
+            border-radius: var(--radius); overflow: hidden;
+            border: 1px solid var(--border-subtle);
+        }
+        #attachment-previews .att-thumb img {
+            width: 100%; height: 100%; object-fit: cover;
+        }
+        #attachment-previews .att-thumb .att-remove {
+            position: absolute; top: -2px; right: -2px;
+            width: 18px; height: 18px; border-radius: 50%;
+            background: var(--error); color: #fff; border: none;
+            font-size: 11px; line-height: 18px; text-align: center;
+            cursor: pointer; padding: 0;
+        }
+        #attachment-previews .att-thumb .att-uploading {
+            position: absolute; inset: 0;
+            background: rgba(0,0,0,0.5);
+            display: flex; align-items: center; justify-content: center;
+            color: var(--text-primary); font-size: 10px;
+        }
+        #attach-btn {
+            padding: 0; width: 40px; min-height: 40px;
+            background: var(--bg-hover); border: 1px solid var(--border-primary);
+            border-radius: var(--radius); color: var(--text-secondary);
+            font-size: 18px; cursor: pointer; flex-shrink: 0;
+            display: flex; align-items: center; justify-content: center;
+        }
+        #attach-btn:hover { border-color: var(--accent-primary); color: var(--accent-primary); }
+        #input-area.drag-over {
+            border: 2px dashed var(--accent-primary);
+            background: var(--accent-subtle);
+        }
 
         #input-footer {
             display: flex;
@@ -980,8 +1159,11 @@
                 </div>
             </div>
             <div id="input-area">
+                <div id="attachment-previews"></div>
                 <form id="input-form">
-                    <textarea id="message-input" placeholder="Send a message..." rows="1"></textarea>
+                    <button type="button" id="attach-btn" title="Attach image">&#128206;</button>
+                    <input type="file" id="file-input" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+                    <textarea id="message-input" placeholder="Send a message... (paste or drop images)" rows="1"></textarea>
                     <button type="submit" id="send-btn">Send</button>
                 </form>
                 <div id="input-footer">
@@ -1047,19 +1229,37 @@
         </div>
 
         <div class="config-section">
+            <h4>Model</h4>
+            <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">
+                <div id="model-dropdown" class="custom-dropdown">
+                    <div class="dd-selected" data-value="">(daemon default)</div>
+                    <div class="dd-list">
+                        <input class="dd-search" type="text" placeholder="Search models...">
+                        <div class="dd-items"></div>
+                    </div>
+                </div>
+            </div>
+            <div id="model-status" style="font-size:11px;color:var(--text-dim);">Using daemon default</div>
+        </div>
+
+        <div class="config-section">
             <h4>Persona</h4>
             <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;">
-                <select id="persona-select" style="flex:1;background:var(--bg-main);color:var(--text-main);border:1px solid var(--border-subtle);border-radius:var(--radius);padding:6px 8px;font-size:13px;">
-                    <option value="default">default</option>
-                </select>
+                <div id="persona-dropdown" class="custom-dropdown">
+                    <div class="dd-selected" data-value="default">default</div>
+                    <div class="dd-list">
+                        <input class="dd-search" type="text" placeholder="Search personas...">
+                        <div class="dd-items"></div>
+                    </div>
+                </div>
                 <button id="persona-delete-btn" style="opacity:0.6;font-size:12px;" title="Delete selected persona">&#128465;</button>
             </div>
             <div id="persona-status" style="font-size:11px;color:var(--text-dim);margin-bottom:6px;"></div>
             <details id="persona-create-section" style="margin-top:4px;">
                 <summary style="cursor:pointer;font-size:12px;color:var(--text-dim);">+ New Persona</summary>
                 <div style="margin-top:6px;">
-                    <input id="persona-new-name" type="text" placeholder="Name (e.g. Vera)" style="width:100%;margin-bottom:4px;background:var(--bg-main);color:var(--text-main);border:1px solid var(--border-subtle);border-radius:var(--radius);padding:6px 8px;font-size:12px;">
-                    <textarea id="persona-new-content" rows="6" style="width:100%;font-family:var(--font-mono);font-size:11px;background:var(--bg-main);color:var(--text-main);border:1px solid var(--border-subtle);border-radius:var(--radius);padding:8px;resize:vertical;" placeholder="Persona system prompt text..."></textarea>
+                    <input id="persona-new-name" type="text" placeholder="Name (e.g. Vera)" style="width:100%;margin-bottom:4px;background:var(--bg-primary);color:var(--text-primary);border:1px solid var(--border-subtle);border-radius:var(--radius);padding:6px 8px;font-size:12px;">
+                    <textarea id="persona-new-content" rows="6" style="width:100%;font-family:var(--font-mono);font-size:11px;background:var(--bg-primary);color:var(--text-primary);border:1px solid var(--border-subtle);border-radius:var(--radius);padding:8px;resize:vertical;" placeholder="Persona system prompt text..."></textarea>
                     <button id="persona-create-btn" style="margin-top:4px;width:100%;">Create Persona</button>
                 </div>
             </details>
@@ -1072,6 +1272,13 @@
 
         <div class="config-section">
             <h4>Tools</h4>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+                <label style="font-size:12px;color:var(--text-secondary);cursor:pointer;display:flex;align-items:center;gap:6px;">
+                    <input type="checkbox" id="auto-approve-toggle" style="accent-color:var(--accent-primary);">
+                    Auto-approve tool calls
+                </label>
+                <span id="auto-approve-status" style="font-size:11px;color:var(--text-dim);"></span>
+            </div>
             <div id="tools-list">
                 <div style="font-size: 12px; color: var(--text-dim);">Loading...</div>
             </div>
@@ -1116,7 +1323,9 @@
             isSending: false,
             tokenTotals: { input: 0, output: 0, messages: 0 },
             lastModel: null,
+            modelOverride: '',
             toolsEnabled: {},
+            pendingAttachments: [],  // [{path, mime, name, localUrl}]
         };
 
         /* ============================
@@ -1256,7 +1465,7 @@
                 });
             } catch (e) { throw new Error('Failed to fetch ' + path); }
             if (!res.ok) throw new Error('API error: ' + res.status);
-            return res;
+            return res.json();
         }
 
         /* ============================
@@ -1438,13 +1647,41 @@
 
         async function switchSession(id) {
             state.currentSession = id;
-            // Tell backend to activate this session
-            await apiPost('/api/sessions/switch', { id: id }).catch(() => {});
+            // Tell backend to activate this session — response includes model + persona
+            try {
+                const resp = await apiPost('/api/sessions/switch', { id: id });
+                restoreSessionConfig(resp.model, resp.persona);
+            } catch (_) {}
             renderSessions();
             resetTokenTotals();
             await loadSessionMessages(id);
             // Close sidebar on mobile
             dom.sidebar.classList.remove('open');
+        }
+
+        function restoreSessionConfig(model, persona) {
+            const modelStatus = document.getElementById('model-status');
+            // Model: empty or daemon default_model means "(daemon default)"
+            if (model && typeof modelDD !== 'undefined') {
+                const match = modelDD.itemsBox.querySelector(`.dd-item[data-value="${CSS.escape(model)}"]`);
+                if (match) {
+                    modelDD.selectValue(model, match.textContent, true);
+                    state.modelOverride = model;
+                    modelStatus.textContent = 'Override: ' + model;
+                } else {
+                    // Stored model isn't in dropdown (might be daemon default) — clear override
+                    modelDD.selectValue('', '(daemon default)', true);
+                    state.modelOverride = '';
+                    modelStatus.textContent = 'Using daemon default';
+                }
+            }
+            // Persona
+            if (typeof personaDD !== 'undefined') {
+                const personaStatus = document.getElementById('persona-status');
+                const pName = persona || 'default';
+                personaDD.selectValue(pName, pName, true);
+                personaStatus.textContent = 'Active: ' + pName;
+            }
         }
 
         async function loadSessionMessages(sessionId) {
@@ -1668,6 +1905,20 @@
             roleLabel.textContent = role === 'user' ? 'You' : 'ClawForge';
             el.appendChild(roleLabel);
 
+            // Show image thumbnails for user messages with attachments
+            if (opts.attachments && opts.attachments.length > 0) {
+                const imgRow = document.createElement('div');
+                imgRow.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px;';
+                opts.attachments.forEach(att => {
+                    const img = document.createElement('img');
+                    img.src = att.localUrl;
+                    img.alt = att.name;
+                    img.style.cssText = 'max-width:200px;max-height:150px;border-radius:var(--radius);border:1px solid var(--border-subtle);';
+                    imgRow.appendChild(img);
+                });
+                el.appendChild(imgRow);
+            }
+
             const contentEl = document.createElement('div');
             contentEl.className = 'msg-content';
 
@@ -1734,6 +1985,8 @@
                 const footer = document.createElement('div');
                 footer.className = 'msg-tokens';
                 let footerHtml = '<span>' + formatTokens(opts.tokens.input) + ' in</span><span>' + formatTokens(opts.tokens.output) + ' out</span>';
+                if (opts.tokens.cache_read > 0) footerHtml += '<span style="color:var(--success);" title="Tokens read from prompt cache">' + formatTokens(opts.tokens.cache_read) + ' cached</span>';
+                if (opts.tokens.cache_creation > 0) footerHtml += '<span style="color:var(--warning);" title="Tokens written to prompt cache">' + formatTokens(opts.tokens.cache_creation) + ' cache write</span>';
                 if (opts.model) {
                     footerHtml += '<span class="msg-model">' + escapeHtml(opts.model) + '</span>';
                 }
@@ -1840,7 +2093,8 @@
 
             const tc = document.createElement('div');
             tc.className = 'tool-call';
-            tc.dataset.toolId = toolId;
+            tc.dataset.toolId = toolId || '';
+            tc.dataset.toolState = 'running';
 
             const inputSummary = inputStr ? formatToolInput(inputStr) : '';
             tc.innerHTML =
@@ -1866,9 +2120,24 @@
             scrollToBottom();
         }
 
+        function findLiveToolCall(msgEl, toolId) {
+            if (!msgEl) return null;
+
+            if (toolId) {
+                const byId = Array.from(msgEl.querySelectorAll('.tool-call')).find(el => (el.dataset.toolId || '') === toolId);
+                if (byId) return byId;
+            }
+
+            // Fallback: some providers are inconsistent about streaming tool IDs.
+            // Prefer the oldest unresolved live tool card so result rendering
+            // stays usable even when the provider omits or changes the ID.
+            return msgEl.querySelector('.tool-call[data-tool-state="running"]');
+        }
+
         function resolveToolCall(msgEl, toolId, isError, resultStr) {
-            const tc = msgEl.querySelector('.tool-call[data-tool-id="' + toolId + '"]');
+            const tc = findLiveToolCall(msgEl, toolId);
             if (!tc) return;
+            tc.dataset.toolState = 'done';
             const status = tc.querySelector('.tool-status');
             status.classList.remove('running');
             status.classList.add(isError ? 'error' : 'done');
@@ -1879,15 +2148,230 @@
             if (resultStr) {
                 const body = tc.querySelector('.tool-call-body');
                 if (body) {
+                    const existing = body.querySelector('.tool-detail-section.tool-output');
+                    if (existing) existing.remove();
                     const resultEl = document.createElement('div');
-                    resultEl.className = 'tool-detail-section';
+                    resultEl.className = 'tool-detail-section tool-output';
                     resultEl.innerHTML = '<span class="tool-detail-label">Output:</span>\n' + escapeHtml(formatToolOutput(resultStr));
                     body.appendChild(resultEl);
                 }
             }
         }
 
-        function finalizeStreamingMessage(msgEl, model, inputTokens, outputTokens) {
+        /* ============================
+           Subagent Job Polling
+           ============================ */
+        function startJobPolling(jobIds) {
+            if (!jobIds || jobIds.length === 0) return;
+            for (const jobId of jobIds) {
+                console.log('[Job] Starting poll for', jobId.slice(0, 8));
+                pollAndDeliver(jobId);
+            }
+        }
+
+        async function pollAndDeliver(jobId) {
+            const shortId = jobId.slice(0, 8);
+
+            // Create a job indicator element in the chat
+            const jobEl = document.createElement('div');
+            jobEl.className = 'msg msg-assistant';
+            const roleLabel = document.createElement('div');
+            roleLabel.className = 'msg-role';
+            roleLabel.textContent = 'ClawForge';
+            jobEl.appendChild(roleLabel);
+
+            const contentEl = document.createElement('div');
+            contentEl.className = 'msg-content';
+
+            const indicator = document.createElement('div');
+            indicator.className = 'subagent-job';
+            indicator.id = 'job-' + jobId;
+            indicator.innerHTML =
+                '<div class="subagent-job-header">' +
+                    '<span class="job-label">&#9881; Subagent ' + shortId + '</span>' +
+                    '<div class="tool-status running">' +
+                        '<span class="tool-status-label">working\u2026</span>' +
+                        '<span class="tool-status-dot"></span>' +
+                    '</div>' +
+                '</div>';
+            contentEl.appendChild(indicator);
+
+            // Tool events container
+            const toolEventsEl = document.createElement('div');
+            toolEventsEl.className = 'subagent-tool-events';
+            contentEl.appendChild(toolEventsEl);
+
+            const textZone = document.createElement('div');
+            textZone.className = 'stream-text-zone';
+            contentEl.appendChild(textZone);
+
+            jobEl.appendChild(contentEl);
+            dom.messagesEl.appendChild(jobEl);
+            scrollToBottom();
+
+            const shownConfirmations = new Set();
+            let eventCursor = 0;
+            const maxIterations = 400; // 400 * 3s = 20 min
+
+            for (let i = 0; i < maxIterations; i++) {
+                await new Promise(r => setTimeout(r, 2000));
+
+                let result;
+                try {
+                    const resp = await fetch('/api/background/status', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ job_id: jobId, cursor: eventCursor }),
+                    });
+                    if (!resp.ok) continue;
+                    result = await resp.json();
+                } catch (e) {
+                    console.warn('[Job] Poll error for', shortId, e);
+                    continue;
+                }
+
+                // Render new tool events
+                if (result.tool_events && result.tool_events.length > 0) {
+                    for (const evt of result.tool_events) {
+                        const evtEl = document.createElement('div');
+                        const isError = evt.is_error;
+                        evtEl.className = 'tool-event ' + (isError ? 'tool-error' : evt.type === 'tool_use' ? 'tool-use' : 'tool-result');
+
+                        const headerEl = document.createElement('div');
+                        headerEl.className = 'tool-event-header';
+                        headerEl.innerHTML =
+                            '<span class="tool-event-type">' + (evt.type === 'tool_use' ? 'call' : 'result') + '</span>' +
+                            '<span class="tool-event-name">' + escapeHtml(evt.tool) + '</span>';
+                        evtEl.appendChild(headerEl);
+
+                        const contentDiv = document.createElement('div');
+                        contentDiv.className = 'tool-event-content';
+                        contentDiv.textContent = evt.content || '';
+                        // Auto-collapse long content
+                        if (evt.content && evt.content.length > 300) {
+                            contentDiv.classList.add('collapsed');
+                            contentDiv.addEventListener('click', () => {
+                                contentDiv.classList.toggle('collapsed');
+                                contentDiv.classList.toggle('expanded');
+                            });
+                        }
+                        evtEl.appendChild(contentDiv);
+                        toolEventsEl.appendChild(evtEl);
+                    }
+                    scrollToBottom();
+                    // Update status label with tool count
+                    const countLabel = indicator.querySelector('.tool-status-label');
+                    if (countLabel) {
+                        countLabel.textContent = 'working\u2026 (' + (eventCursor + result.tool_events.length) + ' events)';
+                    }
+                }
+                if (result.cursor !== undefined) eventCursor = result.cursor;
+
+                const status = result.status || 'pending';
+
+                if (status === 'pending') {
+                    // Check for tool confirmation request
+                    const conf = result.pending_confirmation;
+                    if (conf && !shownConfirmations.has(conf.tool_id)) {
+                        shownConfirmations.add(conf.tool_id);
+                        showToolConfirmation(indicator, jobId, conf);
+                    }
+                    continue;
+                }
+
+                // Terminal state — update indicator and show result
+                const statusEl = indicator.querySelector('.tool-status');
+                statusEl.classList.remove('running');
+
+                if (status === 'completed') {
+                    statusEl.classList.add('done');
+                    statusEl.querySelector('.tool-status-label').textContent = 'done';
+
+                    const raw = result.text || '';
+                    // Strip tool_calls XML for display
+                    const cleaned = raw.replace(/<tool_calls>[\s\S]*<\/tool_calls>\s*/, '').trim();
+                    if (cleaned) {
+                        textZone.innerHTML = renderMarkdown(cleaned);
+                        addCopyButtons(contentEl);
+                    } else if (raw.trim()) {
+                        textZone.innerHTML = '<pre style="color: var(--text-muted); font-size: 12px;">' +
+                            escapeHtml(raw.slice(0, 2000)) + '</pre>';
+                    } else {
+                        textZone.innerHTML = '<span style="color: var(--text-muted);">Subagent completed with no output.</span>';
+                    }
+
+                    // Show tokens if available
+                    if (result.input_tokens || result.output_tokens) {
+                        const footer = document.createElement('div');
+                        footer.className = 'msg-tokens';
+                        let html = '<span>' + formatTokens(result.input_tokens) + ' in</span>' +
+                            '<span>' + formatTokens(result.output_tokens) + ' out</span>';
+                        if (result.model) html += '<span class="msg-model">' + escapeHtml(result.model) + '</span>';
+                        footer.innerHTML = html;
+                        jobEl.appendChild(footer);
+                    }
+                } else if (status === 'failed') {
+                    statusEl.classList.add('error');
+                    statusEl.querySelector('.tool-status-label').textContent = 'failed';
+                    textZone.innerHTML = '<span style="color: var(--error);">' +
+                        escapeHtml(result.text || 'Unknown error') + '</span>';
+                } else if (status === 'cancelled') {
+                    statusEl.classList.add('error');
+                    statusEl.querySelector('.tool-status-label').textContent = 'cancelled';
+                    textZone.innerHTML = '<span style="color: var(--text-muted);">Job cancelled.</span>';
+                }
+
+                scrollToBottom();
+                return;
+            }
+
+            // Timeout
+            const statusEl = indicator.querySelector('.tool-status');
+            statusEl.classList.remove('running');
+            statusEl.classList.add('error');
+            statusEl.querySelector('.tool-status-label').textContent = 'timeout';
+            textZone.innerHTML = '<span style="color: var(--error);">Subagent timed out after 20 minutes.</span>';
+            scrollToBottom();
+        }
+
+        function showToolConfirmation(indicator, jobId, conf) {
+            const existing = indicator.querySelector('.job-confirm');
+            if (existing) existing.remove();
+
+            const el = document.createElement('div');
+            el.className = 'job-confirm';
+            const preview = (conf.input_preview || '').slice(0, 500);
+            el.innerHTML =
+                '<div><strong>Tool request: <code>' + escapeHtml(conf.tool_name) + '</code></strong></div>' +
+                '<pre style="margin: 4px 0; font-size: 11px; color: var(--text-muted);">' + escapeHtml(preview) + '</pre>' +
+                '<div class="job-confirm-buttons">' +
+                    '<button class="btn-approve">Approve</button>' +
+                    '<button class="btn-deny">Deny</button>' +
+                '</div>';
+
+            el.querySelector('.btn-approve').addEventListener('click', async () => {
+                await fetch('/api/background/confirm', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ job_id: jobId, tool_id: conf.tool_id, approved: true }),
+                });
+                el.innerHTML = '<span style="color: var(--success);">Approved: ' + escapeHtml(conf.tool_name) + '</span>';
+            });
+
+            el.querySelector('.btn-deny').addEventListener('click', async () => {
+                await fetch('/api/background/confirm', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ job_id: jobId, tool_id: conf.tool_id, approved: false }),
+                });
+                el.innerHTML = '<span style="color: var(--error);">Denied: ' + escapeHtml(conf.tool_name) + '</span>';
+            });
+
+            indicator.appendChild(el);
+            scrollToBottom();
+        }
+
+        function finalizeStreamingMessage(msgEl, model, inputTokens, outputTokens, cacheRead, cacheCreation) {
             // Flush any buffered stream renders
             flushStreamRender(msgEl);
 
@@ -1907,6 +2391,8 @@
                 const footer = document.createElement('div');
                 footer.className = 'msg-tokens';
                 let html = '<span>' + formatTokens(inputTokens) + ' in</span><span>' + formatTokens(outputTokens) + ' out</span>';
+                if (cacheRead > 0) html += '<span style="color:var(--success);" title="Tokens read from prompt cache">' + formatTokens(cacheRead) + ' cached</span>';
+                if (cacheCreation > 0) html += '<span style="color:var(--warning);" title="Tokens written to prompt cache">' + formatTokens(cacheCreation) + ' cache write</span>';
                 if (model) html += '<span class="msg-model">' + escapeHtml(model) + '</span>';
                 footer.innerHTML = html;
                 msgEl.appendChild(footer);
@@ -1923,10 +2409,15 @@
 
             try {
                 console.log('[SSE] Starting stream request...');
+                const chatBody = { message };
+                if (state.modelOverride) chatBody.model_override = state.modelOverride;
+                if (state.pendingAttachments.length > 0) {
+                    chatBody.attachments = state.pendingAttachments.map(a => ({ path: a.path, mime: a.mime, name: a.name }));
+                }
                 const res = await fetch('/api/chat/stream', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message }),
+                    body: JSON.stringify(chatBody),
                     signal: state.streamAbort.signal,
                 });
 
@@ -1970,8 +2461,11 @@
                                     break;
                                 case 'done':
                                     state.lastModel = event.model;
-                                    finalizeStreamingMessage(msgEl, event.model, event.input_tokens, event.output_tokens);
+                                    finalizeStreamingMessage(msgEl, event.model, event.input_tokens, event.output_tokens, event.cache_read_tokens, event.cache_creation_tokens);
                                     addTokens(event.input_tokens, event.output_tokens, event.context_tokens);
+                                    if (event.spawned_jobs && event.spawned_jobs.length > 0) {
+                                        startJobPolling(event.spawned_jobs);
+                                    }
                                     break;
                                 case 'error':
                                     const contentEl = msgEl.querySelector('.msg-content');
@@ -2024,10 +2518,15 @@
             scrollToBottom();
 
             try {
+                const chatBody = { message };
+                if (state.modelOverride) chatBody.model_override = state.modelOverride;
+                if (state.pendingAttachments.length > 0) {
+                    chatBody.attachments = state.pendingAttachments.map(a => ({ path: a.path, mime: a.mime, name: a.name }));
+                }
                 const res = await fetch('/api/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message }),
+                    body: JSON.stringify(chatBody),
                 });
 
                 const data = await res.json();
@@ -2037,12 +2536,16 @@
                     appendMessage('assistant', 'Error: ' + data.error);
                 } else {
                     state.lastModel = data.model;
-                    const tokens = data.usage ? { input: data.usage.input_tokens, output: data.usage.output_tokens, context: data.usage.context_tokens } : null;
+                    const tokens = data.usage ? { input: data.usage.input_tokens, output: data.usage.output_tokens, context: data.usage.context_tokens, cache_read: data.usage.cache_read_tokens || 0, cache_creation: data.usage.cache_creation_tokens || 0 } : null;
                     appendMessage('assistant', data.text || '(No response)', {
                         tokens: tokens,
                         model: data.model,
                     });
                     if (tokens) addTokens(tokens.input, tokens.output, tokens.context);
+                    // Poll spawned subagent jobs
+                    if (data.spawned_jobs && data.spawned_jobs.length > 0) {
+                        startJobPolling(data.spawned_jobs);
+                    }
                 }
             } catch (e) {
                 loadEl.remove();
@@ -2072,7 +2575,7 @@
             if (state.isSending) return;
 
             const message = dom.input.value.trim();
-            if (!message) return;
+            if (!message && state.pendingAttachments.length === 0) return;
 
             dom.input.value = '';
             dom.input.style.height = 'auto';
@@ -2081,7 +2584,7 @@
             dom.sendBtn.classList.add('stop-mode');
             dom.sendBtn.disabled = false;
 
-            appendMessage('user', message);
+            appendMessage('user', message, { attachments: state.pendingAttachments });
 
             const useStream = dom.useStreaming.checked;
 
@@ -2097,12 +2600,124 @@
             } finally {
                 state.isSending = false;
                 state.isStreaming = false;
+                state.pendingAttachments = [];
+                renderAttachmentPreviews();
                 dom.sendBtn.textContent = 'Send';
                 dom.sendBtn.classList.remove('stop-mode');
                 dom.sendBtn.disabled = false;
                 dom.input.focus();
             }
         }
+
+        /* ============================
+           Attachments (image upload)
+           ============================ */
+        function renderAttachmentPreviews() {
+            const container = document.getElementById('attachment-previews');
+            container.innerHTML = '';
+            state.pendingAttachments.forEach((att, idx) => {
+                const thumb = document.createElement('div');
+                thumb.className = 'att-thumb';
+                const img = document.createElement('img');
+                img.src = att.localUrl;
+                img.alt = att.name;
+                thumb.appendChild(img);
+                if (att.uploading) {
+                    const overlay = document.createElement('div');
+                    overlay.className = 'att-uploading';
+                    overlay.textContent = '...';
+                    thumb.appendChild(overlay);
+                } else {
+                    const btn = document.createElement('button');
+                    btn.className = 'att-remove';
+                    btn.textContent = '\u00d7';
+                    btn.addEventListener('click', () => {
+                        URL.revokeObjectURL(att.localUrl);
+                        state.pendingAttachments.splice(idx, 1);
+                        renderAttachmentPreviews();
+                    });
+                    thumb.appendChild(btn);
+                }
+                container.appendChild(thumb);
+            });
+        }
+
+        async function uploadFile(file) {
+            const maxSize = 10 * 1024 * 1024; // 10MB
+            if (file.size > maxSize) {
+                console.warn('File too large:', file.name, file.size);
+                return;
+            }
+            const allowed = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+            if (!allowed.includes(file.type)) {
+                console.warn('Unsupported type:', file.type);
+                return;
+            }
+
+            const localUrl = URL.createObjectURL(file);
+            const entry = { name: file.name, mime: file.type, path: '', localUrl, uploading: true };
+            state.pendingAttachments.push(entry);
+            renderAttachmentPreviews();
+
+            try {
+                const base64 = await fileToBase64(file);
+                const resp = await apiPost('/api/upload', { data: base64, mime: file.type, name: file.name });
+                entry.path = resp.path;
+                entry.uploading = false;
+            } catch (e) {
+                console.error('Upload failed:', e);
+                const idx = state.pendingAttachments.indexOf(entry);
+                if (idx >= 0) state.pendingAttachments.splice(idx, 1);
+                URL.revokeObjectURL(localUrl);
+            }
+            renderAttachmentPreviews();
+        }
+
+        function fileToBase64(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result.split(',')[1]);
+                reader.onerror = reject;
+                reader.readAsDataURL(file);
+            });
+        }
+
+        function handleFiles(files) {
+            for (const f of files) uploadFile(f);
+        }
+
+        // File picker button
+        document.getElementById('attach-btn').addEventListener('click', () => {
+            document.getElementById('file-input').click();
+        });
+        document.getElementById('file-input').addEventListener('change', (e) => {
+            handleFiles(e.target.files);
+            e.target.value = '';
+        });
+
+        // Drag & drop on input area
+        const inputArea = document.getElementById('input-area');
+        inputArea.addEventListener('dragover', (e) => { e.preventDefault(); inputArea.classList.add('drag-over'); });
+        inputArea.addEventListener('dragleave', () => inputArea.classList.remove('drag-over'));
+        inputArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            inputArea.classList.remove('drag-over');
+            const files = [...e.dataTransfer.files].filter(f => f.type.startsWith('image/'));
+            handleFiles(files);
+        });
+
+        // Paste images from clipboard
+        dom.input.addEventListener('paste', (e) => {
+            const items = [...(e.clipboardData?.items || [])];
+            const imageItems = items.filter(i => i.type.startsWith('image/'));
+            if (imageItems.length > 0) {
+                e.preventDefault();
+                imageItems.forEach(item => {
+                    const file = item.getAsFile();
+                    if (file) uploadFile(file);
+                });
+            }
+        });
 
         /* ============================
            New Session
@@ -2114,6 +2729,12 @@
                 dom.messagesEl.innerHTML = '';
                 showEmptyState();
                 resetTokenTotals();
+                // Reset model/persona to defaults for new session
+                state.modelOverride = '';
+                if (typeof modelDD !== 'undefined') modelDD.selectValue('', '(daemon default)', true);
+                document.getElementById('model-status').textContent = 'Using daemon default';
+                if (typeof personaDD !== 'undefined') personaDD.selectValue('default', 'default', true);
+                document.getElementById('persona-status').textContent = 'Active: default';
                 await loadSessions();
                 dom.input.focus();
             } catch (e) {
@@ -2130,7 +2751,9 @@
             loadStatus();
             loadCompactionStatus();
             loadSkills();
-            loadPersona();
+            // Reload persona list (but preserve current selection from session)
+            loadPersonaList();
+            loadModels();
         }
 
         function closeConfig() {
@@ -2141,34 +2764,58 @@
         /* ============================
            Persona Selector (config panel)
            ============================ */
+        const personaDD = initCustomDropdown(document.getElementById('persona-dropdown'), async (value) => {
+            const status = document.getElementById('persona-status');
+            if (!state.currentSession) {
+                status.textContent = 'No active session';
+                return;
+            }
+            try {
+                await apiPost('/api/persona', { action: 'select', name: value, session_id: state.currentSession });
+                status.textContent = 'Switched to: ' + value;
+            } catch (err) {
+                status.textContent = 'Error switching: ' + err.message;
+            }
+        });
+
+        // Full load: rebuild list AND set active from session
         async function loadPersona() {
-            const select = document.getElementById('persona-select');
             const status = document.getElementById('persona-status');
             try {
-                const data = await apiGet('/api/persona');
-                select.innerHTML = '';
-                for (const name of (data.personas || ['default'])) {
-                    const opt = document.createElement('option');
-                    opt.value = name;
-                    opt.textContent = name;
-                    if (name === (data.active || 'default')) opt.selected = true;
-                    select.appendChild(opt);
-                }
-                status.textContent = 'Active: ' + (data.active || 'default');
+                const url = state.currentSession
+                    ? '/api/persona?session_id=' + encodeURIComponent(state.currentSession)
+                    : '/api/persona';
+                const data = await apiGet(url);
+                rebuildPersonaItems(data.personas || ['default']);
+                const active = data.active || 'default';
+                personaDD.selectValue(active, active, true);
+                status.textContent = 'Active: ' + active;
             } catch (e) {
                 status.textContent = 'Failed to load personas';
             }
         }
 
-        document.getElementById('persona-select').addEventListener('change', async (e) => {
-            const status = document.getElementById('persona-status');
+        // Light load: refresh persona list only, keep current selection
+        async function loadPersonaList() {
             try {
-                await apiPost('/api/persona', { action: 'select', name: e.target.value });
-                status.textContent = 'Switched to: ' + e.target.value;
-            } catch (err) {
-                status.textContent = 'Error switching: ' + err.message;
+                const data = await apiGet('/api/persona');
+                const currentVal = personaDD.selected.dataset.value || 'default';
+                rebuildPersonaItems(data.personas || ['default']);
+                // Restore previous selection highlight
+                personaDD.itemsBox.querySelectorAll('.dd-item').forEach(i =>
+                    i.classList.toggle('active', i.dataset.value === currentVal));
+            } catch (_) {}
+        }
+
+        function rebuildPersonaItems(personas) {
+            personaDD.itemsBox.innerHTML = '';
+            for (const name of personas) {
+                const item = document.createElement('div');
+                item.className = 'dd-item'; item.dataset.value = name;
+                item.textContent = name;
+                personaDD.itemsBox.appendChild(item);
             }
-        });
+        }
 
         document.getElementById('persona-create-btn').addEventListener('click', async () => {
             const name = document.getElementById('persona-new-name').value.trim();
@@ -2188,20 +2835,171 @@
         });
 
         document.getElementById('persona-delete-btn').addEventListener('click', async () => {
-            const select = document.getElementById('persona-select');
-            const name = select.value;
+            const name = personaDD.selected.dataset.value;
             const status = document.getElementById('persona-status');
             if (name === 'default') { status.textContent = 'Cannot delete default'; return; }
             if (!confirm('Delete persona "' + name + '"?')) return;
             try {
                 await apiPost('/api/persona', { action: 'delete', name });
-                await apiPost('/api/persona', { action: 'select', name: 'default' });
+                if (state.currentSession) {
+                    await apiPost('/api/persona', { action: 'select', name: 'default', session_id: state.currentSession });
+                }
                 status.textContent = 'Deleted: ' + name;
                 await loadPersona();
             } catch (e) {
                 status.textContent = 'Error: ' + e.message;
             }
         });
+
+        /* ============================
+           Model Selector (config panel)
+           ============================ */
+        /* --- Custom dropdown helper --- */
+        function initCustomDropdown(container, onSelect) {
+            const selected = container.querySelector('.dd-selected');
+            const list = container.querySelector('.dd-list');
+            const search = container.querySelector('.dd-search');
+            const itemsBox = container.querySelector('.dd-items');
+
+            selected.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const wasOpen = container.classList.contains('open');
+                // Close all dropdowns first
+                document.querySelectorAll('.custom-dropdown.open').forEach(d => d.classList.remove('open'));
+                if (!wasOpen) {
+                    container.classList.add('open');
+                    search.value = '';
+                    filterItems('');
+                    search.focus();
+                }
+            });
+
+            search.addEventListener('input', () => filterItems(search.value));
+            search.addEventListener('click', (e) => e.stopPropagation());
+
+            function filterItems(query) {
+                const q = query.toLowerCase();
+                let anyVisible = false;
+                itemsBox.querySelectorAll('.dd-group-label, .dd-item').forEach(el => {
+                    if (el.classList.contains('dd-group-label')) {
+                        // Show group label if any child items match
+                        let next = el.nextElementSibling;
+                        let groupHasMatch = false;
+                        while (next && !next.classList.contains('dd-group-label')) {
+                            const text = (next.textContent || '').toLowerCase();
+                            const match = !q || text.includes(q);
+                            next.style.display = match ? '' : 'none';
+                            if (match) { groupHasMatch = true; anyVisible = true; }
+                            next = next.nextElementSibling;
+                        }
+                        el.style.display = groupHasMatch ? '' : 'none';
+                    }
+                });
+                const empty = itemsBox.querySelector('.dd-empty');
+                if (empty) empty.style.display = anyVisible ? 'none' : '';
+            }
+
+            // Close on outside click
+            document.addEventListener('click', () => container.classList.remove('open'));
+
+            // Delegate click on items
+            itemsBox.addEventListener('click', (e) => {
+                const item = e.target.closest('.dd-item');
+                if (!item) return;
+                const value = item.dataset.value;
+                const label = item.textContent;
+                selectValue(value, label);
+            });
+
+            function selectValue(value, label, silent) {
+                selected.dataset.value = value;
+                selected.textContent = label;
+                container.classList.remove('open');
+                // Update active highlight
+                itemsBox.querySelectorAll('.dd-item').forEach(i => i.classList.toggle('active', i.dataset.value === value));
+                if (!silent && onSelect) onSelect(value);
+            }
+
+            return { selected, itemsBox, selectValue };
+        }
+
+        /* --- Model dropdown --- */
+        const modelDD = initCustomDropdown(document.getElementById('model-dropdown'), (value) => {
+            const status = document.getElementById('model-status');
+            state.modelOverride = value;
+            if (value) {
+                status.textContent = 'Override: ' + value;
+            } else {
+                status.textContent = 'Using daemon default';
+            }
+            // Persist model choice to current session
+            if (state.currentSession) {
+                apiPost('/api/sessions/model', { id: state.currentSession, model: value || '' }).catch(() => {});
+            }
+        });
+
+        async function loadModels() {
+            const status = document.getElementById('model-status');
+            try {
+                const res = await fetch('/api/models');
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const data = await res.json();
+
+                modelDD.itemsBox.innerHTML = '';
+
+                // Default option
+                const defItem = document.createElement('div');
+                defItem.className = 'dd-item'; defItem.dataset.value = '';
+                defItem.textContent = '(daemon default)';
+                modelDD.itemsBox.appendChild(defItem);
+
+                for (const prov of (data.providers || [])) {
+                    if (!prov.models || prov.models.length === 0) continue;
+                    const groupLabel = document.createElement('div');
+                    groupLabel.className = 'dd-group-label';
+                    groupLabel.textContent = prov.name;
+                    modelDD.itemsBox.appendChild(groupLabel);
+
+                    for (const m of prov.models) {
+                        const isObj = typeof m === 'object' && m.id;
+                        const modelId = isObj ? m.id : m;
+                        const colon = modelId.indexOf(':');
+                        let label = colon >= 0 ? modelId.slice(colon + 1) : modelId;
+                        if (isObj && (m.input_cost || m.output_cost)) {
+                            const inCost = m.input_cost ? (parseFloat(m.input_cost) * 1e6).toFixed(2) : '?';
+                            const outCost = m.output_cost ? (parseFloat(m.output_cost) * 1e6).toFixed(2) : '?';
+                            label += '  ($' + inCost + '/' + outCost + ')';
+                        }
+                        const item = document.createElement('div');
+                        item.className = 'dd-item'; item.dataset.value = modelId;
+                        item.textContent = label;
+                        modelDD.itemsBox.appendChild(item);
+                    }
+                }
+
+                // "No results" placeholder
+                const empty = document.createElement('div');
+                empty.className = 'dd-empty'; empty.textContent = 'No matching models';
+                empty.style.display = 'none';
+                modelDD.itemsBox.appendChild(empty);
+
+                // Restore selection from current session state (set by switchSession)
+                if (state.modelOverride) {
+                    const match = modelDD.itemsBox.querySelector(`.dd-item[data-value="${CSS.escape(state.modelOverride)}"]`);
+                    if (match) {
+                        modelDD.selectValue(state.modelOverride, match.textContent, true);
+                        status.textContent = 'Override: ' + state.modelOverride;
+                    } else {
+                        state.modelOverride = '';
+                        status.textContent = 'Using daemon default';
+                    }
+                } else {
+                    status.textContent = 'Using daemon default';
+                }
+            } catch (e) {
+                status.textContent = 'Failed to load models: ' + e.message;
+            }
+        }
 
         /* ============================
            Tools List (config panel)
@@ -2249,6 +3047,29 @@
                 container.innerHTML = '<div style="color:var(--accent);padding:0.5rem">Failed to load tools</div>';
             }
         }
+
+        // Auto-approve toggle
+        (function initAutoApprove() {
+            const toggle = document.getElementById('auto-approve-toggle');
+            const statusEl = document.getElementById('auto-approve-status');
+            if (!toggle) return;
+
+            toggle.addEventListener('change', async () => {
+                const enabled = toggle.checked;
+                try {
+                    await fetch('/api/tools/autoapprove', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ enabled }),
+                    });
+                    statusEl.textContent = enabled ? 'ON' : '';
+                    statusEl.style.color = enabled ? 'var(--success)' : 'var(--text-dim)';
+                } catch (e) {
+                    console.error('Failed to toggle auto-approve:', e);
+                    toggle.checked = !enabled;
+                }
+            });
+        })();
 
         /* ============================
            Skills Management
@@ -2389,7 +3210,12 @@
 
             // Load initial data
             loadStatus();
-            loadSessions();
+            // Load models + sessions in parallel, then auto-switch to restore per-session config
+            Promise.all([loadModels(), loadSessions()]).then(() => {
+                if (state.sessions.length > 0 && !state.currentSession) {
+                    switchSession(state.sessions[0].id);
+                }
+            });
             loadTools();
             loadSkills();
 

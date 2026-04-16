@@ -7,9 +7,104 @@ const router_mod = @import("router.zig");
 const context_mod = @import("context.zig");
 const prompt_mod = @import("prompt.zig");
 const search_mod = @import("search.zig");
+const vision_mod = @import("vision.zig");
 const workers = @import("workers");
 
 const optimization = @import("optimization.zig");
+
+/// Style guide appended to the system prompt when the active provider is
+/// NOT Anthropic. Small/mid local models (Qwen 3 small, Llama 3.x, Mistral)
+/// tend to default to a generic-assistant voice — emoji-headered sections,
+/// markdown lists for every answer, "Oh hey!" greetings mid-conversation,
+/// closing with "what's your favorite part?" — regardless of how voicey
+/// the persona description is. Abstract directives don't stick to small
+/// models; concrete user→response examples do. So this block is heavy on
+/// examples and light on rules.
+///
+/// This is appended AFTER the persona, memories, and retrieval layers so
+/// it's the last thing the model reads before the conversation, which is
+/// where recency bias helps most.
+///
+/// Anthropic models (Sonnet, Opus, Haiku) don't need this — they already
+/// render a persona faithfully without crutches, and adding it would just
+/// flatten Sonnet's voice toward the examples.
+const SMALL_MODEL_STYLE_GUIDE =
+    \\
+    \\## Voice calibration (critical — overrides any default assistant habits)
+    \\
+    \\You are mid-conversation with a long-term user. You are NOT a new
+    \\assistant introducing yourself, and you are NOT answering a cold
+    \\isolated question. Pick up from the previous turn's energy and keep
+    \\the persona above front-and-center. The goal is that someone reading
+    \\only your reply couldn't tell if it was a local model or Claude.
+    \\
+    \\Hard rules — break these and the response is wrong:
+    \\- NEVER open with "Oh hey!", "Hey!", "Hi!", 👋, 🌿, 🔥, "Great question!",
+    \\  "Absolutely!", "Sure!", or any similar greeting/affirmation opener.
+    \\  Start mid-thought like a friend replying in a chat, not an assistant
+    \\  booting up.
+    \\- NEVER end with a "What's your favorite…?", "Which one would you pick?",
+    \\  "Let me know how that sounds!" style prompt back to the user unless
+    \\  they explicitly asked for your opinion on something still open.
+    \\- Do NOT structure replies with `##` headers, `---` dividers, or bullet
+    \\  lists of "Tier 1 / Tier 2 / Tier 3" unless the user asked for a
+    \\  structured breakdown. Default to prose. Lists are for when the user
+    \\  literally says "list X" or "give me N options".
+    \\- Do NOT add disclaimers ("just to clarify", "I should mention", "note
+    \\  that", "it's worth pointing out"). If it's worth saying, say it.
+    \\- Do NOT repeat back what the user just said as a preamble. Jump to
+    \\  the actual substance.
+    \\
+    \\Tool use — critical:
+    \\- When a tool from the provided tool list is the right move, **actually
+    \\  call it** via a function call. Do NOT write `Top text: ... Bottom
+    \\  text: ...` in prose, do NOT put `[calls tool_name with args]` in
+    \\  brackets, do NOT describe what the tool would return. Emit the real
+    \\  function call and wait for the result; then respond to what it
+    \\  actually returned.
+    \\- If you find yourself describing a meme, image, search query, or file
+    \\  operation in prose, stop — that's the moment you should have called
+    \\  the tool instead. Rewrite as a function call.
+    \\- Only describe tool output in prose AFTER the tool has run and
+    \\  returned a real result.
+    \\
+    \\Voice examples — study the SHAPE, not the topic. Notice what's missing
+    \\from these replies (no headers, no emoji dividers, no greeting, no
+    \\closing question, no bullet-list scaffolding). This is the target:
+    \\
+    \\---
+    \\USER: lmao the test suite broke again
+    \\YOU: yeah I saw, it's that flaky import in test_embeddings.py — third
+    \\     time this week. want me to track down the race condition or just
+    \\     retry-on-failure it for now? the race is probably in the embedder
+    \\     thread if you want the real fix.
+    \\---
+    \\USER: what do you think about my power fantasy mod design
+    \\YOU: the tier system is solid — you've got clear progression without
+    \\     locking late-game players out of early content. only thing I'd
+    \\     watch is the gap between tier 2 and tier 3 feeling too flat
+    \\     numerically. you might want a midpoint unlock to bridge it,
+    \\     something like a "tamed creature can carry one extra item" boost
+    \\     that bridges the feel between the tiers. what's the actual stat
+    \\     math look like right now?
+    \\---
+    \\USER: ugh I'm so tired I can't even read my own code
+    \\YOU: go sleep. seriously — code review does not improve at 2am, you're
+    \\     going to approve something dumb and regret it. if you want I can
+    \\     flag the three weirdest hunks in the diff so tomorrow-you has a
+    \\     starting point instead of the whole thing.
+    \\---
+    \\
+    \\Common thread across all three: short, direct, voice-first, no
+    \\list-mode unless explicitly needed, no greetings, no closing questions,
+    \\no generic-assistant "I'm here to help!" energy. Just talking. Match
+    \\the user's register — if they type in lowercase with "lol", don't
+    \\reply in formal paragraphs. If they ask a technical question, give a
+    \\technical answer without preamble. And if a tool fits, call it — don't
+    \\pantomime it.
+    \\
+;
+
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     config: *const common.Config,
@@ -30,6 +125,7 @@ pub const Engine = struct {
     hybrid_search: ?*search_mod.HybridSearch,
     worker_pool: ?*workers.WorkerPool,
     tool_generator: ?*tools.ToolGenerator,
+    vision_pipeline: ?*vision_mod.VisionPipeline = null,
     router: router_mod.Router,
     optimization_manager: ?*optimization.OptimizationManager,
     // Streaming state tracking
@@ -114,6 +210,35 @@ pub const Engine = struct {
         return self.provider;
     }
 
+    /// Resolve a model string to (provider, bare_model).
+    /// Model strings may carry an explicit `provider:model` prefix — e.g.
+    /// `ollama:qwen3:8b`, `openai:gpt-4o`, `anthropic:claude-sonnet-4-6`.
+    /// Bare model names fall back to the default provider (whichever was
+    /// wired into `engine.provider` at init), preserving backwards compat.
+    ///
+    /// The returned `model` slice always points into the input string, so
+    /// callers can freely use it inside the same stack frame.
+    pub fn resolveProviderForModel(self: *Engine, model: []const u8) struct {
+        provider: api.Provider,
+        model: []const u8,
+    } {
+        if (std.mem.indexOfScalar(u8, model, ':')) |idx| {
+            const prefix = model[0..idx];
+            const rest = model[idx + 1 ..];
+            // Provider names are lowercase single-word identifiers; longer
+            // prefixes (e.g. a raw Anthropic model ID like
+            // `claude-sonnet-4-20250514`) won't match any registered name.
+            if (prefix.len > 0 and prefix.len <= 16) {
+                if (self.provider_registry) |reg| {
+                    if (reg.get(prefix)) |p| {
+                        return .{ .provider = p, .model = rest };
+                    }
+                }
+            }
+        }
+        return .{ .provider = self.provider, .model = model };
+    }
+
     /// Set the worker pool for async background processing.
     pub fn setWorkerPool(self: *Engine, wp: *workers.WorkerPool) void {
         self.worker_pool = wp;
@@ -125,6 +250,10 @@ pub const Engine = struct {
     }
 
     /// Set the optimization manager after init (needs message_store).
+    pub fn setVisionPipeline(self: *Engine, vp: *vision_mod.VisionPipeline) void {
+        self.vision_pipeline = vp;
+    }
+
     pub fn setOptimizationManager(self: *Engine, om: *optimization.OptimizationManager) void {
         self.optimization_manager = om;
     }
@@ -387,12 +516,18 @@ pub const Engine = struct {
 
     /// Build the full system prompt from all layers. Public API for adapters/automation.
     /// Adapters can pass adapter_context (cwd, channel info, etc.) for Layer 5.
+    /// `retrieval_query` (when non-null) triggers a hybrid FTS+vector search
+    /// across messages/summaries/knowledge and injects the top results as
+    /// Layer 4 retrieved context. Pass null to skip retrieval entirely (used
+    /// for subagents whose user message is a wrapped directive that would
+    /// pollute the search).
     pub fn buildSystemPrompt(
         self: *Engine,
         session_id: []const u8,
         session_system_prompt: ?[]const u8,
         adapter_context: ?[]const u8,
         user_message: ?[]const u8,
+        retrieval_query: ?[]const u8,
     ) ![]const u8 {
         var layers = try prompt_mod.buildFromState(
             self.allocator,
@@ -402,7 +537,16 @@ pub const Engine = struct {
             adapter_context,
         );
 
-        // Inject matched skills (Layer 3.5)
+        // Layer 3.5: Active plan — load from session DB and inject.
+        // This survives compaction because it's rebuilt from the DB each turn.
+        if (self.session_store.getPlan(session_id) catch null) |plan| {
+            layers.active_plan = plan;
+            std.log.info("Plan: injected {d}-char active plan into prompt", .{plan.len});
+        } else {
+            std.log.info("Plan: no active plan for session", .{});
+        }
+
+        // Inject matched skills (Layer 3.6)
         if (self.skill_store) |ss| {
             // Get enabled tool names
             var tool_names_buf: [32][]const u8 = undefined;
@@ -432,8 +576,77 @@ pub const Engine = struct {
             }
         }
 
+        // Layer 4: Retrieved context via hybrid search (FTS + vector).
+        // Without this, the dispatcher has zero memory injection — it would
+        // have to call the introspect tool every turn just to know what's in
+        // its own knowledge base. Skipped when retrieval_query is null
+        // (subagents) or when there's no hybrid_search wired.
+        if (retrieval_query) |raw_query| {
+            if (raw_query.len > 0 and self.hybrid_search != null) {
+                if (sanitizeFtsQuery(self.allocator, raw_query)) |clean_query| {
+                    defer self.allocator.free(clean_query);
+                    if (clean_query.len > 0) {
+                        const top_k: usize = 8;
+                        const results = self.hybridSearch(clean_query, top_k) catch &.{};
+                        if (results.len > 0) {
+                            const entries = try self.allocator.alloc(prompt_mod.RetrievedEntry, results.len);
+                            for (results, 0..) |r, i| {
+                                const label = std.fmt.allocPrint(
+                                    self.allocator,
+                                    "{s}#{d}",
+                                    .{ r.source_type, r.source_id },
+                                ) catch "";
+                                // Cap individual entry length so a huge
+                                // message can't blow the prompt budget alone.
+                                const max_entry: usize = 800;
+                                const trimmed_text = if (r.text.len > max_entry)
+                                    r.text[0..max_entry]
+                                else
+                                    r.text;
+                                entries[i] = .{
+                                    .source_type = r.source_type,
+                                    .source_label = label,
+                                    .content = trimmed_text,
+                                };
+                            }
+                            layers.retrieved = entries;
+                            std.log.info("Retrieved: {d} hybrid-search hits injected as Layer 4", .{results.len});
+                        }
+                    }
+                }
+            }
+        }
+
         // ~32K chars ≈ ~8K tokens — reasonable system prompt budget
         return try prompt_mod.assemble(self.allocator, layers, 32768);
+    }
+
+    /// FTS5 query sanitizer: strip every char that isn't alphanumeric or
+    /// underscore, collapse runs of separators to a single space, return the
+    /// cleaned token stream. FTS5 treats space-separated tokens as implicit
+    /// AND, which is restrictive but safe — vector search picks up semantic
+    /// hits the FTS path misses.
+    fn sanitizeFtsQuery(allocator: std.mem.Allocator, raw: []const u8) ?[]const u8 {
+        var out: std.ArrayList(u8) = .{};
+        out.ensureTotalCapacity(allocator, raw.len) catch return null;
+        var in_word = false;
+        for (raw) |c| {
+            const is_word_char = std.ascii.isAlphanumeric(c) or c == '_';
+            if (is_word_char) {
+                if (!in_word and out.items.len > 0) {
+                    out.append(allocator, ' ') catch break;
+                }
+                out.append(allocator, c) catch break;
+                in_word = true;
+            } else {
+                in_word = false;
+            }
+        }
+        if (out.items.len == 0) {
+            out.deinit(allocator);
+            return null;
+        }
+        return out.toOwnedSlice(allocator) catch null;
     }
 
     /// Build prompt layers manually for custom assembly. Public API.
@@ -566,6 +779,9 @@ pub const Engine = struct {
         /// Peak single-round input tokens (actual context window size).
         /// input_tokens is cumulative across all tool rounds.
         context_tokens: u32,
+        /// Prompt cache stats (OpenRouter/Anthropic). Cumulative across tool rounds.
+        cache_read_tokens: u32 = 0,
+        cache_creation_tokens: u32 = 0,
         /// Comma-separated background job IDs spawned via summon_subagent during this turn.
         /// null when nothing was spawned. Caller owns the allocation.
         spawned_jobs: ?[]const u8 = null,
@@ -678,13 +894,26 @@ pub const Engine = struct {
             };
         };
 
-        // Add user message to DB
-        _ = self.message_store.addUserMessage(&sess.id, chat_req.message) catch {
-            return .{ .response = .{ .error_resp = .{
-                .code = "MESSAGE_ERROR",
-                .message = "Failed to add message",
-            } } };
-        };
+        // Add user message to DB. Skipped for subagents — their wrapped
+        // task is a machine-generated instruction from the dispatcher, not
+        // a real user turn, and persisting it pollutes the dispatcher's
+        // session history with directive boilerplate.
+        if (!chat_req.is_subagent) {
+            _ = self.message_store.addUserMessage(&sess.id, chat_req.message) catch {
+                return .{ .response = .{ .error_resp = .{
+                    .code = "MESSAGE_ERROR",
+                    .message = "Failed to add message",
+                } } };
+            };
+        }
+
+        // Plan enforcement: track whether an active plan exists for this session.
+        // When false, the tool gate blocks all non-plan tool calls, forcing the
+        // model to create a plan before it can do any work.
+        var has_active_plan = if (self.session_store.getPlan(&sess.id) catch null) |p| blk: {
+            self.allocator.free(p);
+            break :blk true;
+        } else false;
 
         // Determine model: explicit override > auto-routing > session model
         const model = if (chat_req.model_override) |override|
@@ -695,19 +924,40 @@ pub const Engine = struct {
             break :blk route.model;
         } else sess.model;
 
-        // Build API messages with automatic compaction for long sessions.
-        // Short sessions: all raw messages. Long: summary of older + recent raw.
-        const compact_cfg = context_mod.CompactConfig{
-            .compact_threshold = self.config.context.compact_threshold,
-            .recent_window = self.config.context.recent_window,
-            .max_context_chars = self.config.context.max_context_chars,
-        };
-        const msgs = context_mod.buildCompactedMessages(
+        // Build API messages. Subagents get a FRESH one-message context
+        // containing only their wrapped task directive — no session history
+        // at all. This is load-bearing: the old behavior (loading 90+ turns
+        // of Discord chat via buildCompactedMessages) caused the subagent
+        // to pattern-match the dispatcher's "Let me...", "Dispatching..."
+        // style and reply with chat instead of calling tools.
+        const msgs: []const api.messages.Message = if (chat_req.is_subagent) blk: {
+            const content = self.allocator.alloc(api.messages.ContentBlock, 1) catch {
+                return .{ .response = .{ .error_resp = .{
+                    .code = "BUILD_ERROR",
+                    .message = "Failed to allocate subagent message",
+                } } };
+            };
+            content[0] = .{ .text = .{ .text = chat_req.message } };
+            const msg = self.allocator.alloc(api.messages.Message, 1) catch {
+                self.allocator.free(content);
+                return .{ .response = .{ .error_resp = .{
+                    .code = "BUILD_ERROR",
+                    .message = "Failed to allocate subagent message",
+                } } };
+            };
+            msg[0] = .{ .role = .user, .content = content };
+            std.log.info("Subagent: fresh 1-message context (no session history)", .{});
+            break :blk msg;
+        } else context_mod.buildCompactedMessages(
             self.allocator,
             self.message_store,
             self.summary_store,
             &sess.id,
-            compact_cfg,
+            context_mod.CompactConfig{
+                .compact_threshold = self.config.context.compact_threshold,
+                .recent_window = self.config.context.recent_window,
+                .max_context_chars = self.config.context.max_context_chars,
+            },
         ) catch |err| {
             std.log.err("Build messages failed: {}", .{err});
             return .{ .response = .{ .error_resp = .{
@@ -718,12 +968,136 @@ pub const Engine = struct {
         defer self.allocator.free(msgs);
         std.log.info("Chat: {d} messages, model={s}", .{ msgs.len, model });
 
+        // Process image attachments. The main model receives real image
+        // content blocks on the current user turn (so it can actually see
+        // pixels), while the vision pipeline still runs in parallel to
+        // produce a cached text description — that description is appended
+        // to adapter_context as a supplement (useful for OCR-heavy content
+        // and for subagents that don't get the image blocks).
+        var vision_arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer vision_arena_state.deinit();
+        const vision_arena = vision_arena_state.allocator();
+
+        var user_turn_images: std.ArrayList(api.messages.ContentBlock) = .{};
+
+        const effective_adapter_context: ?[]const u8 = blk: {
+            const attachments = chat_req.attachments orelse break :blk chat_req.adapter_context;
+            if (attachments.len == 0) break :blk chat_req.adapter_context;
+            const vp = self.vision_pipeline orelse {
+                std.log.warn("Attachments provided but no vision pipeline is wired; ignoring.", .{});
+                break :blk chat_req.adapter_context;
+            };
+
+            const vision_cfg = &self.config.vision;
+            const limit = @min(attachments.len, vision_cfg.max_images_per_turn);
+            // Subagents run with a synthetic 1-message context and don't
+            // carry the user's attachments, so skip the main-model image
+            // injection on that path.
+            const attach_to_main_turn = !chat_req.is_subagent;
+
+            var overlay: std.ArrayList(u8) = .{};
+            if (chat_req.adapter_context) |ctx| {
+                overlay.appendSlice(vision_arena, ctx) catch {};
+                overlay.appendSlice(vision_arena, "\n\n") catch {};
+            }
+            overlay.appendSlice(vision_arena, "--- Attached images (auto-described via vision model) ---\n") catch {};
+
+            var i: usize = 0;
+            while (i < limit) : (i += 1) {
+                const att = attachments[i];
+
+                // Read the image bytes and base64-encode them for the main
+                // model's user turn. Bounded by max_image_bytes. On any
+                // failure we fall through to the vision-description path so
+                // the model still sees *something*.
+                img_read: {
+                    if (!attach_to_main_turn) break :img_read;
+                    const file = std.fs.openFileAbsolute(att.path, .{}) catch |err| {
+                        std.log.warn("Main-turn image read failed for {s}: {s}", .{ att.name, @errorName(err) });
+                        break :img_read;
+                    };
+                    defer file.close();
+                    const bytes = file.readToEndAlloc(vision_arena, vision_cfg.max_image_bytes + 1) catch |err| {
+                        std.log.warn("Main-turn image unreadable for {s}: {s}", .{ att.name, @errorName(err) });
+                        break :img_read;
+                    };
+                    if (bytes.len == 0) break :img_read;
+                    const b64_len = std.base64.standard.Encoder.calcSize(bytes.len);
+                    const b64 = vision_arena.alloc(u8, b64_len) catch break :img_read;
+                    _ = std.base64.standard.Encoder.encode(b64, bytes);
+                    user_turn_images.append(vision_arena, .{
+                        .image = .{ .media_type = att.mime, .data = b64 },
+                    }) catch break :img_read;
+                }
+
+                const result = vp.describePath(&sess.id, att.name, att.mime, att.path) catch |err| {
+                    std.log.err("Vision describe failed for {s}: {s}", .{ att.name, @errorName(err) });
+                    var err_buf: [128]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&err_buf, "[vision error: {s}]", .{@errorName(err)}) catch "[vision error]";
+                    overlay.appendSlice(vision_arena, "\nImage: ") catch {};
+                    overlay.appendSlice(vision_arena, att.name) catch {};
+                    overlay.appendSlice(vision_arena, "\n") catch {};
+                    overlay.appendSlice(vision_arena, msg) catch {};
+                    overlay.appendSlice(vision_arena, "\n") catch {};
+                    continue;
+                };
+                defer result.deinit(self.allocator);
+
+                overlay.appendSlice(vision_arena, "\nImage: ") catch {};
+                overlay.appendSlice(vision_arena, att.name) catch {};
+                overlay.appendSlice(vision_arena, " [") catch {};
+                overlay.appendSlice(vision_arena, att.mime) catch {};
+                overlay.appendSlice(vision_arena, if (result.from_cache) ", cached" else ", fresh") catch {};
+                overlay.appendSlice(vision_arena, ", model=") catch {};
+                overlay.appendSlice(vision_arena, result.model_used) catch {};
+                overlay.appendSlice(vision_arena, "]\n") catch {};
+                overlay.appendSlice(vision_arena, result.description) catch {};
+                overlay.appendSlice(vision_arena, "\n") catch {};
+            }
+
+            if (attachments.len > limit) {
+                var trim_buf: [128]u8 = undefined;
+                const msg = std.fmt.bufPrint(&trim_buf, "\n[{d} additional attachments omitted: over per-turn limit of {d}]\n", .{
+                    attachments.len - limit,
+                    limit,
+                }) catch "\n[additional attachments omitted]\n";
+                overlay.appendSlice(vision_arena, msg) catch {};
+            }
+            overlay.appendSlice(vision_arena, "--- End images ---") catch {};
+
+            break :blk overlay.items;
+        };
+
+        // Inject the collected image blocks into the current user turn so
+        // the main model sees the pixels. The vision description stays in
+        // adapter_context as a supplement.
+        if (user_turn_images.items.len > 0 and msgs.len > 0) {
+            const last_idx = msgs.len - 1;
+            if (msgs[last_idx].role == .user) {
+                const orig_content = msgs[last_idx].content;
+                const new_len = user_turn_images.items.len + orig_content.len;
+                if (vision_arena.alloc(api.messages.ContentBlock, new_len)) |new_content| {
+                    @memcpy(new_content[0..user_turn_images.items.len], user_turn_images.items);
+                    @memcpy(new_content[user_turn_images.items.len..], orig_content);
+                    const msgs_mut = @constCast(msgs);
+                    msgs_mut[last_idx] = .{ .role = .user, .content = new_content };
+                    std.log.info("Attached {d} image block(s) to user turn", .{user_turn_images.items.len});
+                } else |_| {}
+            }
+        }
+
         // Build layered system prompt: persona + user context + project + retrieved + adapter + session
+        // For subagents, skip retrieval — their user_message is a wrapped
+        // directive ("[SUBAGENT EXECUTION MODE]...") that would pollute the
+        // FTS query. The dispatcher (the actual user-facing turn) is where
+        // memory injection matters.
+        const retrieval_query: ?[]const u8 = if (chat_req.is_subagent) null else chat_req.message;
         const system_prompt: ?[]const u8 = self.buildSystemPrompt(
             &sess.id,
             sess.system_prompt,
-            chat_req.adapter_context,
+            effective_adapter_context,
             chat_req.message,
+            retrieval_query,
         ) catch sess.system_prompt;
 
         var owned_tool_defs: std.ArrayList([]const api.messages.ToolDefinition) = .{};
@@ -732,6 +1106,11 @@ pub const Engine = struct {
             owned_tool_defs.deinit(self.allocator);
         }
 
+        // Subagents (confirmer != null) must not recursively summon more
+        // subagents — nested job IDs aren't tracked by adapters, so results
+        // get orphaned. Strip summon_subagent from their tool set.
+        const is_subagent = confirmer != null;
+
         // Tool selection: allowed_tools filter > all enabled tools
         const initial_tools = if (chat_req.allowed_tools) |at| blk: {
             var names: [32][]const u8 = undefined;
@@ -739,23 +1118,62 @@ pub const Engine = struct {
             var iter = std.mem.splitScalar(u8, at, ',');
             while (iter.next()) |name| {
                 const trimmed = std.mem.trim(u8, name, " ");
-                if (trimmed.len > 0 and count < 32) {
-                    names[count] = trimmed;
-                    count += 1;
-                }
+                if (trimmed.len == 0 or count >= 32) continue;
+                if (is_subagent and std.mem.eql(u8, trimmed, "summon_subagent")) continue;
+                names[count] = trimmed;
+                count += 1;
             }
             break :blk if (count > 0) self.tool_registry.getToolDefinitionsFiltered(names[0..count]) else null;
-        } else self.tool_registry.getToolDefinitions();
+        } else if (is_subagent)
+            self.tool_registry.getToolDefinitionsExcluding("summon_subagent")
+        else
+            self.tool_registry.getToolDefinitions();
 
         if (initial_tools) |defs| {
             owned_tool_defs.append(self.allocator, defs) catch {};
         }
 
+        // Resolve the model string to a concrete provider + bare model name.
+        // Strings like `ollama:qwen3:8b` or `openai:gpt-4o` switch providers
+        // per-turn; bare names (`claude-sonnet-4-6`) stay on the default
+        // provider for backwards compat.
+        const resolved = self.resolveProviderForModel(model);
+        const active_provider = resolved.provider;
+        if (!std.mem.eql(u8, active_provider.getName(), self.provider.getName())) {
+            std.log.info("Provider switch: {s} → {s} (model={s})", .{
+                self.provider.getName(),
+                active_provider.getName(),
+                resolved.model,
+            });
+        }
+
+        // Append the voice-calibration style guide to the system prompt
+        // when targeting a non-Anthropic provider. The goal is to pin
+        // small local models (qwen3, llama3.x, mistral) to the persona
+        // voice instead of defaulting to generic-assistant cadence.
+        const effective_system: ?[]const u8 = blk_sys: {
+            const base = system_prompt orelse break :blk_sys null;
+            if (std.mem.eql(u8, active_provider.getName(), "anthropic")) {
+                break :blk_sys base;
+            }
+            // Concatenate onto the vision_arena so lifetime matches the
+            // rest of the request (the arena deinits at function exit).
+            const combined_len = base.len + SMALL_MODEL_STYLE_GUIDE.len;
+            const combined = vision_arena.alloc(u8, combined_len) catch break :blk_sys base;
+            @memcpy(combined[0..base.len], base);
+            @memcpy(combined[base.len..], SMALL_MODEL_STYLE_GUIDE);
+            std.log.info(
+                "Appended {d}b style guide for non-Anthropic provider ({s})",
+                .{ SMALL_MODEL_STYLE_GUIDE.len, active_provider.getName() },
+            );
+            break :blk_sys combined;
+        };
+
         const api_request = api.MessageRequest{
-            .model = model,
+            .model = resolved.model,
             .max_tokens = self.config.api.max_tokens,
             .messages = msgs,
-            .system = system_prompt,
+            .system = effective_system,
             .tools = if (chat_req.no_tools) null else initial_tools,
             .stream = true,
         };
@@ -772,6 +1190,8 @@ pub const Engine = struct {
         // ============================================================
         var total_input_tokens: u32 = 0;
         var total_output_tokens: u32 = 0;
+        var total_cache_read: u32 = 0;
+        var total_cache_creation: u32 = 0;
         var context_tokens: u32 = 0; // Peak single-round input (actual context window)
         var final_stop_reason: ?[]const u8 = null;
         var current_request = api_request;
@@ -830,12 +1250,12 @@ pub const Engine = struct {
                             }
                         }.cb,
                     };
-                    break :blk self.provider.createMessageStreaming(&current_request, stream_handler);
+                    break :blk active_provider.createMessageStreaming(&current_request, stream_handler);
                 }
                 // Non-streaming fallback (no emitter — CLI adapter or non-stream mode)
                 var non_stream = current_request;
                 non_stream.stream = false;
-                break :blk self.provider.createMessage(&non_stream);
+                break :blk active_provider.createMessage(&non_stream);
             } catch |err| {
                 if (is_stream_round) self.endStreaming();
                 std.log.err("API error: {}", .{err});
@@ -866,6 +1286,8 @@ pub const Engine = struct {
 
             total_input_tokens += api_response.usage.input_tokens;
             total_output_tokens += api_response.usage.output_tokens;
+            total_cache_read += api_response.usage.cache_read_tokens;
+            total_cache_creation += api_response.usage.cache_creation_tokens;
             context_tokens = @max(context_tokens, api_response.usage.input_tokens);
 
             // Always capture text from this round (API sends text preamble even with tool_use)
@@ -932,6 +1354,18 @@ pub const Engine = struct {
                         } });
                     }
 
+                    // Push tool_use event for subagent live transparency
+                    if (is_subagent) {
+                        if (self.worker_pool) |wp| {
+                            wp.pushToolEvent(.{
+                                .event_type = .tool_use,
+                                .tool_name = tool_call.name,
+                                .content = tool_call.input_json,
+                                .timestamp = std.time.timestamp(),
+                            });
+                        }
+                    }
+
                     // Confirmation check
                     var declined = false;
                     if (self.tool_registry.requiresConfirmation(tool_call.name)) {
@@ -943,12 +1377,49 @@ pub const Engine = struct {
                         // No confirmer → auto-approve
                     }
 
+                    // Plan enforcement gate: block heavyweight tool calls when
+                    // no active plan exists. Lightweight (read-only) tools are
+                    // allowed so the dispatcher can answer quick questions
+                    // directly without creating a full plan.
+                    const is_plan_tool = std.mem.eql(u8, tool_call.name, "plan");
+                    const is_lightweight = isLightweightTool(tool_call.name) or
+                        isSafeBashCommand(tool_call.name, tool_call.input);
+                    const plan_gate_active = !has_active_plan and !is_plan_tool and !is_subagent and !is_lightweight;
                     const tool_res = if (declined) blk: {
                         std.log.info("Tool {s} declined by user", .{tool_call.name});
                         break :blk tools.ToolResult{ .content = TOOL_DECLINED_MSG, .is_error = true };
+                    } else if (plan_gate_active) blk: {
+                        std.log.info("Plan gate: blocked {s} — no active plan", .{tool_call.name});
+                        break :blk tools.ToolResult{
+                            .content = "BLOCKED: This tool requires an active execution plan. Call the `plan` " ++
+                                "tool with operation \"create\" first. Note: lightweight tools (file_read, " ++
+                                "introspect, calc, research, meme_tool, amazon_search) and safe bash " ++
+                                "commands (ls, tree, git log/status/diff, head, tail, cat, find, pwd) " ++
+                                "work without a plan. For multi-step work, create a plan and delegate " ++
+                                "via summon_subagent.",
+                            .is_error = true,
+                        };
+                    } else if (is_plan_tool) blk: {
+                        std.log.info("Special tool: plan", .{});
+                        const res = self.handlePlanTool(tool_call.input, &sess.id, is_subagent);
+                        // Update plan state so subsequent tools in this turn aren't blocked
+                        if (!res.is_error) {
+                            if (tool_call.input == .object) {
+                                if (tool_call.input.object.get("operation")) |op| {
+                                    if (op == .string) {
+                                        if (std.mem.eql(u8, op.string, "create")) {
+                                            has_active_plan = true;
+                                        } else if (std.mem.eql(u8, op.string, "clear")) {
+                                            has_active_plan = false;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        break :blk res;
                     } else if (std.mem.eql(u8, tool_call.name, "summon_subagent")) blk: {
                         std.log.info("Special tool: summon_subagent", .{});
-                        break :blk self.handleSummonSubagent(tool_call.input, &sess.id, &spawned_subagent_ids);
+                        break :blk self.handleSummonSubagent(tool_call.input, &sess.id, &spawned_subagent_ids, model);
                     } else blk: {
                         std.log.info("Executing tool: {s}", .{tool_call.name});
                         break :blk self.executeToolParsedCached(tool_call.name, tool_call.input, tool_call.input_json);
@@ -961,6 +1432,25 @@ pub const Engine = struct {
                             .result = tool_res.content,
                             .is_error = tool_res.is_error,
                         } });
+                    }
+
+                    // Push tool_result event for subagent live transparency
+                    if (is_subagent) {
+                        if (self.worker_pool) |wp| {
+                            // Truncate content for the event log (keep it reasonable)
+                            const max_event_content = 1000;
+                            const event_content = if (tool_res.content.len > max_event_content)
+                                tool_res.content[0..max_event_content]
+                            else
+                                tool_res.content;
+                            wp.pushToolEvent(.{
+                                .event_type = .tool_result,
+                                .tool_name = tool_call.name,
+                                .content = event_content,
+                                .is_error = tool_res.is_error,
+                                .timestamp = std.time.timestamp(),
+                            });
+                        }
                     }
 
                     // Log tool call for message history persistence
@@ -1091,17 +1581,27 @@ pub const Engine = struct {
 
         // If we exhausted tool rounds without a final text response, make one more
         // API call with tools disabled to force a text summary of everything so far.
+        // Route through `active_provider` — `self.provider` is always the
+        // default (Anthropic), so calling it with a bare Ollama model name
+        // like `qwen3:30b` returns 404 and the whole chat dies with no
+        // response. `final_req.model` already holds the bare name from the
+        // earlier resolve, so `active_provider` is the right target.
         if (!cancelled and text_parts.items.len == 0 and tool_log.items.len > 0) {
-            std.log.info("Tool loop exhausted without text — forcing final summary call", .{});
+            std.log.info(
+                "Tool loop exhausted without text — forcing final summary call via {s}",
+                .{active_provider.getName()},
+            );
             var final_req = current_request;
             final_req.tools = null; // No tools → model must respond with text
             final_req.system = system_prompt; // Reapply persona/system prompt for the final user-facing response.
-            if (self.provider.createMessage(&final_req)) |final_resp| {
+            if (active_provider.createMessage(&final_req)) |final_resp| {
                 if (final_resp.arena) |a| {
                     response_arenas.append(self.allocator, a) catch {};
                 }
                 total_input_tokens += final_resp.usage.input_tokens;
                 total_output_tokens += final_resp.usage.output_tokens;
+                total_cache_read += final_resp.usage.cache_read_tokens;
+                total_cache_creation += final_resp.usage.cache_creation_tokens;
                 if (final_resp.text_content.len > 0) {
                     text_parts.appendSlice(self.allocator, final_resp.text_content) catch {};
                 }
@@ -1165,17 +1665,212 @@ pub const Engine = struct {
             .input_tokens = total_input_tokens,
             .context_tokens = context_tokens,
             .output_tokens = total_output_tokens,
+            .cache_read_tokens = total_cache_read,
+            .cache_creation_tokens = total_cache_creation,
             .spawned_jobs = spawned_jobs_str,
         } };
     }
 
+    /// Handle plan tool calls. Reads/writes the session's active_plan column.
+    /// The plan is a JSON blob with goal + steps that persists across turns
+    /// and survives compaction via prompt injection.
+    fn handlePlanTool(self: *Engine, input: std.json.Value, session_id: *const [36]u8, caller_is_subagent: bool) tools.ToolResult {
+        if (input != .object) return .{
+            .content = "plan tool requires an object input with 'operation' field",
+            .is_error = true,
+        };
+
+        const op = if (input.object.get("operation")) |v| (if (v == .string) v.string else null) else null;
+        if (op == null) return .{
+            .content = "plan tool requires 'operation' field (create, update, view, clear)",
+            .is_error = true,
+        };
+
+        // Subagents can only view and update the plan — not create or clear it.
+        // The dispatcher owns plan lifecycle; subagents just report progress.
+        if (caller_is_subagent) {
+            if (!std.mem.eql(u8, op.?, "update") and !std.mem.eql(u8, op.?, "view")) {
+                return .{
+                    .content = "Subagents can only use plan 'view' and 'update'. " ++
+                        "The dispatcher manages plan creation and clearing.",
+                    .is_error = true,
+                };
+            }
+        }
+
+        if (std.mem.eql(u8, op.?, "view")) {
+            const plan = self.session_store.getPlan(session_id) catch |err| {
+                const msg = std.fmt.allocPrint(self.allocator, "Failed to read plan: {s}", .{@errorName(err)}) catch return .{
+                    .content = "Failed to read plan",
+                    .is_error = true,
+                };
+                return .{ .content = msg, .is_error = true };
+            };
+            return .{ .content = plan orelse "No active plan." };
+        }
+
+        if (std.mem.eql(u8, op.?, "clear")) {
+            self.session_store.setPlan(session_id, null) catch |err| {
+                const msg = std.fmt.allocPrint(self.allocator, "Failed to clear plan: {s}", .{@errorName(err)}) catch return .{
+                    .content = "Failed to clear plan",
+                    .is_error = true,
+                };
+                return .{ .content = msg, .is_error = true };
+            };
+            std.log.info("Plan: cleared for session", .{});
+            return .{ .content = "Plan cleared." };
+        }
+
+        if (std.mem.eql(u8, op.?, "create")) {
+            // Build plan JSON from goal + steps
+            const goal = if (input.object.get("goal")) |v| (if (v == .string) v.string else null) else null;
+            if (goal == null) return .{
+                .content = "plan 'create' requires a 'goal' field",
+                .is_error = true,
+            };
+
+            // Serialize the full plan input as the stored plan
+            const plan_json = std.json.Stringify.valueAlloc(self.allocator, input, .{}) catch return .{
+                .content = "Failed to serialize plan",
+                .is_error = true,
+            };
+
+            self.session_store.setPlan(session_id, plan_json) catch |err| {
+                const msg = std.fmt.allocPrint(self.allocator, "Failed to save plan: {s}", .{@errorName(err)}) catch return .{
+                    .content = "Failed to save plan",
+                    .is_error = true,
+                };
+                return .{ .content = msg, .is_error = true };
+            };
+
+            std.log.info("Plan: created for session ({d} chars)", .{plan_json.len});
+            const result = std.fmt.allocPrint(
+                self.allocator,
+                "Plan created. Goal: {s}\n\nPlan is now active and will persist across turns.",
+                .{goal.?},
+            ) catch return .{ .content = "Plan created." };
+            return .{ .content = result };
+        }
+
+        if (std.mem.eql(u8, op.?, "update")) {
+            // Load existing plan, apply step updates
+            const existing = self.session_store.getPlan(session_id) catch null;
+            if (existing == null) return .{
+                .content = "No active plan to update. Use 'create' first.",
+                .is_error = true,
+            };
+
+            // Parse existing plan
+            const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, existing.?, .{}) catch return .{
+                .content = "Failed to parse existing plan. Consider re-creating it.",
+                .is_error = true,
+            };
+            var plan_obj = parsed.value;
+
+            if (plan_obj != .object) return .{
+                .content = "Existing plan is corrupt. Use 'create' to make a new one.",
+                .is_error = true,
+            };
+
+            // Update goal if provided
+            if (input.object.get("goal")) |new_goal| {
+                if (new_goal == .string) {
+                    _ = plan_obj.object.fetchPut("goal", new_goal) catch {};
+                }
+            }
+
+            // Merge step updates: match by id, update status/description
+            if (input.object.get("steps")) |new_steps_val| {
+                if (new_steps_val == .array) {
+                    const existing_steps_val = plan_obj.object.get("steps");
+                    if (existing_steps_val != null and existing_steps_val.? == .array) {
+                        var existing_steps = existing_steps_val.?.array;
+                        for (new_steps_val.array.items) |new_step| {
+                            if (new_step != .object) continue;
+                            const new_id = if (new_step.object.get("id")) |id_val| switch (id_val) {
+                                .integer => |i| i,
+                                .number_string, .string => null,
+                                else => null,
+                            } else null;
+
+                            if (new_id) |nid| {
+                                // Find and update existing step
+                                var found = false;
+                                for (existing_steps.items) |*es| {
+                                    if (es.* != .object) continue;
+                                    const es_id = if (es.*.object.get("id")) |id_val| switch (id_val) {
+                                        .integer => |i| i,
+                                        else => null,
+                                    } else null;
+                                    if (es_id != null and es_id.? == nid) {
+                                        // Update fields
+                                        if (new_step.object.get("status")) |s| {
+                                            _ = es.*.object.fetchPut("status", s) catch {};
+                                        }
+                                        if (new_step.object.get("description")) |d| {
+                                            _ = es.*.object.fetchPut("description", d) catch {};
+                                        }
+                                        // notes: subagents attach findings, discoveries,
+                                        // warnings here so the next subagent inherits context.
+                                        if (new_step.object.get("notes")) |n| {
+                                            _ = es.*.object.fetchPut("notes", n) catch {};
+                                        }
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if (!found) {
+                                    // New step — append
+                                    existing_steps.append(new_step) catch {};
+                                }
+                            }
+                        }
+                    } else {
+                        // No existing steps — set them
+                        _ = plan_obj.object.fetchPut("steps", new_steps_val) catch {};
+                    }
+                }
+            }
+
+            // Serialize and save
+            const updated_json = std.json.Stringify.valueAlloc(self.allocator, plan_obj, .{}) catch return .{
+                .content = "Failed to serialize updated plan",
+                .is_error = true,
+            };
+
+            self.session_store.setPlan(session_id, updated_json) catch |err| {
+                const msg = std.fmt.allocPrint(self.allocator, "Failed to save updated plan: {s}", .{@errorName(err)}) catch return .{
+                    .content = "Failed to save updated plan",
+                    .is_error = true,
+                };
+                return .{ .content = msg, .is_error = true };
+            };
+
+            std.log.info("Plan: updated for session ({d} chars)", .{updated_json.len});
+            return .{ .content = updated_json };
+        }
+
+        const msg = std.fmt.allocPrint(
+            self.allocator,
+            "Unknown plan operation: '{s}'. Use create, update, view, or clear.",
+            .{op.?},
+        ) catch return .{ .content = "Unknown plan operation", .is_error = true };
+        return .{ .content = msg, .is_error = true };
+    }
+
     /// Handle a summon_subagent tool call by enqueueing a BackgroundChatJob.
-    /// The subagent inherits the parent's session so it sees the same persona/history.
+    /// The subagent inherits the parent's session so it sees the same persona/history,
+    /// and inherits the parent's model string (including any `provider:` prefix) so
+    /// cross-provider swaps stay sticky — if the user picked `ollama:qwen3:30b` in
+    /// the web UI or Discord, subagents it spawns run on qwen3 too instead of
+    /// silently falling back to Claude. The parent LLM can still override via an
+    /// explicit `model` field in the tool call input.
     fn handleSummonSubagent(
         self: *Engine,
         input: std.json.Value,
         parent_session_id: *const [36]u8,
         spawned_ids: *std.ArrayList([36]u8),
+        parent_model: []const u8,
     ) tools.ToolResult {
         const wp = self.worker_pool orelse return .{
             .content = "summon_subagent unavailable: no worker pool configured",
@@ -1196,15 +1891,75 @@ pub const Engine = struct {
             .is_error = true,
         };
 
-        const model_val: ?[]const u8 = if (input.object.get("model")) |m|
+        // Explicit override from the parent LLM's tool call args wins; otherwise
+        // inherit the parent's active model so the subagent runs on whatever the
+        // user selected. Without this, any subagent spawned during an Ollama turn
+        // silently falls back to Claude.
+        const explicit_model: ?[]const u8 = if (input.object.get("model")) |m|
             (if (m == .string and m.string.len > 0) m.string else null)
         else
             null;
+        const model_val: ?[]const u8 = explicit_model orelse
+            (if (parent_model.len > 0) parent_model else null);
 
-        const task_dup = self.allocator.dupe(u8, task_val.string) catch return .{
+        // Load the current plan so the subagent sees what step it's working on.
+        const current_plan = self.session_store.getPlan(parent_session_id) catch null;
+
+        // Wrap the task with a hard execution directive. The subagent
+        // otherwise pattern-matches the dispatcher's chatty Discord style
+        // (seen via shared session history) and replies with "Let me...",
+        // "Dispatching...", "Firing off..." instead of calling tools. This
+        // prefix is terminal: the model sees it as the latest instruction,
+        // after persona and adapter_context.
+        const wrapped_task = std.fmt.allocPrint(
+            self.allocator,
+            \\[SUBAGENT EXECUTION MODE — READ BEFORE RESPONDING]
+            \\
+            \\You are running as an autonomous file/code/shell agent. You are NOT
+            \\the Discord dispatcher. Ignore any chat-style patterns from prior
+            \\conversation — they do not apply to you.
+            \\
+            \\HARD RULES:
+            \\1. Your FIRST response MUST contain a tool_use block. Do NOT reply
+            \\   with text only. Start by calling file_read, bash, file_write,
+            \\   or another concrete tool.
+            \\2. NEVER write phrases like "Let me...", "I'll...", "Dispatching...",
+            \\   "Firing off...", "Working on it...", or any dispatcher ack. You
+            \\   are the worker, not a dispatcher.
+            \\3. You do NOT have summon_subagent. Do not try to delegate — you
+            \\   ARE the worker. Finish the task yourself.
+            \\4. When complete, give a concise factual report (≤300 words). No
+            \\   emojis, no greetings, no "let me know if you need more".
+            \\5. You have the `plan` tool (view/update only). When you finish your
+            \\   task, call `plan` with operation "update" to mark your step as
+            \\   "done" and include a "notes" field with key findings, file paths,
+            \\   gotchas, or anything the next step needs to know. This is critical
+            \\   — other subagents see your notes and avoid repeating mistakes.
+            \\   Example: {{"operation":"update","steps":[{{"id":2,"status":"done",
+            \\   "description":"...", "notes":"config was at /etc/x not /opt/x"}}]}}
+            \\
+            \\{s}
+            \\TASK:
+            \\{s}
+            ,
+            .{
+                if (current_plan) |p|
+                    std.fmt.allocPrint(self.allocator,
+                        \\CURRENT PLAN STATE:
+                        \\{s}
+                        \\
+                        \\Find which step matches your task below and update it when done.
+                        \\
+                    , .{p}) catch ""
+                else
+                    "",
+                task_val.string,
+            },
+        ) catch return .{
             .content = "summon_subagent: out of memory",
             .is_error = true,
         };
+
         const model_dup: ?[]const u8 = if (model_val) |m|
             (self.allocator.dupe(u8, m) catch null)
         else
@@ -1215,11 +1970,12 @@ pub const Engine = struct {
 
         wp.enqueueBackgroundChat(.{
             .job_id = job_id,
-            .message = task_dup,
+            .message = wrapped_task,
             .session_id = parent_session_id.*,
             .model_override = model_dup,
             .callback_channel = null,
             .allowed_tools = null,
+            .is_subagent = true,
             .cancelled = std.atomic.Value(bool).init(false),
         });
 
@@ -1347,6 +2103,7 @@ pub const Engine = struct {
                 (self.allocator.dupe(u8, at) catch null)
             else
                 null,
+            .is_subagent = req.is_subagent,
             .cancelled = std.atomic.Value(bool).init(false),
         });
 
@@ -1375,6 +2132,99 @@ pub const Engine = struct {
         }
     }
 
+    /// Run a fast "voice pass" that rewrites a subagent's terse, factual
+    /// report in the parent session's persona voice for Discord delivery.
+    /// Returns an allocated rewritten string, or null on failure (caller
+    /// should fall back to the original terse text).
+    ///
+    /// Why: subagents are forced to be terse + tool-first to actually do
+    /// work. That output reads like a database dump. The voice pass keeps
+    /// every fact intact but transforms tone — like Vera personally
+    /// reporting back instead of a CI bot.
+    fn rewriteInPersonaVoice(
+        self: *Engine,
+        parent_session_id: []const u8,
+        terse_text: []const u8,
+    ) ?[]const u8 {
+        if (terse_text.len == 0) return null;
+
+        // Look up the parent session to read its persona name.
+        var sess = self.session_store.getSession(parent_session_id) catch return null;
+        defer self.session_store.freeSessionInfo(&sess);
+
+        // Load the persona text. DEFAULT_PERSONA is comptime-embedded —
+        // tracking ownership separately so we only free the loaded variant.
+        const persona_owned: ?[]const u8 = if (sess.system_prompt) |name|
+            prompt_mod.loadPersona(self.allocator, name)
+        else
+            null;
+        defer if (persona_owned) |p| self.allocator.free(p);
+        const persona_text = persona_owned orelse prompt_mod.DEFAULT_PERSONA;
+
+        const voice_directive =
+            "\n\n--- VOICE PASS DIRECTIVE ---\n" ++
+            "A subagent just completed a task on the user's behalf and produced " ++
+            "the factual report in the user message below. Your job: rewrite " ++
+            "that report in YOUR voice as if you personally did the work and " ++
+            "are telling the user about it in Discord.\n" ++
+            "\n" ++
+            "HARD RULES:\n" ++
+            "1. PRESERVE every fact verbatim — numbers, paths, file names, IDs, " ++
+            "counts, statuses. Do not drop, alter, or add facts.\n" ++
+            "2. Speak in your natural personality. Casual, warm, brief. " ++
+            "Up to 2 appropriate emojis if they fit, never forced.\n" ++
+            "3. Do NOT add greetings, 'Here's the summary', 'I successfully...', " ++
+            "'Let me know if you need...', or any meta narration about the report.\n" ++
+            "4. Keep it under ~400 words. Lists are fine if the original had them.\n" ++
+            "5. Never mention 'the subagent' or 'the agent' — speak as if you did " ++
+            "the work yourself.\n" ++
+            "\n" ++
+            "Your ENTIRE response is what the user sees. Just the rewritten report.";
+
+        const system_prompt = std.fmt.allocPrint(
+            self.allocator,
+            "{s}{s}",
+            .{ persona_text, voice_directive },
+        ) catch return null;
+        defer self.allocator.free(system_prompt);
+
+        // Build a single user message with the terse report. No tools, no
+        // streaming — this is a one-shot transformation.
+        const content = [_]api.messages.ContentBlock{
+            .{ .text = .{ .text = terse_text } },
+        };
+        const msgs = [_]api.messages.Message{
+            .{ .role = .user, .content = &content },
+        };
+
+        const req = api.MessageRequest{
+            .model = "claude-haiku-4-5-20251001",
+            .max_tokens = 2048,
+            .messages = &msgs,
+            .system = system_prompt,
+            .tools = null,
+            .stream = false,
+        };
+
+        var resp = self.provider.createMessage(&req) catch |err| {
+            std.log.warn("Voice pass failed ({s}); falling back to terse text", .{@errorName(err)});
+            return null;
+        };
+        defer resp.deinit(self.allocator);
+
+        if (resp.text_content.len == 0) {
+            std.log.warn("Voice pass returned empty text; falling back", .{});
+            return null;
+        }
+
+        const dup = self.allocator.dupe(u8, resp.text_content) catch return null;
+        std.log.info(
+            "Voice pass: terse={d} chars → polished={d} chars ({d} in / {d} out tokens)",
+            .{ terse_text.len, dup.len, resp.usage.input_tokens, resp.usage.output_tokens },
+        );
+        return dup;
+    }
+
     /// Callback for the background chat worker thread. Matches the function
     /// signature expected by WorkerPool.setBackgroundChatContext.
     pub fn backgroundChatCallback(
@@ -1383,6 +2233,7 @@ pub const Engine = struct {
         session_id: ?[]const u8,
         model_override: ?[]const u8,
         allowed_tools: ?[]const u8,
+        is_subagent: bool,
         confirm_ctx: ?*anyopaque,
         confirm_fn: ?*const fn (ctx: *anyopaque, tool_name: []const u8, tool_id: []const u8, input_preview: []const u8) bool,
     ) workers.BackgroundChatOutput {
@@ -1391,29 +2242,56 @@ pub const Engine = struct {
             .{ .ctx = confirm_ctx.?, .confirmFn = confirm_fn.? }
         else
             null;
+        const adapter_ctx: []const u8 = if (is_subagent)
+            "You are a SUBAGENT WORKER, not a chat assistant. The user who " ++
+            "sent you this task expects tools to be used, files to be read, " ++
+            "commands to be run, and factual results. You MUST begin by " ++
+            "calling a tool. Never reply with only text on your first turn. " ++
+            "Ignore any conversational patterns from the session history — " ++
+            "they are from the dispatcher, not from you. Keep all output " ++
+            "terse and factual; no emojis, no greetings, no 'let me...'."
+        else
+            "You are running as a background agent. " ++
+            "Investigate thoroughly using file_read before making changes. " ++
+            "When you are ready to modify files or run commands, clearly state your plan first, " ++
+            "then proceed. The user will be prompted to approve the first mutation — " ++
+            "after approval, you have full autonomy to iterate (edit, build, test, fix) " ++
+            "until the task is complete.";
         const result = self.process(.{ .chat = .{
             .message = message,
             .session_id = session_id,
             .model_override = model_override,
             .allowed_tools = allowed_tools,
-            .adapter_context = "You are running as a background agent. " ++
-                "Investigate thoroughly using file_read before making changes. " ++
-                "When you are ready to modify files or run commands, clearly state your plan first, " ++
-                "then proceed. The user will be prompted to approve the first mutation — " ++
-                "after approval, you have full autonomy to iterate (edit, build, test, fix) " ++
-                "until the task is complete.",
+            .adapter_context = adapter_ctx,
             .stream = false,
             .no_tools = false,
             .background = false,
+            .is_subagent = is_subagent,
         } }, null, confirmer);
 
         return switch (result) {
-            .chat => |chat| .{
-                .ok = true,
-                .text = chat.text,
-                .model = chat.model,
-                .input_tokens = chat.input_tokens,
-                .output_tokens = chat.output_tokens,
+            .chat => |chat| blk: {
+                // For subagent results, run a voice pass so the user-facing
+                // text reads in the parent persona's voice instead of as a
+                // dry technical dump. Only fires for subagents (user-initiated
+                // /api/chat/background calls keep their raw output).
+                var final_text = chat.text;
+                if (is_subagent) {
+                    if (session_id) |sid| {
+                        if (self.rewriteInPersonaVoice(sid, chat.text)) |polished| {
+                            // Free the original terse text — we've replaced it.
+                            self.allocator.free(chat.text);
+                            final_text = polished;
+                        }
+                    }
+                }
+                break :blk .{
+                    .ok = true,
+                    .text = final_text,
+                    .model = chat.model,
+                    .input_tokens = chat.input_tokens,
+                    .output_tokens = chat.output_tokens,
+                };
             },
             .response => |resp| .{
                 .ok = false,
@@ -1838,12 +2716,79 @@ pub const Engine = struct {
     }
 };
 
+/// Tools the dispatcher can use directly without creating a plan first.
+/// These are read-only / non-mutating tools suitable for quick lookups.
+/// Anything not on this list requires an active plan to execute.
+/// Check if a bash tool call is a safe read-only command that can bypass
+/// the plan gate. Only allows simple listing/inspection commands with no
+/// chaining, pipes, or redirection that could cause side effects.
+fn isSafeBashCommand(tool_name: []const u8, input: std.json.Value) bool {
+    if (!std.mem.eql(u8, tool_name, "bash")) return false;
+    if (input != .object) return false;
+    const cmd_val = input.object.get("command") orelse return false;
+    if (cmd_val != .string) return false;
+    const cmd = std.mem.trim(u8, cmd_val.string, " \t");
+
+    // Reject anything with chaining/pipes/redirection — not safe
+    for (cmd) |c| {
+        switch (c) {
+            '|', ';', '&', '>', '<', '`', '$' => return false,
+            else => {},
+        }
+    }
+
+    // Whitelist of safe read-only command prefixes
+    const safe_prefixes = [_][]const u8{
+        "ls",
+        "tree",
+        "pwd",
+        "wc ",
+        "du ",
+        "df ",
+        "stat ",
+        "file ",
+        "head ",
+        "tail ",
+        "cat ",
+        "find ",
+        "which ",
+        "realpath ",
+        "dirname ",
+        "basename ",
+        "git log",
+        "git status",
+        "git diff",
+        "git branch",
+        "git show",
+    };
+    for (&safe_prefixes) |prefix| {
+        if (std.mem.eql(u8, cmd, prefix) or std.mem.startsWith(u8, cmd, prefix)) return true;
+    }
+    return false;
+}
+
+fn isLightweightTool(name: []const u8) bool {
+    const lightweight = [_][]const u8{
+        "file_read",
+        "introspect",
+        "calc",
+        "research",
+        "meme_tool",
+        "amazon_search",
+    };
+    for (&lightweight) |lt| {
+        if (std.mem.eql(u8, name, lt)) return true;
+    }
+    return false;
+}
+
 fn estimateMessageChars(messages: []const api.messages.Message) usize {
     var total: usize = 0;
     for (messages) |message| {
         for (message.content) |block| {
             switch (block) {
                 .text => |text| total += text.text.len,
+                .image => |img| total += img.data.len,
                 // Input is structured JSON here, so this is only a rough size estimate for logging.
                 .tool_use => |tool_use| total += tool_use.id.len + tool_use.name.len + 64,
                 .tool_result => |tool_result| total += tool_result.tool_use_id.len + tool_result.content.len,

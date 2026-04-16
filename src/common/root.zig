@@ -5,6 +5,7 @@ pub const simd = @import("simd.zig");
 
 pub const Config = config.Config;
 pub const RoutingConfig = config.RoutingConfig;
+pub const VisionConfig = config.VisionConfig;
 pub const Request = protocol.Request;
 pub const Response = protocol.Response;
 pub const AuthProfileStore = auth_profiles.AuthProfileStore;

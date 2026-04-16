@@ -29,5 +29,23 @@
     "token_file": "",
     "guild_id": "",
     "channel_id": ""
+  },
+  "ollama": {
+    "enabled": true,
+    "base_url": "http://127.0.0.1:11434",
+    "default_model": "qwen3:4b",
+    "num_ctx": 49152
+  },
+  "openrouter": {
+    "enabled": true,
+    "default_model": "x-ai/grok-4.1-fast"
+  },
+  "vision": {
+    "enabled": true,
+    "model": "claude-haiku-4-5-20251001",
+    "max_image_bytes": 10485760,
+    "max_images_per_turn": 2,
+    "max_output_tokens": 512,
+    "prompt": "Describe this image in detail. Extract any visible text verbatim (OCR). If it shows an error, UI, diagram, or code, extract the relevant structure. Be concise and factual — no speculation."
   }
 }

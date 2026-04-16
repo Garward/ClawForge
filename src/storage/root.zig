@@ -31,6 +31,12 @@ pub const Skill = skills.Skill;
 pub const embeddings = @import("embeddings.zig");
 pub const EmbeddingStore = embeddings.EmbeddingStore;
 
+pub const artifacts = @import("artifacts.zig");
+pub const ArtifactStore = artifacts.ArtifactStore;
+pub const CachedAnalysis = artifacts.CachedAnalysis;
+pub const InsertArtifact = artifacts.InsertArtifact;
+pub const InsertAnalysis = artifacts.InsertAnalysis;
+
 /// Run database migrations.
 pub fn runMigrations(conn: *Connection) !void {
     return migrations.runMigrations(conn);

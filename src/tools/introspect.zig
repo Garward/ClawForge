@@ -11,10 +11,12 @@ pub const definition = registry.ToolDefinition{
         " 'summary_search' (search conversation summaries), 'summary_history' (summaries for session/project)," ++
         " 'projects' (list projects with status), 'project_context' (rolling context for a project)," ++
         " 'semantic_search' (hybrid FTS+vector via Ollama embeddings — best for meaning-based recall)," ++
+        " 'project_tree' (browse the ClawForge source tree — use query to filter by path/name, e.g. 'src/tools' or '*.zig')," ++
         " 'sessions', 'tool_stats', 'tool_history', 'session_stats', 'metrics'." ++
-        " For finding relevant past context, prefer 'semantic_search' over 'message_search' — it finds meaning, not just keywords.",
+        " For finding relevant past context, prefer 'semantic_search' over 'message_search' — it finds meaning, not just keywords." ++
+        " For locating files quickly, use 'project_tree' — faster than bash find and respects .gitignore.",
     .input_schema_json =
-        \\{"type":"object","properties":{"mode":{"type":"string","enum":["semantic_search","message_search","message_history","knowledge_search","knowledge_browse","summary_search","summary_history","projects","project_context","sessions","tool_stats","tool_history","session_stats","metrics"],"description":"What to query. Use semantic_search for meaning-based recall across all data."},"query":{"type":"string","description":"Search term (required for *_search modes)"},"source_type":{"type":"string","description":"Filter semantic_search by source: 'message', 'summary', or 'knowledge'"},"category":{"type":"string","description":"Filter knowledge by category"},"session_id":{"type":"string","description":"Filter by session ID"},"project_id":{"type":"string","description":"Filter by project ID or name"},"role":{"type":"string","description":"Filter by role: 'user' or 'assistant'"},"date":{"type":"string","description":"Filter by date (YYYY-MM-DD)"},"tool_name":{"type":"string","description":"Filter by tool name"},"limit":{"type":"integer","description":"Max rows (default 20)"}},"required":["mode"]}
+        \\{"type":"object","properties":{"mode":{"type":"string","enum":["semantic_search","message_search","message_history","knowledge_search","knowledge_browse","summary_search","summary_history","projects","project_context","project_tree","sessions","tool_stats","tool_history","session_stats","metrics"],"description":"What to query. Use semantic_search for meaning-based recall across all data. Use project_tree to browse/search the source tree."},"query":{"type":"string","description":"Search term (required for *_search modes). For project_tree: optional filter — a subdirectory path (e.g. 'src/tools') or glob pattern (e.g. '*.zig')."},"source_type":{"type":"string","description":"Filter semantic_search by source: 'message', 'summary', or 'knowledge'"},"category":{"type":"string","description":"Filter knowledge by category"},"session_id":{"type":"string","description":"Filter by session ID"},"project_id":{"type":"string","description":"Filter by project ID or name"},"role":{"type":"string","description":"Filter by role: 'user' or 'assistant'"},"date":{"type":"string","description":"Filter by date (YYYY-MM-DD)"},"tool_name":{"type":"string","description":"Filter by tool name"},"limit":{"type":"integer","description":"Max rows (default 20, for project_tree: max depth, default 4)"}},"required":["mode"]}
     ,
     .requires_confirmation = false,
     .handler = &execute,
@@ -51,6 +53,11 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
     // Semantic search uses the Python hybrid search script (Ollama + FTS + RRF)
     if (std.mem.eql(u8, mode, "semantic_search")) {
         return executeSemanticSearch(allocator, input);
+    }
+
+    // Project tree uses git ls-files / find — not SQL
+    if (std.mem.eql(u8, mode, "project_tree")) {
+        return executeProjectTree(allocator, query_filter, limit_str);
     }
 
     // Build SQL query based on mode
@@ -147,6 +154,140 @@ fn executeSemanticSearch(allocator: std.mem.Allocator, input: json.Value) regist
     }
 
     return .{ .content = result.stdout, .is_error = false };
+}
+
+const PROJECT_ROOT = "/home/garward/Scripts/Tools/ClawForge";
+
+fn executeProjectTree(allocator: std.mem.Allocator, query: ?[]const u8, limit_str: []const u8) registry.ToolResult {
+    // Parse depth limit from limit_str (default 4)
+    const max_depth = std.fmt.parseInt(u8, limit_str, 10) catch 4;
+    const depth_str = std.fmt.allocPrint(allocator, "{d}", .{@min(max_depth, 8)}) catch "4";
+
+    if (query) |q| {
+        // Safety: reject anything with shell metacharacters
+        for (q) |c| {
+            switch (c) {
+                '|', ';', '&', '>', '<', '`', '$', '(', ')', '{', '}', '!', '\\' => {
+                    return .{ .content = "Invalid characters in query", .is_error = true };
+                },
+                else => {},
+            }
+        }
+
+        // Check if query looks like a subdir path (contains / or no wildcards)
+        const is_subdir = std.mem.indexOf(u8, q, "*") == null and
+            std.mem.indexOf(u8, q, "?") == null;
+
+        if (is_subdir) {
+            // Treat as subdirectory — list that subtree
+            const target = std.fmt.allocPrint(allocator, "{s}/{s}", .{ PROJECT_ROOT, q }) catch
+                return .{ .content = "Path too long", .is_error = true };
+
+            const result = std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{
+                    "find", target,
+                    "-maxdepth", depth_str,
+                    "-not", "-path", "*/.zig-cache/*",
+                    "-not", "-path", "*/__pycache__/*",
+                    "-not", "-path", "*/.git/*",
+                    "-not", "-path", "*/data/*",
+                    "-not", "-name", "*.o",
+                    "-not", "-name", "*.pyc",
+                },
+                .max_output_bytes = 128 * 1024,
+            }) catch |err| {
+                const msg = std.fmt.allocPrint(allocator, "find error: {s}", .{@errorName(err)}) catch
+                    return .{ .content = "find failed", .is_error = true };
+                return .{ .content = msg, .is_error = true };
+            };
+            defer allocator.free(result.stderr);
+
+            if (result.stdout.len == 0) {
+                return .{ .content = "No files found (directory may not exist)", .is_error = false };
+            }
+
+            // Strip the project root prefix from each line for cleaner output
+            return .{ .content = stripProjectRoot(allocator, result.stdout) orelse result.stdout, .is_error = false };
+        } else {
+            // Glob pattern — use find with -name
+            const result = std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{
+                    "find", PROJECT_ROOT,
+                    "-maxdepth", depth_str,
+                    "-name", q,
+                    "-not", "-path", "*/.zig-cache/*",
+                    "-not", "-path", "*/__pycache__/*",
+                    "-not", "-path", "*/.git/*",
+                    "-not", "-path", "*/data/*",
+                },
+                .max_output_bytes = 128 * 1024,
+            }) catch |err| {
+                const msg = std.fmt.allocPrint(allocator, "find error: {s}", .{@errorName(err)}) catch
+                    return .{ .content = "find failed", .is_error = true };
+                return .{ .content = msg, .is_error = true };
+            };
+            defer allocator.free(result.stderr);
+
+            if (result.stdout.len == 0) {
+                return .{ .content = "No files matching pattern", .is_error = false };
+            }
+
+            return .{ .content = stripProjectRoot(allocator, result.stdout) orelse result.stdout, .is_error = false };
+        }
+    } else {
+        // No query — show full project tree with default depth
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{
+                "find", PROJECT_ROOT,
+                "-maxdepth", depth_str,
+                "-not", "-path", "*/.zig-cache/*",
+                "-not", "-path", "*/__pycache__/*",
+                "-not", "-path", "*/.git/*",
+                "-not", "-path", "*/data/*",
+                "-not", "-name", "*.o",
+                "-not", "-name", "*.pyc",
+                "-type", "f",
+            },
+            .max_output_bytes = 128 * 1024,
+        }) catch |err| {
+            const msg = std.fmt.allocPrint(allocator, "find error: {s}", .{@errorName(err)}) catch
+                return .{ .content = "find failed", .is_error = true };
+            return .{ .content = msg, .is_error = true };
+        };
+        defer allocator.free(result.stderr);
+
+        if (result.stdout.len == 0) {
+            return .{ .content = "No files found", .is_error = false };
+        }
+
+        // Sort the output for readability
+        return .{ .content = stripProjectRoot(allocator, result.stdout) orelse result.stdout, .is_error = false };
+    }
+}
+
+/// Strip the PROJECT_ROOT prefix from each line of find output for cleaner display.
+fn stripProjectRoot(allocator: std.mem.Allocator, raw: []const u8) ?[]const u8 {
+    const prefix = PROJECT_ROOT ++ "/";
+    var out: std.ArrayList(u8) = .{};
+    var iter = std.mem.splitScalar(u8, raw, '\n');
+    var first = true;
+    while (iter.next()) |line| {
+        if (line.len == 0) continue;
+        if (!first) out.append(allocator, '\n') catch return null;
+        first = false;
+        if (std.mem.startsWith(u8, line, prefix)) {
+            out.appendSlice(allocator, line[prefix.len..]) catch return null;
+        } else if (std.mem.eql(u8, line, PROJECT_ROOT)) {
+            out.appendSlice(allocator, ".") catch return null;
+        } else {
+            out.appendSlice(allocator, line) catch return null;
+        }
+    }
+    out.append(allocator, '\n') catch return null;
+    return out.items;
 }
 
 fn buildToolStatsQuery(allocator: std.mem.Allocator, date: ?[]const u8, tool: ?[]const u8) ?[]const u8 {

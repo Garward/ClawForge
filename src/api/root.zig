@@ -8,6 +8,7 @@ pub const openai_provider = @import("openai_provider.zig");
 
 pub const AnthropicClient = anthropic.AnthropicClient;
 pub const StreamHandler = anthropic.StreamHandler;
+pub const VisionResult = anthropic.VisionResult;
 pub const MessageRequest = messages.MessageRequest;
 pub const MessageResponse = messages.MessageResponse;
 pub const ToolUseInfo = messages.ToolUseInfo;

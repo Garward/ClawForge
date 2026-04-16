@@ -30,7 +30,7 @@ pub fn dotProduct(a: []const f32, b: []const f32) f32 {
 
 /// Cosine similarity between two f32 vectors.
 /// Returns value in [-1, 1] where 1 = identical direction.
-pub fn cosineSimilarity(a: []const f32, b: []const f32) f32 {
+pub fn cosineSimilarity(a: []align(1) const f32, b: []align(1) const f32) f32 {
     const len = @min(a.len, b.len);
     const simd_width = 8;
 
@@ -60,7 +60,9 @@ pub fn cosineSimilarity(a: []const f32, b: []const f32) f32 {
 
 /// Hamming distance between two binary vectors stored as packed u64 arrays.
 /// Uses @popCount for hardware-accelerated bit counting.
-pub fn hammingDistance(a: []const u64, b: []const u64) u32 {
+/// Accepts byte-aligned slices because SQLite blobs come back as
+/// `[]align(1) const u8` and `bytesAsSlice` preserves that alignment.
+pub fn hammingDistance(a: []align(1) const u64, b: []align(1) const u64) u32 {
     const len = @min(a.len, b.len);
     var dist: u32 = 0;
 

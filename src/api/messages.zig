@@ -1,6 +1,93 @@
 const std = @import("std");
 const json = std.json;
 
+/// Append `data` to `out` as a JSON-escaped string body (without the
+/// surrounding quotes). Walks input as UTF-8: any invalid lead byte,
+/// truncated sequence, overlong encoding, or surrogate codepoint
+/// (U+D800–U+DFFF) is replaced with U+FFFD. ASCII control chars get
+/// `\u00XX` escapes per the JSON spec. This is the chokepoint for
+/// everything going to the Anthropic API, so a single poisoned byte
+/// in session history can't kill subsequent turns.
+pub fn appendJsonEscaped(out: *std.ArrayList(u8), a: std.mem.Allocator, data: []const u8) void {
+    const REPLACEMENT = "\xEF\xBF\xBD";
+    var i: usize = 0;
+    while (i < data.len) {
+        const b = data[i];
+        if (b < 0x80) {
+            switch (b) {
+                '"' => { out.append(a, '\\') catch {}; out.append(a, '"') catch {}; },
+                '\\' => { out.append(a, '\\') catch {}; out.append(a, '\\') catch {}; },
+                '\n' => { out.append(a, '\\') catch {}; out.append(a, 'n') catch {}; },
+                '\r' => { out.append(a, '\\') catch {}; out.append(a, 'r') catch {}; },
+                '\t' => { out.append(a, '\\') catch {}; out.append(a, 't') catch {}; },
+                else => {
+                    if (b < 0x20) {
+                        var buf: [8]u8 = undefined;
+                        const s = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{b}) catch {
+                            i += 1;
+                            continue;
+                        };
+                        out.appendSlice(a, s) catch {};
+                    } else {
+                        out.append(a, b) catch {};
+                    }
+                },
+            }
+            i += 1;
+            continue;
+        }
+        const seq_len: usize = if (b & 0b11100000 == 0b11000000) 2
+            else if (b & 0b11110000 == 0b11100000) 3
+            else if (b & 0b11111000 == 0b11110000) 4
+            else 0;
+        if (seq_len == 0 or i + seq_len > data.len) {
+            out.appendSlice(a, REPLACEMENT) catch {};
+            i += 1;
+            continue;
+        }
+        var cont_ok = true;
+        var j: usize = 1;
+        while (j < seq_len) : (j += 1) {
+            if (data[i + j] & 0b11000000 != 0b10000000) {
+                cont_ok = false;
+                break;
+            }
+        }
+        if (!cont_ok) {
+            out.appendSlice(a, REPLACEMENT) catch {};
+            i += 1;
+            continue;
+        }
+        const cp: u32 = switch (seq_len) {
+            2 => (@as(u32, b & 0x1F) << 6) |
+                 @as(u32, data[i + 1] & 0x3F),
+            3 => (@as(u32, b & 0x0F) << 12) |
+                 (@as(u32, data[i + 1] & 0x3F) << 6) |
+                 @as(u32, data[i + 2] & 0x3F),
+            4 => (@as(u32, b & 0x07) << 18) |
+                 (@as(u32, data[i + 1] & 0x3F) << 12) |
+                 (@as(u32, data[i + 2] & 0x3F) << 6) |
+                 @as(u32, data[i + 3] & 0x3F),
+            else => unreachable,
+        };
+        const min_cp: u32 = switch (seq_len) {
+            2 => 0x80,
+            3 => 0x800,
+            4 => 0x10000,
+            else => 0,
+        };
+        const is_surrogate = cp >= 0xD800 and cp <= 0xDFFF;
+        const is_oob = cp > 0x10FFFF;
+        if (cp < min_cp or is_surrogate or is_oob) {
+            out.appendSlice(a, REPLACEMENT) catch {};
+            i += 1;
+            continue;
+        }
+        out.appendSlice(a, data[i .. i + seq_len]) catch {};
+        i += seq_len;
+    }
+}
+
 pub const Role = enum {
     user,
     assistant,
@@ -8,11 +95,19 @@ pub const Role = enum {
 
 pub const ContentBlock = union(enum) {
     text: TextBlock,
+    image: ImageBlock,
     tool_use: ToolUseBlock,
     tool_result: ToolResultBlock,
 
     pub const TextBlock = struct {
         text: []const u8,
+    };
+
+    pub const ImageBlock = struct {
+        /// e.g. "image/png", "image/jpeg"
+        media_type: []const u8,
+        /// Base64-encoded image data (no prefix). Borrowed slice; caller owns.
+        data: []const u8,
     };
 
     pub const ToolUseBlock = struct {
@@ -64,16 +159,7 @@ pub const MessageRequest = struct {
                 o.appendSlice(a, data) catch {};
             }
             fn appendEscaped(o: *std.ArrayList(u8), a: std.mem.Allocator, data: []const u8) void {
-                for (data) |c| {
-                    switch (c) {
-                        '"' => { o.append(a, '\\') catch {}; o.append(a, '"') catch {}; },
-                        '\\' => { o.append(a, '\\') catch {}; o.append(a, '\\') catch {}; },
-                        '\n' => { o.append(a, '\\') catch {}; o.append(a, 'n') catch {}; },
-                        '\r' => { o.append(a, '\\') catch {}; o.append(a, 'r') catch {}; },
-                        '\t' => { o.append(a, '\\') catch {}; o.append(a, 't') catch {}; },
-                        else => o.append(a, c) catch {},
-                    }
-                }
+                appendJsonEscaped(o, a, data);
             }
             fn appendNum(o: *std.ArrayList(u8), a: std.mem.Allocator, n: anytype) void {
                 var num_buf: [32]u8 = undefined;
@@ -123,6 +209,14 @@ pub const MessageRequest = struct {
                         w.append(&out, allocator, "{\"type\":\"text\",\"text\":\"");
                         w.appendEscaped(&out, allocator, t.text);
                         w.append(&out, allocator, "\"}");
+                    },
+                    .image => |img| {
+                        w.append(&out, allocator, "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"");
+                        w.appendEscaped(&out, allocator, img.media_type);
+                        w.append(&out, allocator, "\",\"data\":\"");
+                        // base64 alphabet is JSON-safe — no escaping needed
+                        w.append(&out, allocator, img.data);
+                        w.append(&out, allocator, "\"}}");
                     },
                     .tool_use => |tu| {
                         w.append(&out, allocator, "{\"type\":\"tool_use\",\"id\":\"");
@@ -201,6 +295,10 @@ pub const MessageResponse = struct {
     pub const Usage = struct {
         input_tokens: u32,
         output_tokens: u32,
+        /// Tokens read from cache (OpenRouter/Anthropic prompt caching)
+        cache_read_tokens: u32 = 0,
+        /// Tokens written to cache on this request
+        cache_creation_tokens: u32 = 0,
     };
 
     pub fn hasToolUse(self: *const MessageResponse) bool {

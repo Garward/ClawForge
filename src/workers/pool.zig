@@ -37,6 +37,7 @@ pub const WorkerPool = struct {
         session_id: ?[]const u8,
         model_override: ?[]const u8,
         allowed_tools: ?[]const u8,
+        is_subagent: bool,
         confirm_ctx: ?*anyopaque,
         confirm_fn: ?*const fn (ctx: *anyopaque, tool_name: []const u8, tool_id: []const u8, input_preview: []const u8) bool,
     ) BackgroundChatOutput = null,
@@ -44,6 +45,12 @@ pub const WorkerPool = struct {
 
     // Background job result store
     result_store: ResultStore = .{},
+
+    // Per-job tool event log for live transparency
+    tool_event_log: ToolEventLog = .{},
+    // The job_id currently being processed by the background chat thread.
+    // Safe because there is exactly one background chat worker thread.
+    active_job_id: ?[36]u8 = null,
 
     // Tool confirmation gate (one at a time — single background thread)
     confirmation_mutex: std.Thread.Mutex = .{},
@@ -235,6 +242,7 @@ pub const WorkerPool = struct {
             session_id: ?[]const u8,
             model_override: ?[]const u8,
             allowed_tools: ?[]const u8,
+            is_subagent: bool,
             confirm_ctx: ?*anyopaque,
             confirm_fn: ?*const fn (ctx: *anyopaque, tool_name: []const u8, tool_id: []const u8, input_preview: []const u8) bool,
         ) BackgroundChatOutput,
@@ -283,6 +291,19 @@ pub const WorkerPool = struct {
             }
         }
         return false;
+    }
+
+    /// Push a tool event for the currently-active background job.
+    /// No-op if no job is active (i.e. not running on the bg chat thread).
+    pub fn pushToolEvent(self: *WorkerPool, event: ToolEvent) void {
+        if (self.active_job_id) |*jid| {
+            self.tool_event_log.push(jid, event);
+        }
+    }
+
+    /// Get tool events for a job starting from cursor (for polling).
+    pub fn getToolEvents(self: *WorkerPool, job_id: *const [36]u8, cursor: usize) ToolEventLog.EventSlice {
+        return self.tool_event_log.getEvents(job_id, cursor);
     }
 
     /// Check if there's a pending confirmation for a given job.
@@ -427,6 +448,10 @@ pub const WorkerPool = struct {
 
                 std.log.info("Background chat: processing job {s}", .{job.job_id[0..8]});
 
+                // Track active job for tool event logging
+                self.tool_event_log.startJob(&job.job_id);
+                self.active_job_id = job.job_id;
+
                 var confirm_ctx = BgConfirmCtx{ .pool = self, .job_id = &job.job_id };
                 const output = process_fn(
                     process_ctx,
@@ -434,9 +459,14 @@ pub const WorkerPool = struct {
                     &job.session_id,
                     job.model_override,
                     job.allowed_tools,
+                    job.is_subagent,
                     @ptrCast(&confirm_ctx),
                     &bgConfirmCallback,
                 );
+
+                // Clear active job tracking
+                self.active_job_id = null;
+                self.tool_event_log.endJob(&job.job_id);
 
                 if (output.ok) {
                     self.result_store.put(.{
@@ -540,6 +570,10 @@ pub const BackgroundChatJob = struct {
     model_override: ?[]const u8,
     callback_channel: ?[]const u8,
     allowed_tools: ?[]const u8,
+    /// True when this job was spawned by the summon_subagent tool. The
+    /// engine uses this to skip session history and apply a hard
+    /// subagent-execution adapter context.
+    is_subagent: bool = false,
     cancelled: std.atomic.Value(bool),
 };
 
@@ -560,6 +594,94 @@ pub const PendingConfirmation = struct {
     tool_id: []const u8,
     input_preview: []const u8,
     approved: ?bool,
+};
+
+/// A single tool event captured during subagent execution.
+pub const ToolEvent = struct {
+    event_type: enum { tool_use, tool_result },
+    tool_name: []const u8,
+    /// For tool_use: the input JSON. For tool_result: the output text.
+    content: []const u8,
+    is_error: bool = false,
+    timestamp: i64,
+};
+
+/// Per-job ring buffer of tool events for live transparency.
+/// Pollers provide a cursor (number of events already seen) and get back only new ones.
+pub const ToolEventLog = struct {
+    const MAX_EVENTS = 128;
+    const MAX_JOBS = 16;
+
+    pub const EventSlice = struct {
+        events: []const ?ToolEvent,
+        new_cursor: usize,
+    };
+
+    /// Each slot is a job's event buffer.
+    entries: [MAX_JOBS]JobEvents = [_]JobEvents{.{}} ** MAX_JOBS,
+    mutex: std.Thread.Mutex = .{},
+
+    const JobEvents = struct {
+        job_id: [36]u8 = undefined,
+        active: bool = false,
+        events: [MAX_EVENTS]?ToolEvent = [_]?ToolEvent{null} ** MAX_EVENTS,
+        count: usize = 0,
+    };
+
+    pub fn startJob(self: *ToolEventLog, job_id: *const [36]u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        // Find empty or evict oldest
+        for (&self.entries) |*slot| {
+            if (!slot.active) {
+                slot.* = .{ .job_id = job_id.*, .active = true };
+                return;
+            }
+        }
+        // All full — evict first inactive, or first slot
+        self.entries[0] = .{ .job_id = job_id.*, .active = true };
+    }
+
+    pub fn endJob(self: *ToolEventLog, job_id: *const [36]u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (&self.entries) |*slot| {
+            if (slot.active and std.mem.eql(u8, &slot.job_id, job_id)) {
+                slot.active = false;
+                return;
+            }
+        }
+    }
+
+    pub fn push(self: *ToolEventLog, job_id: *const [36]u8, event: ToolEvent) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (&self.entries) |*slot| {
+            if (slot.active and std.mem.eql(u8, &slot.job_id, job_id)) {
+                if (slot.count < MAX_EVENTS) {
+                    slot.events[slot.count] = event;
+                    slot.count += 1;
+                }
+                return;
+            }
+        }
+    }
+
+    /// Get events for a job starting from cursor. Returns slice of events and new cursor.
+    pub fn getEvents(self: *ToolEventLog, job_id: *const [36]u8, cursor: usize) EventSlice {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (&self.entries) |*slot| {
+            if (std.mem.eql(u8, &slot.job_id, job_id)) {
+                const start = @min(cursor, slot.count);
+                return .{
+                    .events = slot.events[start..slot.count],
+                    .new_cursor = slot.count,
+                };
+            }
+        }
+        return .{ .events = &.{}, .new_cursor = cursor };
+    }
 };
 
 pub const ResultStore = struct {

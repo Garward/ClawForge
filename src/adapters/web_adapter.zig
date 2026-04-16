@@ -10,6 +10,10 @@ pub const WebAdapter = struct {
     allocator: std.mem.Allocator,
     config: *const common.Config,
     engine: *core.Engine,
+    /// Optional background-chat engine. When present, runtime config changes
+    /// (e.g., /api/vision POST) are applied to both engines so subagents
+    /// inherit the user's runtime choices.
+    bg_engine: ?*core.Engine = null,
     server: ?std.net.Server,
     running: bool,
 
@@ -22,9 +26,16 @@ pub const WebAdapter = struct {
             .allocator = allocator,
             .config = config,
             .engine = engine_ptr,
+            .bg_engine = null,
             .server = null,
             .running = false,
         };
+    }
+
+    /// Attach a background-chat engine so /api/vision and other runtime
+    /// config endpoints update both engines at once.
+    pub fn setBgEngine(self: *WebAdapter, bg: *core.Engine) void {
+        self.bg_engine = bg;
     }
 
     pub fn adapter(self: *WebAdapter) adapter_mod.Adapter {
@@ -85,11 +96,12 @@ pub const WebAdapter = struct {
     fn handleConnection(self: *WebAdapter, conn: std.net.Server.Connection) !void {
         defer conn.stream.close();
 
-        var buf: [8192]u8 = undefined;
-        const n = conn.stream.read(&buf) catch return;
+        // Read headers (first chunk — headers always fit in 8KB)
+        var hdr_buf: [8192]u8 = undefined;
+        const n = conn.stream.read(&hdr_buf) catch return;
         if (n == 0) return;
 
-        const request = buf[0..n];
+        const request = hdr_buf[0..n];
         const first_line_end = std.mem.indexOf(u8, request, "\r\n") orelse return;
         const first_line = request[0..first_line_end];
 
@@ -97,43 +109,106 @@ pub const WebAdapter = struct {
         const method = parts.next() orelse return;
         const path = parts.next() orelse return;
 
-        const body_start = std.mem.indexOf(u8, request, "\r\n\r\n");
-        const body = if (body_start) |s| request[s + 4 ..] else "";
+        const hdr_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body_offset = hdr_end + 4;
+        const initial_body = request[body_offset..];
 
+        // Parse Content-Length from headers (case-insensitive)
+        const content_length = parseContentLength(request[0..hdr_end]);
+
+        // If the entire body arrived in the first read, use the stack buffer directly
+        if (content_length <= initial_body.len) {
+            const body = initial_body[0..@min(content_length, initial_body.len)];
+            return self.dispatchRequest(conn.stream, method, path, body);
+        }
+
+        // Large body — allocate heap buffer, read remaining bytes
+        const max_body: usize = 20 * 1024 * 1024; // 20 MB hard cap
+        if (content_length > max_body) {
+            try self.sendHttp(conn.stream, "413 Payload Too Large", "text/plain", "Body too large");
+            return;
+        }
+        const full_body = self.allocator.alloc(u8, content_length) catch {
+            try self.sendHttp(conn.stream, "500 Internal Server Error", "text/plain", "Out of memory");
+            return;
+        };
+        defer self.allocator.free(full_body);
+
+        @memcpy(full_body[0..initial_body.len], initial_body);
+        var received: usize = initial_body.len;
+        while (received < content_length) {
+            const chunk = conn.stream.read(full_body[received..]) catch break;
+            if (chunk == 0) break;
+            received += chunk;
+        }
+
+        return self.dispatchRequest(conn.stream, method, path, full_body[0..received]);
+    }
+
+    fn parseContentLength(headers: []const u8) usize {
+        var line_it = std.mem.splitSequence(u8, headers, "\r\n");
+        while (line_it.next()) |line| {
+            // Quick check: line must start with C/c and be long enough
+            if (line.len < 16) continue;
+            if (line[0] != 'C' and line[0] != 'c') continue;
+            // Case-insensitive comparison of first 15/16 chars
+            const prefix_with_space = "content-length: ";
+            const prefix_no_space = "content-length:";
+            var lower: [16]u8 = undefined;
+            for (line[0..16], 0..) |ch, i| {
+                lower[i] = if (ch >= 'A' and ch <= 'Z') ch + 32 else ch;
+            }
+            if (std.mem.startsWith(u8, &lower, prefix_with_space)) {
+                return std.fmt.parseInt(usize, std.mem.trim(u8, line[16..], " \t"), 10) catch 0;
+            }
+            if (std.mem.startsWith(u8, &lower, prefix_no_space)) {
+                return std.fmt.parseInt(usize, std.mem.trim(u8, line[15..], " \t"), 10) catch 0;
+            }
+        }
+        return 0;
+    }
+
+    fn dispatchRequest(self: *WebAdapter, stream: std.net.Stream, method: []const u8, path: []const u8, body: []const u8) !void {
         if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) {
-            try self.serveIndex(conn.stream);
+            try self.serveIndex(stream);
         } else if (std.mem.eql(u8, path, "/api/chat/stream")) {
-            try self.handleApiChatStream(conn.stream, method, body);
+            try self.handleApiChatStream(stream, method, body);
         } else if (std.mem.eql(u8, path, "/api/chat/background")) {
-            try self.handleApiChatBackground(conn.stream, method, body);
+            try self.handleApiChatBackground(stream, method, body);
         } else if (std.mem.startsWith(u8, path, "/api/background")) {
-            try self.handleApiBackground(conn.stream, method, path, body);
+            try self.handleApiBackground(stream, method, path, body);
         } else if (std.mem.startsWith(u8, path, "/api/chat")) {
-            try self.handleApiChat(conn.stream, method, body);
+            try self.handleApiChat(stream, method, body);
         } else if (std.mem.startsWith(u8, path, "/api/messages")) {
-            try self.handleApiMessages(conn.stream, path);
+            try self.handleApiMessages(stream, path);
         } else if (std.mem.startsWith(u8, path, "/api/sessions")) {
-            try self.handleApiSessions(conn.stream, method, path, body);
+            try self.handleApiSessions(stream, method, path, body);
         } else if (std.mem.startsWith(u8, path, "/api/skills")) {
-            try self.handleApiSkills(conn.stream, method, body);
+            try self.handleApiSkills(stream, method, body);
         } else if (std.mem.eql(u8, path, "/api/status")) {
-            try self.handleApiStatus(conn.stream);
+            try self.handleApiStatus(stream);
         } else if (std.mem.eql(u8, path, "/api/projects")) {
-            try self.handleApiProjects(conn.stream);
+            try self.handleApiProjects(stream);
         } else if (std.mem.startsWith(u8, path, "/api/tools/register")) {
-            try self.handleApiToolRegister(conn.stream, body);
+            try self.handleApiToolRegister(stream, body);
         } else if (std.mem.eql(u8, path, "/api/tools/autoapprove")) {
-            try self.handleApiToolAutoApprove(conn.stream, method, body);
+            try self.handleApiToolAutoApprove(stream, method, body);
         } else if (std.mem.eql(u8, path, "/api/tools")) {
             if (std.mem.eql(u8, method, "POST")) {
-                try self.handleApiToolToggle(conn.stream, body);
+                try self.handleApiToolToggle(stream, body);
             } else {
-                try self.handleApiTools(conn.stream);
+                try self.handleApiTools(stream);
             }
         } else if (std.mem.startsWith(u8, path, "/api/persona")) {
-            try self.handleApiPersona(conn.stream, method, path, body);
+            try self.handleApiPersona(stream, method, path, body);
+        } else if (std.mem.eql(u8, path, "/api/vision")) {
+            try self.handleApiVision(stream, method, body);
+        } else if (std.mem.eql(u8, path, "/api/models")) {
+            try self.handleApiModels(stream);
+        } else if (std.mem.eql(u8, path, "/api/upload")) {
+            try self.handleApiUpload(stream, method, body);
         } else {
-            try self.serve404(conn.stream);
+            try self.serve404(stream);
         }
     }
 
@@ -177,6 +252,8 @@ pub const WebAdapter = struct {
         const model_override = if (parsed.value.object.get("model_override")) |v| (if (v == .string) v.string else null) else null;
         const allowed_tools = if (parsed.value.object.get("allowed_tools")) |v| (if (v == .string) v.string else null) else null;
         const adapter_context = if (parsed.value.object.get("adapter_context")) |v| (if (v == .string) v.string else null) else null;
+        const attachments = parseAttachments(self.allocator, parsed.value);
+        defer if (attachments) |a| self.allocator.free(a);
 
         const result = self.engine.process(.{ .chat = .{
             .message = message,
@@ -185,6 +262,7 @@ pub const WebAdapter = struct {
             .no_tools = no_tools,
             .allowed_tools = allowed_tools,
             .adapter_context = adapter_context,
+            .attachments = attachments,
         } }, null, null);
 
         switch (result) {
@@ -219,6 +297,12 @@ pub const WebAdapter = struct {
                 json_out.appendSlice(self.allocator, ",\"context_tokens\":") catch {};
                 const ctx_str = std.fmt.bufPrint(&num_buf, "{d}", .{chat.context_tokens}) catch "0";
                 json_out.appendSlice(self.allocator, ctx_str) catch {};
+                if (chat.cache_read_tokens > 0 or chat.cache_creation_tokens > 0) {
+                    json_out.appendSlice(self.allocator, ",\"cache_read_tokens\":") catch {};
+                    json_out.appendSlice(self.allocator, std.fmt.bufPrint(&num_buf, "{d}", .{chat.cache_read_tokens}) catch "0") catch {};
+                    json_out.appendSlice(self.allocator, ",\"cache_creation_tokens\":") catch {};
+                    json_out.appendSlice(self.allocator, std.fmt.bufPrint(&num_buf, "{d}", .{chat.cache_creation_tokens}) catch "0") catch {};
+                }
                 json_out.appendSlice(self.allocator, "}") catch {};
 
                 // Surface spawned subagent job IDs so adapters can poll them.
@@ -277,6 +361,8 @@ pub const WebAdapter = struct {
         const model_override = if (parsed.value.object.get("model_override")) |v| (if (v == .string) v.string else null) else null;
         const callback_channel = if (parsed.value.object.get("callback_channel")) |v| (if (v == .string) v.string else null) else null;
         const allowed_tools = if (parsed.value.object.get("allowed_tools")) |v| (if (v == .string) v.string else null) else null;
+        const attachments = parseAttachments(self.allocator, parsed.value);
+        defer if (attachments) |a| self.allocator.free(a);
 
         const result = self.engine.process(.{ .chat = .{
             .message = message.?,
@@ -285,6 +371,7 @@ pub const WebAdapter = struct {
             .callback_channel = callback_channel,
             .allowed_tools = allowed_tools,
             .background = true,
+            .attachments = attachments,
         } }, null, null);
 
         switch (result) {
@@ -434,7 +521,61 @@ pub const WebAdapter = struct {
                 out.appendSlice(self.allocator, "\"}}") catch {};
                 try self.sendHttp(stream, "200 OK", "application/json", out.items);
             } else {
-                try self.sendHttp(stream, "200 OK", "application/json", "{\"status\":\"pending\"}");
+                // No confirmation pending — return tool events if any
+                const cursor = blk: {
+                    if (parsed.value.object.get("cursor")) |cv| {
+                        if (cv == .integer) break :blk @as(usize, @intCast(@max(0, cv.integer)));
+                    }
+                    break :blk @as(usize, 0);
+                };
+                const te = wp.getToolEvents(&job_id, cursor);
+                if (te.events.len > 0 or te.new_cursor > 0) {
+                    var out2: std.ArrayList(u8) = .{};
+                    defer out2.deinit(self.allocator);
+                    out2.appendSlice(self.allocator, "{\"status\":\"pending\",\"tool_events\":[") catch {};
+                    var first = true;
+                    for (te.events) |maybe_evt| {
+                        const evt = maybe_evt orelse continue;
+                        if (!first) out2.appendSlice(self.allocator, ",") catch {};
+                        first = false;
+                        out2.appendSlice(self.allocator, "{\"type\":\"") catch {};
+                        out2.appendSlice(self.allocator, if (evt.event_type == .tool_use) "tool_use" else "tool_result") catch {};
+                        out2.appendSlice(self.allocator, "\",\"tool\":\"") catch {};
+                        out2.appendSlice(self.allocator, evt.tool_name) catch {};
+                        out2.appendSlice(self.allocator, "\",\"content\":\"") catch {};
+                        for (evt.content) |ch| {
+                            switch (ch) {
+                                '"' => out2.appendSlice(self.allocator, "\\\"") catch {},
+                                '\\' => out2.appendSlice(self.allocator, "\\\\") catch {},
+                                '\n' => out2.appendSlice(self.allocator, "\\n") catch {},
+                                '\r' => out2.appendSlice(self.allocator, "\\r") catch {},
+                                '\t' => out2.appendSlice(self.allocator, "\\t") catch {},
+                                else => {
+                                    if (ch < 0x20) {
+                                        out2.appendSlice(self.allocator, "\\u00") catch {};
+                                        const hex = "0123456789abcdef";
+                                        out2.append(self.allocator, hex[ch >> 4]) catch {};
+                                        out2.append(self.allocator, hex[ch & 0xf]) catch {};
+                                    } else {
+                                        out2.append(self.allocator, ch) catch {};
+                                    }
+                                },
+                            }
+                        }
+                        out2.appendSlice(self.allocator, "\"") catch {};
+                        if (evt.is_error) {
+                            out2.appendSlice(self.allocator, ",\"is_error\":true") catch {};
+                        }
+                        out2.appendSlice(self.allocator, "}") catch {};
+                    }
+                    var num_buf2: [32]u8 = undefined;
+                    out2.appendSlice(self.allocator, "],\"cursor\":") catch {};
+                    out2.appendSlice(self.allocator, std.fmt.bufPrint(&num_buf2, "{d}", .{te.new_cursor}) catch "0") catch {};
+                    out2.appendSlice(self.allocator, "}") catch {};
+                    try self.sendHttp(stream, "200 OK", "application/json", out2.items);
+                } else {
+                    try self.sendHttp(stream, "200 OK", "application/json", "{\"status\":\"pending\"}");
+                }
             }
         }
     }
@@ -546,6 +687,19 @@ pub const WebAdapter = struct {
             return;
         };
 
+        // Mirror the non-streaming handler's field set so the streaming
+        // endpoint honors model_override / allowed_tools / attachments etc.
+        // The old body only pulled `message` + `session_id`, which meant
+        // web UI model swaps silently fell back to the daemon default on
+        // every streaming turn.
+        const no_tools = if (parsed.value.object.get("no_tools")) |v| (v == .bool and v.bool) else false;
+        const session_id = if (parsed.value.object.get("session_id")) |v| (if (v == .string) v.string else null) else null;
+        const model_override = if (parsed.value.object.get("model_override")) |v| (if (v == .string) v.string else null) else null;
+        const allowed_tools = if (parsed.value.object.get("allowed_tools")) |v| (if (v == .string) v.string else null) else null;
+        const adapter_context = if (parsed.value.object.get("adapter_context")) |v| (if (v == .string) v.string else null) else null;
+        const attachments = parseAttachments(self.allocator, parsed.value);
+        defer if (attachments) |a| self.allocator.free(a);
+
         // Disable Nagle buffering — SSE events must flush immediately
         const fd: std.posix.fd_t = stream.handle;
         std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.os.linux.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
@@ -562,12 +716,16 @@ pub const WebAdapter = struct {
             .isCancelledFn = &sseIsCancelled,
         };
 
-        // Hold the compaction gate open for the entire SSE session so background
-        // summarization cannot mutate the message store while we are still streaming.
-        const session_id = if (parsed.value.object.get("session_id")) |v| (if (v == .string) v.string else null) else null;
-
         self.engine.beginStreaming();
-        const result = self.engine.process(.{ .chat = .{ .message = message, .session_id = session_id } }, emitter, null);
+        const result = self.engine.process(.{ .chat = .{
+            .message = message,
+            .session_id = session_id,
+            .model_override = model_override,
+            .no_tools = no_tools,
+            .allowed_tools = allowed_tools,
+            .adapter_context = adapter_context,
+            .attachments = attachments,
+        } }, emitter, null);
 
         // After streaming completes, send done event with final metadata
         switch (result) {
@@ -587,6 +745,29 @@ pub const WebAdapter = struct {
                 end_buf.appendSlice(self.allocator, ",\"context_tokens\":") catch {};
                 const ctx_s = std.fmt.bufPrint(&num_buf, "{d}", .{chat.context_tokens}) catch "0";
                 end_buf.appendSlice(self.allocator, ctx_s) catch {};
+                if (chat.cache_read_tokens > 0 or chat.cache_creation_tokens > 0) {
+                    end_buf.appendSlice(self.allocator, ",\"cache_read_tokens\":") catch {};
+                    end_buf.appendSlice(self.allocator, std.fmt.bufPrint(&num_buf, "{d}", .{chat.cache_read_tokens}) catch "0") catch {};
+                    end_buf.appendSlice(self.allocator, ",\"cache_creation_tokens\":") catch {};
+                    end_buf.appendSlice(self.allocator, std.fmt.bufPrint(&num_buf, "{d}", .{chat.cache_creation_tokens}) catch "0") catch {};
+                }
+
+                // Include spawned subagent job IDs so the web UI can poll them
+                if (chat.spawned_jobs) |jobs_csv| {
+                    end_buf.appendSlice(self.allocator, ",\"spawned_jobs\":[") catch {};
+                    var first_job = true;
+                    var job_iter = std.mem.splitScalar(u8, jobs_csv, ',');
+                    while (job_iter.next()) |jid| {
+                        if (jid.len == 0) continue;
+                        if (!first_job) end_buf.append(self.allocator, ',') catch {};
+                        first_job = false;
+                        end_buf.append(self.allocator, '"') catch {};
+                        end_buf.appendSlice(self.allocator, jid) catch {};
+                        end_buf.append(self.allocator, '"') catch {};
+                    }
+                    end_buf.append(self.allocator, ']') catch {};
+                }
+
                 end_buf.appendSlice(self.allocator, "}\n\n") catch {};
                 _ = stream.write(end_buf.items) catch {};
             },
@@ -619,6 +800,8 @@ pub const WebAdapter = struct {
                 return self.handleSessionAction(stream, body, "delete");
             } else if (std.mem.endsWith(u8, path, "/switch")) {
                 return self.handleSessionAction(stream, body, "switch");
+            } else if (std.mem.endsWith(u8, path, "/model")) {
+                return self.handleSessionAction(stream, body, "model");
             }
         }
 
@@ -704,6 +887,36 @@ pub const WebAdapter = struct {
             self.engine.session_store.deleteSession(id) catch {};
         } else if (std.mem.eql(u8, action, "switch")) {
             self.engine.session_store.switchSession(id) catch {};
+            // Return session model + persona so the UI can restore them
+            const sess = self.engine.session_store.getSession(id) catch {
+                try self.sendHttp(stream, "200 OK", "application/json", "{\"ok\":true}");
+                return;
+            };
+            defer {
+                if (sess.name) |n| self.allocator.free(n);
+                self.allocator.free(sess.model);
+                if (sess.system_prompt) |s| self.allocator.free(s);
+            }
+            var out: std.ArrayList(u8) = .{};
+            defer out.deinit(self.allocator);
+            out.appendSlice(self.allocator, "{\"ok\":true,\"model\":\"") catch {};
+            out.appendSlice(self.allocator, sess.model) catch {};
+            out.appendSlice(self.allocator, "\",\"persona\":") catch {};
+            if (sess.system_prompt) |sp| {
+                out.append(self.allocator, '"') catch {};
+                out.appendSlice(self.allocator, sp) catch {};
+                out.append(self.allocator, '"') catch {};
+            } else {
+                out.appendSlice(self.allocator, "null") catch {};
+            }
+            out.append(self.allocator, '}') catch {};
+            try self.sendHttp(stream, "200 OK", "application/json", out.items);
+            return;
+        } else if (std.mem.eql(u8, action, "model")) {
+            const raw_model = if (parsed.value.object.get("model")) |v| (if (v == .string) v.string else null) else null;
+            // Empty string means "reset to daemon default"
+            const model = if (raw_model) |m| (if (m.len == 0) self.engine.session_store.default_model else m) else self.engine.session_store.default_model;
+            self.engine.session_store.updateModel(id, model) catch {};
         }
 
         try self.sendHttp(stream, "200 OK", "application/json", "{\"ok\":true}");
@@ -819,6 +1032,452 @@ pub const WebAdapter = struct {
         } else {
             try self.sendHttp(stream, "200 OK", "application/json", "[]");
         }
+    }
+
+    /// POST /api/upload — accept base64-encoded file, save to disk, return {path, mime, name}
+    fn handleApiUpload(self: *WebAdapter, stream: std.net.Stream, method: []const u8, body: []const u8) !void {
+        if (!std.mem.eql(u8, method, "POST")) {
+            try self.sendHttp(stream, "405 Method Not Allowed", "text/plain", "Method Not Allowed");
+            return;
+        }
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{
+            .allocate = .alloc_always,
+        }) catch {
+            try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Invalid JSON\"}");
+            return;
+        };
+        defer parsed.deinit();
+
+        const obj = if (parsed.value == .object) parsed.value.object else {
+            try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Expected object\"}");
+            return;
+        };
+
+        const data_str = if (obj.get("data")) |v| (if (v == .string) v.string else null) else null;
+        const mime_str = if (obj.get("mime")) |v| (if (v == .string) v.string else null) else null;
+        const name_str = if (obj.get("name")) |v| (if (v == .string) v.string else null) else null;
+
+        if (data_str == null or mime_str == null or name_str == null) {
+            try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Need data, mime, name\"}");
+            return;
+        }
+
+        // Validate MIME type
+        const allowed_mimes = [_][]const u8{ "image/png", "image/jpeg", "image/gif", "image/webp" };
+        var mime_ok = false;
+        for (&allowed_mimes) |m| {
+            if (std.mem.eql(u8, mime_str.?, m)) { mime_ok = true; break; }
+        }
+        if (!mime_ok) {
+            try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Unsupported image type\"}");
+            return;
+        }
+
+        // Decode base64
+        const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data_str.?) catch {
+            try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Invalid base64\"}");
+            return;
+        };
+        const buf = self.allocator.alloc(u8, decoded_len) catch {
+            try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Out of memory\"}");
+            return;
+        };
+        defer self.allocator.free(buf);
+        std.base64.standard.Decoder.decode(buf, data_str.?) catch {
+            try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Invalid base64\"}");
+            return;
+        };
+
+        // Ensure upload directory exists
+        const upload_dir = "/tmp/clawforge_attachments";
+        std.fs.makeDirAbsolute(upload_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => {
+                try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Cannot create upload dir\"}");
+                return;
+            },
+        };
+
+        // Generate unique filename
+        const ts = std.time.timestamp();
+        const ext = if (std.mem.eql(u8, mime_str.?, "image/png")) ".png"
+            else if (std.mem.eql(u8, mime_str.?, "image/jpeg")) ".jpg"
+            else if (std.mem.eql(u8, mime_str.?, "image/gif")) ".gif"
+            else if (std.mem.eql(u8, mime_str.?, "image/webp")) ".webp"
+            else ".bin";
+
+        // Strip existing extension from name to avoid double-extension
+        const name_raw = name_str.?;
+        const dot_pos = std.mem.lastIndexOfScalar(u8, name_raw, '.') orelse name_raw.len;
+        const name_stem = name_raw[0..dot_pos];
+
+        var path_buf: [256]u8 = undefined;
+        const file_path = std.fmt.bufPrint(&path_buf, "{s}/{d}_{s}{s}", .{
+            upload_dir, ts, name_stem, ext,
+        }) catch {
+            try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Path too long\"}");
+            return;
+        };
+
+        // Write file
+        const file = std.fs.createFileAbsolute(file_path, .{}) catch {
+            try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Cannot write file\"}");
+            return;
+        };
+        defer file.close();
+        file.writeAll(buf[0..decoded_len]) catch {
+            try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Write failed\"}");
+            return;
+        };
+
+        // Return JSON with path, mime, name
+        var out: std.ArrayList(u8) = .{};
+        defer out.deinit(self.allocator);
+        out.appendSlice(self.allocator, "{\"path\":\"") catch {};
+        out.appendSlice(self.allocator, file_path) catch {};
+        out.appendSlice(self.allocator, "\",\"mime\":\"") catch {};
+        out.appendSlice(self.allocator, mime_str.?) catch {};
+        out.appendSlice(self.allocator, "\",\"name\":\"") catch {};
+        // JSON-escape name
+        for (name_str.?) |ch| {
+            switch (ch) {
+                '"' => out.appendSlice(self.allocator, "\\\"") catch {},
+                '\\' => out.appendSlice(self.allocator, "\\\\") catch {},
+                else => out.append(self.allocator, ch) catch {},
+            }
+        }
+        out.appendSlice(self.allocator, "\"}") catch {};
+        try self.sendHttp(stream, "200 OK", "application/json", out.items);
+    }
+
+    /// Parse the `attachments` array from a chat JSON body into a slice of
+    /// `common.Request.Attachment` structs. Returns null if the field is
+    /// missing or empty. All returned slices point into `parsed_root`'s arena
+    /// so the caller must keep the parse alive for the duration of the request.
+    fn parseAttachments(
+        allocator: std.mem.Allocator,
+        parsed_root: std.json.Value,
+    ) ?[]const common.Request.Attachment {
+        const field = parsed_root.object.get("attachments") orelse return null;
+        if (field != .array) return null;
+        const items = field.array.items;
+        if (items.len == 0) return null;
+
+        var list: std.ArrayList(common.Request.Attachment) = .{};
+        list.ensureTotalCapacity(allocator, items.len) catch return null;
+        for (items) |item| {
+            if (item != .object) continue;
+            const path_v = item.object.get("path") orelse continue;
+            if (path_v != .string) continue;
+            const mime_v = item.object.get("mime") orelse continue;
+            if (mime_v != .string) continue;
+            const name_v = item.object.get("name") orelse path_v;
+            const name_str = if (name_v == .string) name_v.string else path_v.string;
+            list.append(allocator, .{
+                .path = path_v.string,
+                .mime = mime_v.string,
+                .name = name_str,
+            }) catch return null;
+        }
+        if (list.items.len == 0) return null;
+        return list.toOwnedSlice(allocator) catch null;
+    }
+
+    /// GET /api/vision  → returns current effective model + config
+    /// POST /api/vision → { "model": "claude-opus-4-6" } sets runtime override
+    /// POST /api/vision → { "model": null } clears the override
+    fn handleApiVision(self: *WebAdapter, stream: std.net.Stream, method: []const u8, body: []const u8) !void {
+        if (std.mem.eql(u8, method, "GET")) {
+            const vp = self.engine.vision_pipeline orelse {
+                try self.sendHttp(stream, "503 Service Unavailable", "application/json",
+                    "{\"error\":\"Vision pipeline not wired\"}");
+                return;
+            };
+            const effective = vp.effectiveModel();
+            var out_buf: [512]u8 = undefined;
+            const json_resp = std.fmt.bufPrint(&out_buf,
+                "{{\"enabled\":{s},\"model\":\"{s}\",\"default_model\":\"{s}\",\"max_image_bytes\":{d},\"max_images_per_turn\":{d}}}",
+                .{
+                    if (self.config.vision.enabled) "true" else "false",
+                    effective,
+                    self.config.vision.model,
+                    self.config.vision.max_image_bytes,
+                    self.config.vision.max_images_per_turn,
+                },
+            ) catch "{\"error\":\"format error\"}";
+            try self.sendHttp(stream, "200 OK", "application/json", json_resp);
+            return;
+        }
+
+        if (!std.mem.eql(u8, method, "POST")) {
+            try self.sendHttp(stream, "405 Method Not Allowed", "text/plain", "Method Not Allowed");
+            return;
+        }
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{
+            .allocate = .alloc_always,
+        }) catch {
+            try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Invalid JSON\"}");
+            return;
+        };
+        defer parsed.deinit();
+
+        // Resolve requested model: explicit string → override, JSON null → clear.
+        const model_val = parsed.value.object.get("model");
+        const new_model: ?[]const u8 = blk: {
+            if (model_val) |v| {
+                if (v == .string) break :blk v.string;
+                if (v == .null) break :blk null;
+            }
+            break :blk null;
+        };
+
+        const vp = self.engine.vision_pipeline orelse {
+            try self.sendHttp(stream, "503 Service Unavailable", "application/json",
+                "{\"error\":\"Vision pipeline not wired\"}");
+            return;
+        };
+
+        vp.setModelOverride(new_model) catch {
+            try self.sendHttp(stream, "500 Internal Server Error", "application/json",
+                "{\"error\":\"Failed to set vision model\"}");
+            return;
+        };
+        if (self.bg_engine) |bg| {
+            if (bg.vision_pipeline) |bg_vp| {
+                bg_vp.setModelOverride(new_model) catch {};
+            }
+        }
+
+        std.log.info("Vision model override set to: {s}", .{new_model orelse "(cleared)"});
+
+        var ok_buf: [256]u8 = undefined;
+        const ok_resp = std.fmt.bufPrint(&ok_buf,
+            "{{\"ok\":true,\"model\":\"{s}\"}}",
+            .{vp.effectiveModel()},
+        ) catch "{\"ok\":true}";
+        try self.sendHttp(stream, "200 OK", "application/json", ok_resp);
+    }
+
+    /// GET /api/models → enumerate models grouped by provider.
+    /// Shape:
+    ///   { "providers": [
+    ///       { "name": "anthropic", "models": ["anthropic:claude-sonnet-4-6", ...] },
+    ///       { "name": "ollama",    "models": ["ollama:qwen3:8b", ...] },
+    ///       { "name": "openai",    "models": ["openai:gpt-4o", ...] }
+    ///   ] }
+    /// Model strings are pre-prefixed with `provider:` so clients can send
+    /// them back unchanged as a `model_override` and the engine resolver
+    /// will dispatch them correctly. Anthropic + OpenAI lists are static;
+    /// Ollama is queried live via `{base_url}/api/tags`.
+    fn handleApiModels(self: *WebAdapter, stream: std.net.Stream) !void {
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var out: std.ArrayList(u8) = .{};
+        out.ensureTotalCapacity(arena, 4096) catch {};
+
+        out.appendSlice(arena, "{\"providers\":[") catch {};
+
+        // Anthropic — static list. Current generation + stable snapshots.
+        const anthropic_models = [_][]const u8{
+            "anthropic:claude-opus-4-6",
+            "anthropic:claude-sonnet-4-6",
+            "anthropic:claude-haiku-4-5-20251001",
+            "anthropic:claude-opus-4-20250514",
+            "anthropic:claude-sonnet-4-20250514",
+        };
+        out.appendSlice(arena, "{\"name\":\"anthropic\",\"models\":[") catch {};
+        for (anthropic_models, 0..) |m, i| {
+            if (i > 0) out.appendSlice(arena, ",") catch {};
+            out.appendSlice(arena, "\"") catch {};
+            out.appendSlice(arena, m) catch {};
+            out.appendSlice(arena, "\"") catch {};
+        }
+        out.appendSlice(arena, "]}") catch {};
+
+        // Ollama — query `{base_url}/api/tags` for the live local list.
+        // Best-effort: on failure we emit an empty models array instead
+        // of dropping the provider entry, so clients can still show it.
+        if (self.engine.config.ollama.enabled) {
+            out.appendSlice(arena, ",{\"name\":\"ollama\",\"models\":[") catch {};
+            self.appendOllamaTags(&out, arena, self.engine.config.ollama.base_url) catch {};
+            out.appendSlice(arena, "]}") catch {};
+        }
+
+        // OpenAI — static list. Users can type anything else as a free
+        // string via `/model openai:<whatever>` — this list just primes
+        // the UI dropdown.
+        if (self.engine.config.openai.enabled) {
+            const openai_models = [_][]const u8{
+                "openai:gpt-4o",
+                "openai:gpt-4o-mini",
+                "openai:gpt-4.1",
+                "openai:gpt-4.1-mini",
+                "openai:o1",
+                "openai:o1-mini",
+            };
+            out.appendSlice(arena, ",{\"name\":\"openai\",\"models\":[") catch {};
+            for (openai_models, 0..) |m, i| {
+                if (i > 0) out.appendSlice(arena, ",") catch {};
+                out.appendSlice(arena, "\"") catch {};
+                out.appendSlice(arena, m) catch {};
+                out.appendSlice(arena, "\"") catch {};
+            }
+            out.appendSlice(arena, "]}") catch {};
+        }
+
+        // OpenRouter — fetch live model list with pricing from the API.
+        // Falls back to empty on any error so the UI stays functional.
+        if (self.engine.config.openrouter.enabled) {
+            out.appendSlice(arena, ",{\"name\":\"openrouter\",\"models\":[") catch {};
+            self.appendOpenRouterModels(&out, arena) catch {};
+            out.appendSlice(arena, "]}") catch {};
+        }
+
+        out.appendSlice(arena, "]}") catch {};
+
+        try self.sendHttp(stream, "200 OK", "application/json", out.items);
+    }
+
+    /// Helper: fetch `{base_url}/api/tags` from Ollama and append each
+    /// model name (quoted, comma-separated, with `ollama:` prefix) into
+    /// `out`. Silently succeeds with nothing appended on any error so
+    /// the caller's surrounding JSON stays well-formed.
+    fn appendOllamaTags(
+        self: *WebAdapter,
+        out: *std.ArrayList(u8),
+        arena: std.mem.Allocator,
+        base_url: []const u8,
+    ) !void {
+        _ = self;
+        var client = std.http.Client{ .allocator = arena };
+
+        var url_buf: [512]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "{s}/api/tags", .{base_url}) catch return;
+
+        var response_writer = std.Io.Writer.Allocating.init(arena);
+        var redirect_buf: [4096]u8 = undefined;
+
+        const result = client.fetch(.{
+            .location = .{ .url = url },
+            .method = .GET,
+            .redirect_buffer = &redirect_buf,
+            .response_writer = &response_writer.writer,
+        }) catch return;
+
+        if (result.status != .ok) return;
+        const data = response_writer.written();
+
+        const parsed = std.json.parseFromSlice(std.json.Value, arena, data, .{
+            .allocate = .alloc_always,
+        }) catch return;
+
+        if (parsed.value != .object) return;
+        const obj = parsed.value.object;
+        const models = obj.get("models") orelse return;
+        if (models != .array) return;
+
+        var first = true;
+        for (models.array.items) |entry| {
+            if (entry != .object) continue;
+            const name_val = entry.object.get("name") orelse continue;
+            if (name_val != .string) continue;
+            const name = name_val.string;
+            if (name.len == 0) continue;
+            if (!first) out.appendSlice(arena, ",") catch {};
+            first = false;
+            out.appendSlice(arena, "\"ollama:") catch {};
+            out.appendSlice(arena, name) catch {};
+            out.appendSlice(arena, "\"") catch {};
+        }
+    }
+
+    /// Fetch models from OpenRouter's `/api/v1/models` endpoint and append
+    /// them as JSON objects with pricing info. Each entry is:
+    ///   {"id":"openrouter:vendor/model","input_cost":"0.20","output_cost":"0.50"}
+    /// The web UI reads these to show $/M in the dropdown.
+    /// Silently succeeds with nothing appended on error.
+    fn appendOpenRouterModels(
+        self: *WebAdapter,
+        out: *std.ArrayList(u8),
+        arena: std.mem.Allocator,
+    ) !void {
+        const base_url = self.engine.config.openrouter.base_url;
+
+        var url_buf: [512]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "{s}/models", .{base_url}) catch return;
+
+        // Shell out to curl — Zig's HTTP client crashes on large compressed
+        // responses from OpenRouter (~5MB gzipped). curl handles this natively.
+        const result = std.process.Child.run(.{
+            .allocator = arena,
+            .argv = &.{ "curl", "-s", "--max-time", "15", "-H", "Accept: application/json", url },
+            .max_output_bytes = 16 * 1024 * 1024,
+        }) catch |err| {
+            std.log.warn("OpenRouter /models curl failed: {}", .{err});
+            return;
+        };
+        if (result.stderr.len > 0) arena.free(result.stderr);
+        if (result.term.Exited != 0 or result.stdout.len == 0) {
+            std.log.warn("OpenRouter /models: curl exited {d}, {d}b", .{ result.term.Exited, result.stdout.len });
+            return;
+        }
+        const data = result.stdout;
+
+        const parsed = std.json.parseFromSlice(std.json.Value, arena, data, .{
+            .allocate = .alloc_always,
+        }) catch return;
+
+        if (parsed.value != .object) return;
+        const models_arr = parsed.value.object.get("data") orelse return;
+        if (models_arr != .array) return;
+
+        var count: usize = 0;
+        for (models_arr.array.items) |entry| {
+            if (entry != .object) continue;
+            const id_val = entry.object.get("id") orelse continue;
+            if (id_val != .string) continue;
+            const model_id = id_val.string;
+            if (model_id.len == 0) continue;
+
+            // Extract pricing (strings like "0.0000002" = per-token cost)
+            var input_cost: []const u8 = "";
+            var output_cost: []const u8 = "";
+            if (entry.object.get("pricing")) |pricing| {
+                if (pricing == .object) {
+                    if (pricing.object.get("prompt")) |p| {
+                        if (p == .string) input_cost = p.string;
+                    }
+                    if (pricing.object.get("completion")) |c| {
+                        if (c == .string) output_cost = c.string;
+                    }
+                }
+            }
+
+            if (count > 0) out.appendSlice(arena, ",") catch {};
+            count += 1;
+
+            // Emit as JSON object: {"id":"openrouter:vendor/model","input_cost":"...","output_cost":"..."}
+            out.appendSlice(arena, "{\"id\":\"openrouter:") catch {};
+            out.appendSlice(arena, model_id) catch {};
+            out.appendSlice(arena, "\"") catch {};
+            if (input_cost.len > 0) {
+                out.appendSlice(arena, ",\"input_cost\":\"") catch {};
+                out.appendSlice(arena, input_cost) catch {};
+                out.appendSlice(arena, "\"") catch {};
+            }
+            if (output_cost.len > 0) {
+                out.appendSlice(arena, ",\"output_cost\":\"") catch {};
+                out.appendSlice(arena, output_cost) catch {};
+                out.appendSlice(arena, "\"") catch {};
+            }
+            out.appendSlice(arena, "}") catch {};
+        }
+
+        std.log.info("OpenRouter: fetched {d} models with pricing", .{count});
     }
 
     fn handleApiStatus(self: *WebAdapter, stream: std.net.Stream) !void {

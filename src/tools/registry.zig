@@ -13,18 +13,45 @@ const meme_tool = @import("meme_tool.zig");
 const rebuild = @import("rebuild.zig");
 const research_tool = @import("research_tool.zig");
 
+/// plan — special tool. Execution is intercepted by the engine (it needs
+/// session context for plan persistence) so this definition has no handler.
+/// The agent MUST use this tool to create and maintain a plan before and
+/// during any multi-step work. This is not optional.
+pub const plan_def = ToolDefinition{
+    .name = "plan",
+    .description =
+        "Plan tracker for multi-step work. SKIP THIS for simple questions — if you can answer " ++
+        "with file_read, introspect, calc, research, or safe bash (ls, git log, etc.), just do " ++
+        "it directly. REQUIRED before mutating tools (file_write, file_diff, summon_subagent, " ++
+        "or destructive bash commands). " ++
+        "Operations: 'create' (goal + steps — unblocks heavy tools), 'update' (mark steps " ++
+        "done, add notes with findings), 'view' (show plan), 'clear' (remove when done). " ++
+        "Do NOT hallucinate results — only mark done when genuinely complete. " ++
+        "Subagents can view/update the plan too, so steps get marked done in real time.",
+    .input_schema_json =
+        \\{"type":"object","properties":{"operation":{"type":"string","enum":["create","update","view","clear"],"description":"Plan operation to perform."},"goal":{"type":"string","description":"High-level goal for the plan. Required for 'create'."},"steps":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer","description":"Step number (1-based)."},"description":{"type":"string","description":"What this step does."},"status":{"type":"string","enum":["pending","in_progress","done","skipped"],"description":"Step status."},"notes":{"type":"string","description":"Findings, discoveries, or warnings from execution. Subagents SHOULD populate this so subsequent steps inherit context (e.g. 'config is at /etc/foo not /opt/foo', 'API v2 changed the auth header format')."}},"required":["id","description","status"]},"description":"Steps for 'create', or step updates for 'update'. For 'update', only include steps that changed."}},"required":["operation"]}
+    ,
+    .requires_confirmation = false,
+    .handler = null,
+};
+
 /// summon_subagent — special tool. Execution is intercepted by the engine
 /// (it needs worker pool + session context) so this definition has no handler.
 pub const summon_subagent_def = ToolDefinition{
     .name = "summon_subagent",
     .description =
-        "Spawn a background subagent worker to handle a task that requires file edits, " ++
-        "shell commands, builds, multi-step tool calls, or any substantive work. Returns a job ID; " ++
-        "the user will receive the subagent's result automatically when it completes — you do not " ++
-        "wait for it. Use this whenever the user asks for code changes, file modifications, " ++
-        "system work, debugging, or anything that needs real tools. Do NOT use it for casual " ++
-        "conversation, simple questions, or things you can answer directly from context. " ++
-        "The subagent inherits the current session's persona and conversation history.",
+        "Spawn a background subagent for HEAVY work that requires file_write, file_diff, builds, " ++
+        "or destructive shell commands. Do NOT use this for simple questions — if you can answer " ++
+        "with file_read, introspect, calc, research, or safe bash (ls, git log, etc.), just do " ++
+        "it yourself. Subagents are for multi-step tasks that modify files or run complex builds. " ++
+        "Returns a job ID; the user receives the result when it completes. " ++
+        "Give the subagent a clear, specific task description including file paths and constraints. " ++
+        "The subagent can see and update the shared plan, so it will mark its step done. " ++
+        "WRONG: user asks 'what is in main.zig' → spawning a subagent to file_read. " ++
+        "WRONG: user asks 'list the src dir' → spawning a subagent to ls. " ++
+        "RIGHT: user asks 'what is in main.zig' → call file_read yourself and answer. " ++
+        "RIGHT: user asks 'list the src dir' → call bash with 'ls src/' yourself and answer. " ++
+        "RIGHT: user asks 'refactor the config module' → plan + subagent (heavy work).",
     .input_schema_json =
         \\{"type":"object","properties":{"task":{"type":"string","description":"Clear, specific task description for the subagent. Include file paths, the goal, and any constraints."},"model":{"type":"string","description":"Optional Anthropic model id for the subagent (e.g. 'claude-sonnet-4-6', 'claude-opus-4-6'). Defaults to the daemon's worker model."}},"required":["task"]}
     ,
@@ -94,6 +121,7 @@ pub const ToolRegistry = struct {
         try self.register(meme_tool.definition);
         try self.register(rebuild.definition);
         try self.register(research_tool.definition);
+        try self.register(plan_def);
         try self.register(summon_subagent_def);
     }
 
@@ -154,27 +182,69 @@ pub const ToolRegistry = struct {
         return true;
     }
 
+    /// Max tools we ever fit into a single stack buffer. Callers who exceed
+    /// this hit the warning and truncate — realistic tool sets are <20.
+    const MAX_TOOL_DEFS = 64;
+
+    /// Finalize a stack-built tool-def slice into an exact-size heap allocation.
+    /// The caller's allocator.free(slice) must see the same size that was
+    /// allocated, so we return a slice whose backing allocation is exactly
+    /// `items.len` long — never a truncated view of an oversized buffer.
+    fn duplicateToolDefs(
+        self: *ToolRegistry,
+        items: []const api_messages.ToolDefinition,
+    ) ?[]const api_messages.ToolDefinition {
+        if (items.len == 0) return null;
+        const heap = self.allocator.alloc(api_messages.ToolDefinition, items.len) catch return null;
+        @memcpy(heap, items);
+        return heap;
+    }
+
     pub fn getToolDefinitions(self: *ToolRegistry) ?[]const api_messages.ToolDefinition {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.enabled.count() == 0) return null;
-        const count = self.enabled.count();
-        const result = self.allocator.alloc(api_messages.ToolDefinition, count) catch return null;
+
+        var buf: [MAX_TOOL_DEFS]api_messages.ToolDefinition = undefined;
         var idx: usize = 0;
         var it = self.enabled.keyIterator();
         while (it.next()) |name| {
+            if (idx >= buf.len) break;
             if (self.tools.get(name.*)) |tool| {
-                if (idx < count) {
-                    result[idx] = .{
-                        .name = tool.name,
-                        .description = tool.description,
-                        .input_schema_json = tool.input_schema_json,
-                    };
-                    idx += 1;
-                }
+                buf[idx] = .{
+                    .name = tool.name,
+                    .description = tool.description,
+                    .input_schema_json = tool.input_schema_json,
+                };
+                idx += 1;
             }
         }
-        return result[0..idx];
+        return self.duplicateToolDefs(buf[0..idx]);
+    }
+
+    /// Like getToolDefinitions but drops any tool whose name matches `exclude`.
+    /// Used for subagents, which must not see `summon_subagent` (no recursive spawning).
+    pub fn getToolDefinitionsExcluding(self: *ToolRegistry, exclude: []const u8) ?[]const api_messages.ToolDefinition {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.enabled.count() == 0) return null;
+
+        var buf: [MAX_TOOL_DEFS]api_messages.ToolDefinition = undefined;
+        var idx: usize = 0;
+        var it = self.enabled.keyIterator();
+        while (it.next()) |name| {
+            if (idx >= buf.len) break;
+            if (std.mem.eql(u8, name.*, exclude)) continue;
+            if (self.tools.get(name.*)) |tool| {
+                buf[idx] = .{
+                    .name = tool.name,
+                    .description = tool.description,
+                    .input_schema_json = tool.input_schema_json,
+                };
+                idx += 1;
+            }
+        }
+        return self.duplicateToolDefs(buf[0..idx]);
     }
 
     /// Return only the enabled tool definitions named in `names`, preserving the requested order.
@@ -184,14 +254,15 @@ pub const ToolRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const result = self.allocator.alloc(api_messages.ToolDefinition, names.len) catch return null;
+        var buf: [MAX_TOOL_DEFS]api_messages.ToolDefinition = undefined;
         var idx: usize = 0;
 
         for (names) |name| {
+            if (idx >= buf.len) break;
             if (!self.enabled.contains(name)) continue;
             if (self.tools.get(name)) |tool| {
                 var duplicate = false;
-                for (result[0..idx]) |existing| {
+                for (buf[0..idx]) |existing| {
                     if (std.mem.eql(u8, existing.name, tool.name)) {
                         duplicate = true;
                         break;
@@ -199,7 +270,7 @@ pub const ToolRegistry = struct {
                 }
                 if (duplicate) continue;
 
-                result[idx] = .{
+                buf[idx] = .{
                     .name = tool.name,
                     .description = tool.description,
                     .input_schema_json = tool.input_schema_json,
@@ -208,8 +279,7 @@ pub const ToolRegistry = struct {
             }
         }
 
-        if (idx == 0) return null;
-        return result[0..idx];
+        return self.duplicateToolDefs(buf[0..idx]);
     }
 
     /// Execute a script-based tool by passing JSON input as argv[1].

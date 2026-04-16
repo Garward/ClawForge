@@ -20,8 +20,14 @@ pub const PromptLayers = struct {
     /// Tagged: [from project state]
     project: ?ProjectLayer = null,
 
-    /// Layer 3.5: Active skills — matched instruction templates.
-    /// Injected after project context, before retrieved search results.
+    /// Layer 3.5: Active execution plan — persisted per-session.
+    /// Injected after project context so the model always sees its current
+    /// plan state. When null, a mandatory planning instruction is injected
+    /// instead to force plan creation on multi-step work.
+    active_plan: ?[]const u8 = null,
+
+    /// Layer 3.6: Active skills — matched instruction templates.
+    /// Injected after plan, before retrieved search results.
     skills: ?[]const []const u8 = null,
 
     /// Layer 4: Retrieved context from search (summaries, knowledge, artifacts).
@@ -195,7 +201,41 @@ pub fn assemble(allocator: std.mem.Allocator, layers: PromptLayers, max_chars: u
         }
     }
 
-    // Layer 3.5: Skills (matched instruction templates)
+    // Layer 3.5: Active plan (persisted task tracking)
+    if (layers.active_plan) |plan| {
+        write(buf, &pos, "\n\n--- Active Execution Plan (delegate work via summon_subagent — do NOT hallucinate results) ---\n");
+        write(buf, &pos, plan);
+        write(buf, &pos, "\n--- End Plan ---");
+    } else {
+        // No plan exists — inject planning instruction with lightweight exception
+        write(buf, &pos, "\n\n--- Execution Plan: None Active ---\n");
+        write(buf, &pos,
+            \\DEFAULT: Handle it yourself. You have direct access to file_read,
+            \\introspect, calc, research, meme_tool, amazon_search, and safe bash
+            \\commands (ls, tree, pwd, git log/status/diff, head, tail, cat, find).
+            \\Use them for quick lookups, listing files, checking facts. No plan
+            \\needed. Just call the tool and answer the user.
+            \\
+            \\ONLY escalate to plan + subagent when the task genuinely requires
+            \\multiple heavy steps (destructive shell commands, file edits, builds):
+            \\1. Call `plan` with operation "create" (this unblocks heavy tools)
+            \\2. Use summon_subagent for steps that need file_write/file_diff/builds
+            \\3. Subagents update the plan as they complete steps
+            \\
+            \\Examples of what NOT to plan/delegate:
+            \\- "What's in main.zig?" → file_read, answer. Done.
+            \\- "List the src directory" → bash ls src/, answer. Done.
+            \\- "Show recent commits" → bash git log --oneline -10, answer. Done.
+            \\- "How many sessions exist?" → introspect, answer. Done.
+            \\- "Where is the config file?" → introspect project_tree with query, answer. Done.
+            \\
+            \\Heavy tools (mutating bash, file_write, file_diff, summon_subagent)
+            \\are BLOCKED until you create a plan. Read-only tools are available now.
+        );
+        write(buf, &pos, "\n--- End Plan ---");
+    }
+
+    // Layer 3.6: Skills (matched instruction templates)
     if (layers.skills) |skill_instructions| {
         if (skill_instructions.len > 0) {
             write(buf, &pos, "\n\n--- Active Skills ---\n");
