@@ -37,23 +37,38 @@ pub const plan_def = ToolDefinition{
 
 /// summon_subagent — special tool. Execution is intercepted by the engine
 /// (it needs worker pool + session context) so this definition has no handler.
+///
+/// Takes a STRUCTURED BRIEF, not a free-form task. The dispatcher is expected
+/// to do enough recon (file_read, bash grep, introspect) to fill target_files,
+/// known_facts, and acceptance before delegating. Subagents inherit none of
+/// the dispatcher's conversation context, so whatever isn't in the brief is
+/// invisible to them.
 pub const summon_subagent_def = ToolDefinition{
     .name = "summon_subagent",
     .description =
-        "Spawn a background subagent for HEAVY work that requires file_write, file_diff, builds, " ++
-        "or destructive shell commands. Do NOT use this for simple questions — if you can answer " ++
-        "with file_read, introspect, calc, research, or safe bash (ls, git log, etc.), just do " ++
-        "it yourself. Subagents are for multi-step tasks that modify files or run complex builds. " ++
-        "Returns a job ID; the user receives the result when it completes. " ++
-        "Give the subagent a clear, specific task description including file paths and constraints. " ++
-        "The subagent can see and update the shared plan, so it will mark its step done. " ++
-        "WRONG: user asks 'what is in main.zig' → spawning a subagent to file_read. " ++
-        "WRONG: user asks 'list the src dir' → spawning a subagent to ls. " ++
-        "RIGHT: user asks 'what is in main.zig' → call file_read yourself and answer. " ++
-        "RIGHT: user asks 'list the src dir' → call bash with 'ls src/' yourself and answer. " ++
-        "RIGHT: user asks 'refactor the config module' → plan + subagent (heavy work).",
+        "Spawn a background subagent. Two modes:\n" ++
+        "\n" ++
+        "  mode='explore' — READ-ONLY research agent. Investigates a question and returns a " ++
+        "structured 3-layer brief (executive map + structured facts + pinned evidence). Use " ++
+        "this FIRST when you need to understand code you haven't read. Bypasses the plan gate. " ++
+        "Required fields: task (the question). Optional: target_files (hint paths to focus on), " ++
+        "context. The returned brief is designed to drop into a follow-up execute subagent's " ++
+        "known_facts.\n" ++
+        "\n" ++
+        "  mode='execute' (default) — the worker that does real changes (multi-file edits, " ++
+        "builds, destructive shell). Requires a full brief: task + target_files + acceptance. " ++
+        "Do NOT use execute mode for single-file edits or simple reads — handle those yourself " ++
+        "inline with file_read, file_diff, bash, introspect.\n" ++
+        "\n" ++
+        "Common pattern: dispatcher → explore subagent → read its 3-layer brief → execute " ++
+        "subagent with the findings in known_facts + target_files.\n" ++
+        "\n" ++
+        "A subagent gets NONE of your conversation context — it only sees the brief. Empty or " ++
+        "vague briefs are the #1 cause of failure. The subagent can view/update the shared plan. " ++
+        "Returns a job ID; the user (for execute) or you (for explore) receives the result " ++
+        "automatically when it completes.",
     .input_schema_json =
-        \\{"type":"object","properties":{"task":{"type":"string","description":"Clear, specific task description for the subagent. Include file paths, the goal, and any constraints."},"model":{"type":"string","description":"Optional Anthropic model id for the subagent (e.g. 'claude-sonnet-4-6', 'claude-opus-4-6'). Defaults to the daemon's worker model."}},"required":["task"]}
+        \\{"type":"object","properties":{"mode":{"type":"string","enum":["execute","explore"],"description":"'execute' (default) = worker that makes changes. 'explore' = read-only research agent that returns a structured 3-layer brief."},"task":{"type":"string","description":"For execute: one-sentence goal (the end state). For explore: the question to investigate (e.g. 'How does the dispatcher wire summon_subagent results back to Discord?')."},"context":{"type":"string","description":"Why this matters / the user's actual words. The subagent does not see chat history."},"target_files":{"type":"array","items":{"type":"string"},"description":"For execute: files the subagent will read or modify (REQUIRED non-empty for execute unless pure-discovery). For explore: hint paths to focus recon on (optional)."},"known_facts":{"type":"array","items":{"type":"string"},"description":"Findings the subagent should NOT re-derive. Paste relevant lines from a prior explore subagent's brief here. e.g. 'handleSummonSubagent is at engine.zig:1868'."},"acceptance":{"type":"string","description":"For execute (REQUIRED): concrete testable stop condition. e.g. 'zig build succeeds AND new function visible in engine.zig'. Not used by explore."},"constraints":{"type":"array","items":{"type":"string"},"description":"Things the subagent must NOT do. e.g. 'do not modify discord_adapter.zig'."},"out_of_scope":{"type":"array","items":{"type":"string"},"description":"Related work to resist. Stops scope creep."},"model":{"type":"string","description":"Optional model id override. Inherits parent's model by default."}},"required":["task"]}
     ,
     .requires_confirmation = false,
     .handler = null,

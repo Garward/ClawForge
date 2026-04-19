@@ -33,6 +33,7 @@ pub const WorkerPool = struct {
     // Background chat worker context (set via setBackgroundChatContext)
     bg_process_fn: ?*const fn (
         ctx: *anyopaque,
+        job_id: *const [36]u8,
         message: []const u8,
         session_id: ?[]const u8,
         model_override: ?[]const u8,
@@ -238,6 +239,7 @@ pub const WorkerPool = struct {
         ctx: *anyopaque,
         process_fn: *const fn (
             ctx: *anyopaque,
+            job_id: *const [36]u8,
             message: []const u8,
             session_id: ?[]const u8,
             model_override: ?[]const u8,
@@ -455,6 +457,7 @@ pub const WorkerPool = struct {
                 var confirm_ctx = BgConfirmCtx{ .pool = self, .job_id = &job.job_id };
                 const output = process_fn(
                     process_ctx,
+                    &job.job_id,
                     job.message,
                     &job.session_id,
                     job.model_override,

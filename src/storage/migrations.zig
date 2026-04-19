@@ -466,4 +466,19 @@ const migrations = [_]Migration{
         \\ALTER TABLE sessions ADD COLUMN active_plan TEXT;
         ,
     },
+    .{
+        .description = "Explore subagent result cache",
+        .sql =
+        \\CREATE TABLE IF NOT EXISTS explore_cache (
+        \\    cache_key    TEXT PRIMARY KEY,
+        \\    task         TEXT NOT NULL,
+        \\    target_files TEXT NOT NULL,
+        \\    result_json  TEXT NOT NULL,
+        \\    created_at   INTEGER NOT NULL,
+        \\    last_hit_at  INTEGER NOT NULL,
+        \\    hits         INTEGER NOT NULL DEFAULT 0
+        \\);
+        \\CREATE INDEX IF NOT EXISTS idx_explore_cache_created ON explore_cache(created_at);
+        ,
+    },
 };

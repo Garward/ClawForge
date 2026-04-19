@@ -6,9 +6,12 @@ pub const definition = registry.ToolDefinition{
     .name = "file_diff",
     .description = "Edit a file using search-and-replace. The PRIMARY tool for modifying existing files. " ++
         "Provide old_text (exact string to find) and new_text (replacement). " ++
-        "For new files, use file_write instead. Always use file_read first to see current content. " ++
-        "If a replacement fails, reread the exact target region and include more unchanged surrounding context. " ++
-        "Do not guess the current file state from memory.",
+        "REQUIRED: you MUST call file_read on the target path at least once before using file_diff. " ++
+        "The runtime enforces this — an unread path returns a BLOCKED tool error. This prevents " ++
+        "editing files you can't actually see. " ++
+        "For new files, set create_if_missing: true (bypasses the read requirement) or use file_write. " ++
+        "If a replacement fails (old_text not found or non-unique), re-read the target region and " ++
+        "include more unchanged surrounding context. Do not guess file state from memory.",
     .input_schema_json =
     \\{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the file"},"old_text":{"type":"string","description":"Exact text to find in the file (must match uniquely)"},"new_text":{"type":"string","description":"Replacement text"},"create_if_missing":{"type":"boolean","description":"Create the file with new_text if it doesn't exist","default":false}},"required":["path","old_text","new_text"]}
     ,

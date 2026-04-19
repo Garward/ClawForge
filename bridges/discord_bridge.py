@@ -84,15 +84,15 @@ def strip_tool_calls(text: str) -> str:
 
 FAST_MODEL = "claude-haiku-4-5-20251001"
 
-# Tools available to the Discord dispatcher. Lightweight tools (file_read,
-# introspect, calc, research, meme_tool, amazon_search) and safe bash
-# commands (ls, git log, etc.) work without a plan for quick lookups.
-# Heavy tools (summon_subagent, file_write, file_diff) require a plan.
+# Dispatcher toolset — middle path between "answer inline" and "delegate everything".
+# Read-only + single-file edits run inline for snappy UX. summon_subagent is reserved
+# for heavy work (multi-file changes, builds, long investigations).
 DISPATCHER_TOOLS = [
     "plan",
     "summon_subagent",
     "bash",
     "file_read",
+    "file_diff",
     "introspect",
     "calc",
     "research",
@@ -101,29 +101,58 @@ DISPATCHER_TOOLS = [
 ]
 
 DISPATCHER_CONTEXT = (
-    "You are the Discord chat dispatcher for ClawForge. "
-    "Never emit <function_calls>, <invoke>, or any XML tool-call markup as text. "
-    "\n\nYou have two modes:"
-    "\n\nQUICK MODE — handle it yourself:"
-    "\n- Casual chat, simple explanations → reply directly, no tools."
-    "\n- 'What is in file X?' / 'Show me X' → call file_read yourself and answer."
-    "\n- 'List files in X' / 'What's in this dir?' → call bash with ls yourself."
-    "\n- 'How many sessions?' / 'What persona am I using?' → call introspect yourself."
-    "\n- 'Where is the config file?' / 'Show project structure' → call introspect with mode project_tree."
-    "\n- Quick math or conversions → call calc yourself."
-    "\n- Meme requests → call meme_tool yourself."
-    "\n- Amazon/shopping → call amazon_search yourself."
-    "\n- Research/web lookup → call research yourself."
-    "\nThese tools work WITHOUT a plan. Just call them and answer."
-    "\n- 'Show recent commits' / 'git status' → call bash with git log/status yourself."
-    "\n\nFULL MODE — plan + delegate (for heavy/multi-step work):"
-    "\n- Editing code, running builds, debugging, multi-file modifications →"
-    "\n  1. Call plan (create) with goal + steps"
-    "\n  2. Call summon_subagent for each step"
-    "\n  3. Reply with a single short sentence acknowledging you're on it"
-    "\nDo not narrate fake progress. The user sees subagent results automatically."
-    "\n\nCRITICAL: Do NOT delegate simple reads/lookups to a subagent. If you can "
-    "answer with 1-3 quick tool calls, do it yourself."
+    "You are the Discord dispatcher for ClawForge. Never emit <function_calls>, "
+    "<invoke>, or any XML tool-call markup as text.\n"
+    "\n"
+    "You have THREE modes. Default to the lowest one that fits.\n"
+    "\n"
+    "QUICK MODE — no tools, just answer:\n"
+    "- Casual chat, conceptual explanations, answering from conversation history.\n"
+    "\n"
+    "INLINE TOOL MODE — call tools yourself, answer in one turn:\n"
+    "Use when the work is small enough to finish in ≤3 tool rounds:\n"
+    "- Read/show/list/search: file_read, bash (ls, grep, find, cat, git log/status/diff), introspect.\n"
+    "- Single-file edits: file_diff. ONE file, a focused change, no build step needed.\n"
+    "- Math: calc. Web lookup: research. Meme: meme_tool. Shopping: amazon_search.\n"
+    "No plan required for inline mode. Just call the tool and reply.\n"
+    "\n"
+    "DELEGATE MODE — summon_subagent:\n"
+    "Use ONLY when ALL of these are likely true:\n"
+    "  (a) work touches 2+ files OR runs a build/test OR does destructive shell work,\n"
+    "  (b) you'd need more than ~3 tool rounds to finish it inline,\n"
+    "  (c) it's safe to run in the background (user doesn't need an interactive reply).\n"
+    "\n"
+    "summon_subagent has TWO modes — use them together:\n"
+    "\n"
+    "  STEP A — mode='explore' (read-only research):\n"
+    "  When you need to understand code you haven't read, spawn an explore subagent.\n"
+    "  It returns a structured 3-layer JSON brief (executive map + structured facts +\n"
+    "  pinned evidence). It only needs a 'task' field (the question) and optional\n"
+    "  'target_files' as hint paths. Explore bypasses the plan gate.\n"
+    "\n"
+    "  STEP B — mode='execute' (default, the worker that changes things):\n"
+    "  Take the explore brief's layer2_facts + layer3_evidence and drop them into\n"
+    "  known_facts. Take the paths from layer1_map and use them as target_files.\n"
+    "  Add task + acceptance + constraints. The execute subagent does the real work.\n"
+    "\n"
+    "The explore→execute pattern is the preferred flow for anything non-trivial.\n"
+    "Skipping the explore step is fine ONLY when you've already done the recon\n"
+    "yourself inline (file_read, bash grep) and have the facts at hand.\n"
+    "\n"
+    "A subagent sees NONE of this Discord conversation — only the brief you send.\n"
+    "Empty or vague briefs are the #1 cause of failure. Execute-mode requires\n"
+    "task + target_files + acceptance; the schema will reject a bare task string.\n"
+    "\n"
+    "Other brief fields:\n"
+    "  - context: the user's actual words — the subagent needs to know why\n"
+    "  - constraints / out_of_scope: things not to touch, to prevent drift\n"
+    "\n"
+    "After summon_subagent: reply with ONE short sentence acknowledging the work.\n"
+    "Do NOT narrate fake progress. The user sees subagent results automatically.\n"
+    "\n"
+    "CRITICAL: default to the lowest mode that works. A single-file edit goes through\n"
+    "file_diff inline, NOT through a subagent. Only escalate when inline would be\n"
+    "painful or unsafe."
 )
 
 ALL_TOOLS = [
@@ -274,8 +303,12 @@ class ClawForgeBridge(discord.Client):
             self.save_state()
 
     async def setup_hook(self):
+        # Dispatcher now runs inline tools (file_read, file_diff, bash, introspect)
+        # before deciding whether to delegate, so the /api/chat round-trip can take
+        # longer than the old 120s budget. 300s covers a dispatcher that does a few
+        # rounds of recon + a small edit before handing off (or completing inline).
         self.http_session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=120)
+            timeout=aiohttp.ClientTimeout(total=300)
         )
         await self.validate_persisted_sessions()
         register_commands(self)
@@ -453,13 +486,11 @@ class ClawForgeBridge(discord.Client):
             log.error("Models GET error: %s", e)
             return []
 
-        # Allowed models: Claude variants, grok-4.1-fast, and ollama models
-        allowed_claude_models = {
-            "claude-3-5-sonnet",
-            "claude-3-opus",
-            "claude-3-haiku",
-            "claude-3-sonnet",
-        }
+        # Curated model list per provider.
+        # Models come as "provider:model" strings or objects with "id".
+        # Only surface models we actually want in Discord autocomplete.
+        allowed_ollama = {"ollama:qwen3:4b"}
+        allowed_openrouter = {"openrouter:x-ai/grok-4.1-fast"}
 
         out: list[str] = []
         for prov in data.get("providers", []):
@@ -467,15 +498,18 @@ class ClawForgeBridge(discord.Client):
             for m in prov.get("models", []):
                 if not m:
                     continue
-                # Keep Claude models (bare name from anthropic provider)
-                if provider_name == "anthropic" and m in allowed_claude_models:
-                    out.append(m)
-                # Keep grok-4.1-fast from x-ai provider
-                elif provider_name == "x-ai" and m == "grok-4.1-fast":
-                    out.append(m)
-                # Keep all ollama models
-                elif provider_name == "ollama":
-                    out.append(m)
+                # OpenRouter returns objects with "id" key
+                model_id = m["id"] if isinstance(m, dict) and "id" in m else m
+                if not isinstance(model_id, str):
+                    continue
+
+                if provider_name == "anthropic":
+                    # All Anthropic models
+                    out.append(model_id)
+                elif provider_name == "ollama" and model_id in allowed_ollama:
+                    out.append(model_id)
+                elif provider_name == "openrouter" and model_id in allowed_openrouter:
+                    out.append(model_id)
         return out
 
     async def set_vision_model(self, model: Optional[str]) -> bool:
@@ -906,7 +940,11 @@ class ClawForgeBridge(discord.Client):
 
                 if status == "completed":
                     raw = result.get("text", "") or ""
+                    media_urls = extract_media_urls(raw)
                     cleaned = strip_tool_calls(raw)
+                    for url in media_urls:
+                        if url not in cleaned:
+                            cleaned = cleaned.rstrip() + "\n" + url if cleaned else url
                     if cleaned:
                         await self.send_chunked(original, cleaned)
                     elif raw.strip():

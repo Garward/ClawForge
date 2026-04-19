@@ -133,17 +133,7 @@ pub const Engine = struct {
     pending_compaction: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     // Tracks files read via file_read this conversation turn — enforces read-before-write
     files_read_this_turn: std.StringHashMap(void) = undefined,
-    // Pending explore-cache entries keyed by job_id (36-char UUID). Consumed
-    // by backgroundChatCallback on successful completion.
-    pending_explore_cache: std.StringHashMap(PendingExploreCache) = undefined,
-    pending_explore_cache_mutex: std.Thread.Mutex = .{},
     start_time: i64,
-
-    pub const PendingExploreCache = struct {
-        cache_key: []const u8,
-        task: []const u8,
-        target_files_json: []const u8,
-    };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -179,53 +169,8 @@ pub const Engine = struct {
             .router = router_mod.Router.init(&config.routing),
             .optimization_manager = null,
             .files_read_this_turn = std.StringHashMap(void).init(allocator),
-            .pending_explore_cache = std.StringHashMap(PendingExploreCache).init(allocator),
             .start_time = std.time.timestamp(),
         };
-    }
-
-    fn registerPendingExploreCache(
-        self: *Engine,
-        job_id: *const [36]u8,
-        cache_key: []u8,
-        task: []const u8,
-        target_files_json: []const u8,
-    ) void {
-        self.pending_explore_cache_mutex.lock();
-        defer self.pending_explore_cache_mutex.unlock();
-
-        const key = self.allocator.dupe(u8, job_id) catch {
-            self.allocator.free(cache_key);
-            self.allocator.free(task);
-            self.allocator.free(target_files_json);
-            return;
-        };
-        const gop = self.pending_explore_cache.getOrPut(key) catch {
-            self.allocator.free(key);
-            self.allocator.free(cache_key);
-            self.allocator.free(task);
-            self.allocator.free(target_files_json);
-            return;
-        };
-        if (gop.found_existing) {
-            self.allocator.free(key);
-            self.allocator.free(gop.value_ptr.cache_key);
-            self.allocator.free(gop.value_ptr.task);
-            self.allocator.free(gop.value_ptr.target_files_json);
-        }
-        gop.value_ptr.* = .{
-            .cache_key = cache_key,
-            .task = task,
-            .target_files_json = target_files_json,
-        };
-    }
-
-    fn consumePendingExploreCache(self: *Engine, job_id: *const [36]u8) ?PendingExploreCache {
-        self.pending_explore_cache_mutex.lock();
-        defer self.pending_explore_cache_mutex.unlock();
-        const entry = self.pending_explore_cache.fetchRemove(job_id) orelse return null;
-        self.allocator.free(entry.key);
-        return entry.value;
     }
 
     /// Set the summarizer and summary store after init.
@@ -1276,41 +1221,6 @@ pub const Engine = struct {
             response_arenas.deinit(self.allocator);
         }
 
-        // File-read gate for file_diff: track which file paths the model has
-        // actually read during this chat turn (plus any read earlier in the
-        // session via history). file_diff requires the target path to be in
-        // this set so the model isn't editing a file it hasn't seen. Exception:
-        // `create_if_missing: true` skips the check since the file may not exist.
-        var read_paths: std.StringHashMap(void) = std.StringHashMap(void).init(self.allocator);
-        defer {
-            var it = read_paths.keyIterator();
-            while (it.next()) |k| self.allocator.free(k.*);
-            read_paths.deinit();
-        }
-        // Seed from prior history: any file_read tool_use block in the current
-        // request's messages counts as "read in this session".
-        for (current_request.messages) |msg| {
-            for (msg.content) |block| {
-                switch (block) {
-                    .tool_use => |tu| {
-                        if (std.mem.eql(u8, tu.name, "file_read") and tu.input == .object) {
-                            if (tu.input.object.get("path")) |p| {
-                                if (p == .string and p.string.len > 0) {
-                                    const dup = self.allocator.dupe(u8, p.string) catch continue;
-                                    const gop = read_paths.getOrPut(dup) catch {
-                                        self.allocator.free(dup);
-                                        continue;
-                                    };
-                                    if (gop.found_existing) self.allocator.free(dup);
-                                }
-                            }
-                        }
-                    },
-                    else => {},
-                }
-            }
-        }
-
         var cancelled = false;
         var tool_round: usize = 0;
         while (tool_round < 100) : (tool_round += 1) {
@@ -1425,22 +1335,6 @@ pub const Engine = struct {
 
                 // User message: tool_result for each tool call
                 var result_blocks: std.ArrayList(api.messages.ContentBlock) = .{};
-
-                // Dedup identical tool_uses within a single round. The model
-                // sometimes emits two or more parallel calls with the same
-                // name+input (e.g. the same file_diff twice) — executing both
-                // wastes rounds and, worse, when both fail the model sees "the
-                // error happened twice" and retries again. Instead we run each
-                // unique call once and return the SAME result for every
-                // duplicate id. Key = "name\x00input_json".
-                const DedupEntry = struct { content: []const u8, is_error: bool };
-                var dedup: std.StringHashMap(DedupEntry) = std.StringHashMap(DedupEntry).init(self.allocator);
-                defer {
-                    var dit = dedup.keyIterator();
-                    while (dit.next()) |k| self.allocator.free(k.*);
-                    dedup.deinit();
-                }
-
                 for (api_response.tool_use) |tool_call| {
                     // Check cancellation before each tool execution
                     if (emitter) |em| {
@@ -1458,40 +1352,6 @@ pub const Engine = struct {
                             .tool_name = tool_call.name,
                             .input = tool_call.input_json,
                         } });
-                    }
-
-                    // Dedup: if this exact (name, input_json) already ran in
-                    // this round, reuse the result instead of re-executing.
-                    const dedup_key = std.fmt.allocPrint(
-                        self.allocator,
-                        "{s}\x00{s}",
-                        .{ tool_call.name, tool_call.input_json },
-                    ) catch null;
-                    if (dedup_key) |key| {
-                        if (dedup.get(key)) |prior| {
-                            self.allocator.free(key);
-                            std.log.info("Dedup: skipping duplicate {s} call, reusing prior result", .{tool_call.name});
-                            const note = std.fmt.allocPrint(
-                                self.allocator,
-                                "[DEDUPLICATED: this exact call already ran earlier in the same round. " ++
-                                    "Result reused below. Do not emit duplicate tool_use blocks — they " ++
-                                    "waste context and delay the response.]\n\n{s}",
-                                .{prior.content},
-                            ) catch prior.content;
-                            if (emitter) |em| {
-                                em.emit(.{ .stream_tool_result = .{
-                                    .tool_id = tool_call.id,
-                                    .result = note,
-                                    .is_error = prior.is_error,
-                                } });
-                            }
-                            result_blocks.append(self.allocator, .{ .tool_result = .{
-                                .tool_use_id = tool_call.id,
-                                .content = note,
-                                .is_error = prior.is_error,
-                            } }) catch {};
-                            continue;
-                        }
                     }
 
                     // Push tool_use event for subagent live transparency
@@ -1524,11 +1384,7 @@ pub const Engine = struct {
                     const is_plan_tool = std.mem.eql(u8, tool_call.name, "plan");
                     const is_lightweight = isLightweightTool(tool_call.name) or
                         isSafeBashCommand(tool_call.name, tool_call.input);
-                    // Explore-mode summon_subagent is read-only recon; bypass plan gate.
-                    const is_explore_summon = std.mem.eql(u8, tool_call.name, "summon_subagent") and
-                        isExploreSummon(tool_call.input);
-                    const plan_gate_active = !has_active_plan and !is_plan_tool and !is_subagent and
-                        !is_lightweight and !is_explore_summon;
+                    const plan_gate_active = !has_active_plan and !is_plan_tool and !is_subagent and !is_lightweight;
                     const tool_res = if (declined) blk: {
                         std.log.info("Tool {s} declined by user", .{tool_call.name});
                         break :blk tools.ToolResult{ .content = TOOL_DECLINED_MSG, .is_error = true };
@@ -1536,10 +1392,10 @@ pub const Engine = struct {
                         std.log.info("Plan gate: blocked {s} — no active plan", .{tool_call.name});
                         break :blk tools.ToolResult{
                             .content = "BLOCKED: This tool requires an active execution plan. Call the `plan` " ++
-                                "tool with operation \"create\" first. Inline tools that work without a plan: " ++
-                                "file_read, introspect, calc, research, meme_tool, amazon_search, file_diff " ++
-                                "(single-file edits), and safe bash (ls, tree, git log/status/diff, head, tail, " ++
-                                "cat, find, pwd). For multi-step/multi-file work, create a plan and delegate " ++
+                                "tool with operation \"create\" first. Note: lightweight tools (file_read, " ++
+                                "introspect, calc, research, meme_tool, amazon_search) and safe bash " ++
+                                "commands (ls, tree, git log/status/diff, head, tail, cat, find, pwd) " ++
+                                "work without a plan. For multi-step work, create a plan and delegate " ++
                                 "via summon_subagent.",
                             .is_error = true,
                         };
@@ -1564,35 +1420,10 @@ pub const Engine = struct {
                     } else if (std.mem.eql(u8, tool_call.name, "summon_subagent")) blk: {
                         std.log.info("Special tool: summon_subagent", .{});
                         break :blk self.handleSummonSubagent(tool_call.input, &sess.id, &spawned_subagent_ids, model);
-                    } else if (std.mem.eql(u8, tool_call.name, "file_diff") and
-                        !fileDiffHasBeenRead(tool_call.input, &read_paths)) blk:
-                    {
-                        const gated_path = if (tool_call.input == .object)
-                            (if (tool_call.input.object.get("path")) |p|
-                                (if (p == .string) p.string else "<unknown>")
-                            else
-                                "<unknown>")
-                        else
-                            "<unknown>";
-                        std.log.info("file_diff gate: blocked — path '{s}' not read yet", .{gated_path});
-                        const msg = std.fmt.allocPrint(self.allocator,
-                            "BLOCKED: file_diff requires you to file_read the target file first so " ++
-                                "you can see its actual contents before proposing a change. Call file_read " ++
-                                "on '{s}', then retry the diff. " ++
-                                "(If this is a new file that doesn't exist yet, set create_if_missing: true.)",
-                            .{gated_path},
-                        ) catch "BLOCKED: file_diff requires you to file_read the target file first.";
-                        break :blk tools.ToolResult{ .content = msg, .is_error = true };
                     } else blk: {
                         std.log.info("Executing tool: {s}", .{tool_call.name});
                         break :blk self.executeToolParsedCached(tool_call.name, tool_call.input, tool_call.input_json);
                     };
-
-                    // Record successful file_read paths so subsequent file_diff
-                    // calls in this turn can see the file.
-                    if (!tool_res.is_error and std.mem.eql(u8, tool_call.name, "file_read")) {
-                        recordReadPath(self.allocator, &read_paths, tool_call.input);
-                    }
 
                     // Emit result
                     if (emitter) |em| {
@@ -1664,33 +1495,12 @@ pub const Engine = struct {
                         err_msg.appendSlice(self.allocator, model_content) catch break :blk model_content;
                         err_msg.appendSlice(
                             self.allocator,
-                            "\n\n[RECOVERY HINT: This tool call FAILED. " ++
-                                "DO NOT retry with the same input — you will get the same error. " ++
-                                "Read the error text above and change what caused it (path, argument, " ++
-                                "parameter, or prerequisite step). If the error says a prerequisite " ++
-                                "is missing (e.g. 'file_read first'), satisfy it before retrying. " ++
-                                "If you don't understand the error, ask the user rather than guessing.]",
+                            "\n\n[RECOVERY HINT: This tool call failed. Fix the issue in your PREVIOUS call " ++
+                                "(correct the path, argument, or parameter) rather than regenerating all content from scratch. " ++
+                                "Your original input is preserved above — adjust only what caused the error.]",
                         ) catch {};
                         break :blk err_msg.items;
                     } else model_content;
-
-                    // Record in dedup map so later duplicates in this round reuse the result.
-                    if (dedup_key) |key| {
-                        const gop = dedup.getOrPut(key) catch {
-                            self.allocator.free(key);
-                            result_blocks.append(self.allocator, .{ .tool_result = .{
-                                .tool_use_id = tool_call.id,
-                                .content = result_content,
-                                .is_error = tool_res.is_error,
-                            } }) catch {};
-                            continue;
-                        };
-                        if (gop.found_existing) {
-                            self.allocator.free(key);
-                        } else {
-                            gop.value_ptr.* = .{ .content = result_content, .is_error = tool_res.is_error };
-                        }
-                    }
 
                     result_blocks.append(self.allocator, .{ .tool_result = .{
                         .tool_use_id = tool_call.id,
@@ -2048,114 +1858,6 @@ pub const Engine = struct {
         return .{ .content = msg, .is_error = true };
     }
 
-    /// Compute sha256 hex cache key for an explore subagent call.
-    /// Returns null if target_files is empty (caching that would over-match across
-    /// unrelated codebases). Caller owns the returned bytes.
-    fn computeExploreCacheKey(
-        self: *Engine,
-        task: []const u8,
-        target_files: ?std.json.Array,
-    ) ?[]u8 {
-        const arr = target_files orelse return null;
-        if (arr.items.len == 0) return null;
-
-        // Collect & sort paths for stable key ordering.
-        var paths = std.ArrayList([]const u8){};
-        defer paths.deinit(self.allocator);
-        for (arr.items) |item| {
-            if (item == .string and item.string.len > 0) {
-                paths.append(self.allocator, item.string) catch return null;
-            }
-        }
-        if (paths.items.len == 0) return null;
-        std.mem.sort([]const u8, paths.items, {}, struct {
-            fn lt(_: void, a: []const u8, b: []const u8) bool {
-                return std.mem.order(u8, a, b) == .lt;
-            }
-        }.lt);
-
-        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        hasher.update(task);
-        hasher.update("\x00");
-
-        for (paths.items) |p| {
-            hasher.update(p);
-            hasher.update("\x00");
-
-            // Hash file content (bounded). Use "MISSING" marker if unreadable.
-            const content = readFileForHash(self.allocator, p) catch null;
-            if (content) |c| {
-                defer self.allocator.free(c);
-                var file_hasher = std.crypto.hash.sha2.Sha256.init(.{});
-                file_hasher.update(c);
-                var file_digest: [32]u8 = undefined;
-                file_hasher.final(&file_digest);
-                hasher.update(&file_digest);
-            } else {
-                hasher.update("MISSING");
-            }
-            hasher.update("\x00");
-        }
-
-        var digest: [32]u8 = undefined;
-        hasher.final(&digest);
-
-        const hex = self.allocator.alloc(u8, 64) catch return null;
-        const hex_chars = "0123456789abcdef";
-        for (digest, 0..) |b, i| {
-            hex[i * 2] = hex_chars[b >> 4];
-            hex[i * 2 + 1] = hex_chars[b & 0x0F];
-        }
-        return hex;
-    }
-
-    /// Look up a cached explore result by key. Caller owns returned bytes.
-    fn exploreCacheGet(self: *Engine, cache_key: []const u8) ?[]u8 {
-        var stmt = self.session_store.conn.prepare(
-            "SELECT result_json FROM explore_cache WHERE cache_key = ?",
-        ) catch return null;
-        defer stmt.deinit();
-        stmt.bindText(1, cache_key) catch return null;
-        const has = stmt.step() catch return null;
-        if (!has) return null;
-        const raw = stmt.columnText(0) orelse return null;
-        const dup = self.allocator.dupe(u8, raw) catch return null;
-
-        // Bump hits/last_hit_at (best effort).
-        var upd = self.session_store.conn.prepare(
-            "UPDATE explore_cache SET hits = hits + 1, last_hit_at = ? WHERE cache_key = ?",
-        ) catch return dup;
-        defer upd.deinit();
-        upd.bindInt64(1, std.time.timestamp()) catch return dup;
-        upd.bindText(2, cache_key) catch return dup;
-        _ = upd.step() catch return dup;
-        return dup;
-    }
-
-    /// Write a successful explore result to the cache.
-    pub fn exploreCachePut(
-        self: *Engine,
-        cache_key: []const u8,
-        task: []const u8,
-        target_files_json: []const u8,
-        result_json: []const u8,
-    ) void {
-        var stmt = self.session_store.conn.prepare(
-            \\INSERT OR REPLACE INTO explore_cache
-            \\(cache_key, task, target_files, result_json, created_at, last_hit_at, hits)
-            \\VALUES (?, ?, ?, ?, ?, ?, 0)
-        ) catch return;
-        defer stmt.deinit();
-        const now = std.time.timestamp();
-        stmt.bindText(1, cache_key) catch return;
-        stmt.bindText(2, task) catch return;
-        stmt.bindText(3, target_files_json) catch return;
-        stmt.bindText(4, result_json) catch return;
-        stmt.bindInt64(5, now) catch return;
-        stmt.bindInt64(6, now) catch return;
-        _ = stmt.step() catch return;
-    }
-
     /// Handle a summon_subagent tool call by enqueueing a BackgroundChatJob.
     /// The subagent inherits the parent's session so it sees the same persona/history,
     /// and inherits the parent's model string (including any `provider:` prefix) so
@@ -2176,75 +1878,18 @@ pub const Engine = struct {
         };
 
         if (input != .object) return .{
-            .content = "summon_subagent: input must be an object. See the tool schema for required fields.",
-            .is_error = true,
-        };
-
-        // Mode: "execute" (default) or "explore"
-        const mode_str: []const u8 = if (input.object.get("mode")) |m|
-            (if (m == .string and m.string.len > 0) m.string else "execute")
-        else
-            "execute";
-        const is_explore = std.mem.eql(u8, mode_str, "explore");
-        if (!is_explore and !std.mem.eql(u8, mode_str, "execute")) return .{
-            .content = "summon_subagent: 'mode' must be 'execute' or 'explore'.",
+            .content = "summon_subagent: input must be an object with a 'task' field",
             .is_error = true,
         };
 
         const task_val = input.object.get("task") orelse return .{
-            .content = "summon_subagent: missing required 'task' field (one-sentence goal for execute, or question for explore).",
+            .content = "summon_subagent: missing required 'task' field",
             .is_error = true,
         };
         if (task_val != .string or task_val.string.len == 0) return .{
-            .content = "summon_subagent: 'task' must be a non-empty string.",
+            .content = "summon_subagent: 'task' must be a non-empty string",
             .is_error = true,
         };
-
-        // Execute mode requires target_files + acceptance. Explore mode does not.
-        const acceptance_val: ?[]const u8 = if (is_explore) null else blk: {
-            const a = input.object.get("acceptance") orelse return .{
-                .content = "summon_subagent (execute): missing required 'acceptance' field. Specify a concrete, testable stop condition. (If you just want to investigate, use mode='explore' instead.)",
-                .is_error = true,
-            };
-            if (a != .string or a.string.len == 0) return .{
-                .content = "summon_subagent (execute): 'acceptance' must be a non-empty string.",
-                .is_error = true,
-            };
-            break :blk a.string;
-        };
-
-        const target_files_val: ?std.json.Array = blk: {
-            const tf = input.object.get("target_files") orelse {
-                if (is_explore) break :blk null;
-                return .{
-                    .content = "summon_subagent (execute): missing required 'target_files' field. Do recon first and pass the file paths.",
-                    .is_error = true,
-                };
-            };
-            if (tf != .array) return .{
-                .content = "summon_subagent: 'target_files' must be an array of strings.",
-                .is_error = true,
-            };
-            break :blk tf.array;
-        };
-
-        // Optional fields
-        const context_val: ?[]const u8 = if (input.object.get("context")) |v|
-            (if (v == .string and v.string.len > 0) v.string else null)
-        else
-            null;
-        const known_facts_val: ?std.json.Array = if (input.object.get("known_facts")) |v|
-            (if (v == .array) v.array else null)
-        else
-            null;
-        const constraints_val: ?std.json.Array = if (input.object.get("constraints")) |v|
-            (if (v == .array) v.array else null)
-        else
-            null;
-        const out_of_scope_val: ?std.json.Array = if (input.object.get("out_of_scope")) |v|
-            (if (v == .array) v.array else null)
-        else
-            null;
 
         // Explicit override from the parent LLM's tool call args wins; otherwise
         // inherit the parent's active model so the subagent runs on whatever the
@@ -2260,208 +1905,59 @@ pub const Engine = struct {
         // Load the current plan so the subagent sees what step it's working on.
         const current_plan = self.session_store.getPlan(parent_session_id) catch null;
 
-        // Render the brief as structured sections. A subagent inherits no
-        // conversation context, so every useful fact must be spelled out here.
-        const has_targets = if (target_files_val) |tf| tf.items.len > 0 else false;
-
-        var brief_buf: std.ArrayList(u8) = .{};
-        defer brief_buf.deinit(self.allocator);
-        const w = brief_buf.writer(self.allocator);
-
-        if (is_explore) {
-            w.writeAll(
-                \\[EXPLORE SUBAGENT — READ-ONLY RESEARCH MODE]
-                \\
-                \\You are a research agent. Your ONLY job is to investigate the question below
-                \\and return a structured 3-layer brief. You have READ-ONLY tools: file_read,
-                \\bash (for grep/find/cat/ls/head/tail only — do NOT use destructive commands),
-                \\and introspect. You do NOT have file_write, file_diff, or summon_subagent.
-                \\
-                \\HARD RULES:
-                \\1. Your FIRST response MUST contain a tool_use block. No text-only replies.
-                \\2. Do recon passes. If initial findings point you elsewhere, follow the lead.
-                \\3. Your FINAL response MUST be a single JSON object, no prose wrapping, matching:
-                \\
-                \\   {
-                \\     "layer1_map": [
-                \\       {"path": "src/foo.zig", "purpose": "one-line summary"}
-                \\     ],
-                \\     "layer2_facts": [
-                \\       {
-                \\         "path": "src/foo.zig",
-                \\         "purpose": "what this file does",
-                \\         "exports": ["fn foo(...)", "pub const Bar"],
-                \\         "structs": ["Bar { field: Type, ... }"],
-                \\         "inbound_deps": ["who calls / imports this"],
-                \\         "outbound_deps": ["what this depends on"],
-                \\         "invariants": ["non-obvious rules / assumptions"],
-                \\         "edit_points": ["line 42: the switch in handleX", "fn Y: add branch here"],
-                \\         "confidence": "high|medium|low"
-                \\       }
-                \\     ],
-                \\     "layer3_evidence": [
-                \\       {"path": "src/foo.zig", "anchor": "fn foo", "excerpt": "small targeted block — signatures + short relevant code only, NO whole-file dumps"}
-                \\     ]
-                \\   }
-                \\
-                \\4. Layer 1 = tiny executive map. Layer 2 = the real payload. Layer 3 = small
-                \\   targeted excerpts (signatures, short blocks, anchors) — NEVER whole files.
-                \\5. NEVER write "Let me...", "I'll...", or any dispatcher ack. Just use tools,
-                \\   then emit the JSON.
-                \\6. If you can't find something, say so in invariants/confidence — do not
-                \\   fabricate.
-                \\
-                \\
-            ) catch {};
-
-            if (current_plan) |p| {
-                w.print("--- CURRENT PLAN (context) ---\n{s}\n--- END PLAN ---\n\n", .{p}) catch {};
-            }
-
-            w.print("--- QUESTION ---\n{s}\n\n", .{task_val.string}) catch {};
-
-            if (context_val) |c| {
-                w.print("--- CONTEXT (why the caller is asking) ---\n{s}\n\n", .{c}) catch {};
-            }
-
-            if (has_targets) {
-                w.writeAll("--- HINT PATHS (caller's starting guesses; pivot if they're wrong) ---\n") catch {};
-                for (target_files_val.?.items) |item| {
-                    if (item == .string) {
-                            w.print("- {s}\n", .{item.string}) catch {};
-                    }
-                }
-                w.writeAll("\n") catch {};
-            }
-
-            w.writeAll("--- REMEMBER: final response is the JSON object, nothing else ---\n") catch {};
-        } else {
-            // EXECUTE MODE — worker that makes changes.
-            w.writeAll(
-                \\[SUBAGENT EXECUTION MODE — READ BEFORE RESPONDING]
-                \\
-                \\You are an autonomous file/code/shell worker. You are NOT the
-                \\dispatcher. Ignore any chat-style patterns from prior conversation.
-                \\
-                \\HARD RULES:
-                \\1. Your FIRST response MUST contain a tool_use block. No text-only replies.
-                \\2. NEVER write "Let me...", "I'll...", "Dispatching...", "Firing off...",
-                \\   "Working on it..." or any dispatcher ack. You are the worker.
-                \\3. You do NOT have summon_subagent. Finish the task yourself.
-                \\4. When complete, give a concise factual report (≤300 words). No
-                \\   emojis, no greetings, no sign-offs.
-                \\5. Call `plan` with operation "update" to mark your step "done" and
-                \\   include a "notes" field with key findings/paths/gotchas so later
-                \\   subagents inherit context.
-                \\
-                \\
-            ) catch {};
-
-            if (has_targets) {
-                w.writeAll(
-                    \\RECON GUIDANCE:
-                    \\target_files is populated — the dispatcher already did recon. Read the
-                    \\listed files first, then act. Do NOT re-explore the tree unless the
-                    \\listed files don't contain what you need.
-                    \\
-                    \\
-                ) catch {};
-            } else {
-                w.writeAll(
-                    \\RECON GUIDANCE:
-                    \\target_files is empty — this is a discovery task. Use bash (grep, find),
-                    \\introspect, and file_read to locate what you need before acting.
-                    \\
-                    \\
-                ) catch {};
-            }
-
-            if (current_plan) |p| {
-                w.print("--- CURRENT PLAN ---\n{s}\n--- END PLAN ---\n\n", .{p}) catch {};
-            }
-
-            w.print("--- TASK ---\n{s}\n\n", .{task_val.string}) catch {};
-
-            if (context_val) |c| {
-                w.print("--- CONTEXT (why this matters / user's words) ---\n{s}\n\n", .{c}) catch {};
-            }
-
-            if (has_targets) {
-                w.writeAll("--- TARGET FILES ---\n") catch {};
-                for (target_files_val.?.items) |item| {
-                    if (item == .string) {
-                        w.print("- {s}\n", .{item.string}) catch {};
-                    }
-                }
-                w.writeAll("\n") catch {};
-            }
-
-            if (known_facts_val) |arr| {
-                if (arr.items.len > 0) {
-                    w.writeAll("--- KNOWN FACTS (do NOT re-derive these) ---\n") catch {};
-                    for (arr.items) |item| {
-                        if (item == .string) {
-                            w.print("- {s}\n", .{item.string}) catch {};
-                        }
-                    }
-                    w.writeAll("\n") catch {};
-                }
-            }
-
-            if (constraints_val) |arr| {
-                if (arr.items.len > 0) {
-                    w.writeAll("--- CONSTRAINTS (must NOT do) ---\n") catch {};
-                    for (arr.items) |item| {
-                        if (item == .string) {
-                            w.print("- {s}\n", .{item.string}) catch {};
-                        }
-                    }
-                    w.writeAll("\n") catch {};
-                }
-            }
-
-            if (out_of_scope_val) |arr| {
-                if (arr.items.len > 0) {
-                    w.writeAll("--- OUT OF SCOPE (resist scope creep) ---\n") catch {};
-                    for (arr.items) |item| {
-                        if (item == .string) {
-                            w.print("- {s}\n", .{item.string}) catch {};
-                        }
-                    }
-                    w.writeAll("\n") catch {};
-                }
-            }
-
-            if (acceptance_val) |a| {
-                w.print("--- ACCEPTANCE (you are done when) ---\n{s}\n", .{a}) catch {};
-            }
-        }
-
-        // Explore cache lookup: only applies when the caller passed target_files
-        // (the key is derived from sorted paths + their content hashes, so an
-        // empty list would over-match across unrelated codebases).
-        var cache_key_opt: ?[]u8 = null;
-        if (is_explore) {
-            if (self.computeExploreCacheKey(task_val.string, target_files_val)) |ck| {
-                if (self.exploreCacheGet(ck)) |cached_json| {
-                    defer self.allocator.free(ck);
-                    std.log.info("Explore cache HIT for key {s}", .{ck[0..@min(16, ck.len)]});
-                    const msg = std.fmt.allocPrint(
-                        self.allocator,
-                        "EXPLORE CACHE HIT (no subagent spawned). Cached result below — use directly.\n\n{s}",
-                        .{cached_json},
-                    ) catch cached_json;
-                    if (msg.ptr != cached_json.ptr) self.allocator.free(cached_json);
-                    return .{ .content = msg, .is_error = false };
-                }
-                cache_key_opt = ck;
-                std.log.info("Explore cache MISS for key {s}", .{ck[0..@min(16, ck.len)]});
-            }
-        }
-
-        const wrapped_task = self.allocator.dupe(u8, brief_buf.items) catch {
-            if (cache_key_opt) |ck| self.allocator.free(ck);
-            return .{ .content = "summon_subagent: out of memory", .is_error = true };
+        // Wrap the task with a hard execution directive. The subagent
+        // otherwise pattern-matches the dispatcher's chatty Discord style
+        // (seen via shared session history) and replies with "Let me...",
+        // "Dispatching...", "Firing off..." instead of calling tools. This
+        // prefix is terminal: the model sees it as the latest instruction,
+        // after persona and adapter_context.
+        const wrapped_task = std.fmt.allocPrint(
+            self.allocator,
+            \\[SUBAGENT EXECUTION MODE — READ BEFORE RESPONDING]
+            \\
+            \\You are running as an autonomous file/code/shell agent. You are NOT
+            \\the Discord dispatcher. Ignore any chat-style patterns from prior
+            \\conversation — they do not apply to you.
+            \\
+            \\HARD RULES:
+            \\1. Your FIRST response MUST contain a tool_use block. Do NOT reply
+            \\   with text only. Start by calling file_read, bash, file_write,
+            \\   or another concrete tool.
+            \\2. NEVER write phrases like "Let me...", "I'll...", "Dispatching...",
+            \\   "Firing off...", "Working on it...", or any dispatcher ack. You
+            \\   are the worker, not a dispatcher.
+            \\3. You do NOT have summon_subagent. Do not try to delegate — you
+            \\   ARE the worker. Finish the task yourself.
+            \\4. When complete, give a concise factual report (≤300 words). No
+            \\   emojis, no greetings, no "let me know if you need more".
+            \\5. You have the `plan` tool (view/update only). When you finish your
+            \\   task, call `plan` with operation "update" to mark your step as
+            \\   "done" and include a "notes" field with key findings, file paths,
+            \\   gotchas, or anything the next step needs to know. This is critical
+            \\   — other subagents see your notes and avoid repeating mistakes.
+            \\   Example: {{"operation":"update","steps":[{{"id":2,"status":"done",
+            \\   "description":"...", "notes":"config was at /etc/x not /opt/x"}}]}}
+            \\
+            \\{s}
+            \\TASK:
+            \\{s}
+            ,
+            .{
+                if (current_plan) |p|
+                    std.fmt.allocPrint(self.allocator,
+                        \\CURRENT PLAN STATE:
+                        \\{s}
+                        \\
+                        \\Find which step matches your task below and update it when done.
+                        \\
+                    , .{p}) catch ""
+                else
+                    "",
+                task_val.string,
+            },
+        ) catch return .{
+            .content = "summon_subagent: out of memory",
+            .is_error = true,
         };
 
         const model_dup: ?[]const u8 = if (model_val) |m|
@@ -2472,58 +1968,13 @@ pub const Engine = struct {
         var job_id: [36]u8 = undefined;
         generateUUID(&job_id);
 
-        // Explore subagents get a read-only toolset. Execute subagents inherit
-        // whatever tools are enabled on the registry.
-        const allowed_dup: ?[]const u8 = if (is_explore)
-            (self.allocator.dupe(u8, "file_read,bash,introspect,plan") catch null)
-        else
-            null;
-
-        // Build compact target_files JSON once, for both pending-cache metadata
-        // and eventual write-back (stored on the Engine's pending_explore_cache
-        // map keyed by job_id).
-        if (cache_key_opt) |ck| {
-            var tf_buf: std.ArrayList(u8) = .{};
-            defer tf_buf.deinit(self.allocator);
-            const tfw = tf_buf.writer(self.allocator);
-            tfw.writeAll("[") catch {};
-            if (target_files_val) |arr| {
-                for (arr.items, 0..) |item, i| {
-                    if (i > 0) tfw.writeAll(",") catch {};
-                    if (item == .string) {
-                        tfw.writeByte('"') catch {};
-                        for (item.string) |ch| {
-                            switch (ch) {
-                                '"' => tfw.writeAll("\\\"") catch {},
-                                '\\' => tfw.writeAll("\\\\") catch {},
-                                '\n' => tfw.writeAll("\\n") catch {},
-                                '\r' => tfw.writeAll("\\r") catch {},
-                                '\t' => tfw.writeAll("\\t") catch {},
-                                else => if (ch < 0x20)
-                                    tfw.print("\\u{x:0>4}", .{ch}) catch {}
-                                else
-                                    tfw.writeByte(ch) catch {},
-                            }
-                        }
-                        tfw.writeByte('"') catch {};
-                    } else {
-                        tfw.writeAll("null") catch {};
-                    }
-                }
-            }
-            tfw.writeAll("]") catch {};
-            const task_dup = self.allocator.dupe(u8, task_val.string) catch "";
-            const tf_dup = self.allocator.dupe(u8, tf_buf.items) catch "[]";
-            self.registerPendingExploreCache(&job_id, ck, task_dup, tf_dup);
-        }
-
         wp.enqueueBackgroundChat(.{
             .job_id = job_id,
             .message = wrapped_task,
             .session_id = parent_session_id.*,
             .model_override = model_dup,
             .callback_channel = null,
-            .allowed_tools = allowed_dup,
+            .allowed_tools = null,
             .is_subagent = true,
             .cancelled = std.atomic.Value(bool).init(false),
         });
@@ -2534,8 +1985,8 @@ pub const Engine = struct {
 
         const result_text = std.fmt.allocPrint(
             self.allocator,
-            "Subagent dispatched (mode={s}). Job ID: {s}. For execute: the user receives the result automatically. For explore: poll the job result, parse the 3-layer JSON brief, then summon an execute subagent with the findings dropped into known_facts and target_files.",
-            .{ mode_str, job_id },
+            "Subagent dispatched. Job ID: {s}. The user will receive the result automatically when it completes — you do not need to wait.",
+            .{job_id},
         ) catch "Subagent dispatched.";
 
         return .{ .content = result_text, .is_error = false };
@@ -2778,7 +2229,6 @@ pub const Engine = struct {
     /// signature expected by WorkerPool.setBackgroundChatContext.
     pub fn backgroundChatCallback(
         ctx: *anyopaque,
-        job_id: *const [36]u8,
         message: []const u8,
         session_id: ?[]const u8,
         model_override: ?[]const u8,
@@ -2821,24 +2271,6 @@ pub const Engine = struct {
 
         return switch (result) {
             .chat => |chat| blk: {
-                // Explore cache write-back: if this job had a pending cache entry
-                // (set by handleSummonSubagent when mode=explore + target_files),
-                // persist the raw result BEFORE the voice pass rewrites it.
-                if (self.consumePendingExploreCache(job_id)) |pending| {
-                    defer {
-                        self.allocator.free(pending.cache_key);
-                        self.allocator.free(pending.task);
-                        self.allocator.free(pending.target_files_json);
-                    }
-                    self.exploreCachePut(
-                        pending.cache_key,
-                        pending.task,
-                        pending.target_files_json,
-                        chat.text,
-                    );
-                    std.log.info("Explore cache WROTE key {s}", .{pending.cache_key[0..@min(16, pending.cache_key.len)]});
-                }
-
                 // For subagent results, run a voice pass so the user-facing
                 // text reads in the parent persona's voice instead of as a
                 // dry technical dump. Only fires for subagents (user-initiated
@@ -2861,20 +2293,12 @@ pub const Engine = struct {
                     .output_tokens = chat.output_tokens,
                 };
             },
-            .response => |resp| blk: {
-                // On failure, drop any pending cache entry (we don't cache failures).
-                if (self.consumePendingExploreCache(job_id)) |pending| {
-                    self.allocator.free(pending.cache_key);
-                    self.allocator.free(pending.task);
-                    self.allocator.free(pending.target_files_json);
-                }
-                break :blk .{
-                    .ok = false,
-                    .error_message = switch (resp) {
-                        .error_resp => |e| e.message,
-                        else => "unexpected response type",
-                    },
-                };
+            .response => |resp| .{
+                .ok = false,
+                .error_message = switch (resp) {
+                    .error_resp => |e| e.message,
+                    else => "unexpected response type",
+                },
             },
         };
     }
@@ -3343,38 +2767,6 @@ fn isSafeBashCommand(tool_name: []const u8, input: std.json.Value) bool {
     return false;
 }
 
-/// True when a summon_subagent call is in explore mode (read-only recon).
-fn isExploreSummon(input: std.json.Value) bool {
-    if (input != .object) return false;
-    const m = input.object.get("mode") orelse return false;
-    if (m != .string) return false;
-    return std.mem.eql(u8, m.string, "explore");
-}
-
-/// True when file_diff can proceed: either the target path has been read this
-/// session, OR the caller explicitly set create_if_missing for a new file.
-fn fileDiffHasBeenRead(input: std.json.Value, read_paths: *const std.StringHashMap(void)) bool {
-    if (input != .object) return true; // malformed input — let normal validation handle it
-    if (input.object.get("create_if_missing")) |cif| {
-        if (cif == .bool and cif.bool) return true;
-    }
-    const path_val = input.object.get("path") orelse return true; // let file_diff error on missing path
-    if (path_val != .string or path_val.string.len == 0) return true;
-    return read_paths.contains(path_val.string);
-}
-
-fn recordReadPath(allocator: std.mem.Allocator, read_paths: *std.StringHashMap(void), input: std.json.Value) void {
-    if (input != .object) return;
-    const p = input.object.get("path") orelse return;
-    if (p != .string or p.string.len == 0) return;
-    const dup = allocator.dupe(u8, p.string) catch return;
-    const gop = read_paths.getOrPut(dup) catch {
-        allocator.free(dup);
-        return;
-    };
-    if (gop.found_existing) allocator.free(dup);
-}
-
 fn isLightweightTool(name: []const u8) bool {
     const lightweight = [_][]const u8{
         "file_read",
@@ -3383,10 +2775,6 @@ fn isLightweightTool(name: []const u8) bool {
         "research",
         "meme_tool",
         "amazon_search",
-        // Single-file edits are allowed inline — the dispatcher needs this for
-        // the middle-path UX (small edits without the spawn/poll overhead of a
-        // subagent). Still gated by user confirmation via requiresConfirmation.
-        "file_diff",
     };
     for (&lightweight) |lt| {
         if (std.mem.eql(u8, name, lt)) return true;
@@ -3434,14 +2822,4 @@ fn containsAny(haystack: []const u8, needles: []const []const u8) bool {
         if (std.mem.indexOf(u8, haystack, needle) != null) return true;
     }
     return false;
-}
-
-/// Read a file (≤2MB) for explore-cache content hashing. Path must be absolute.
-fn readFileForHash(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
-    if (path.len == 0 or path[0] != '/') return null;
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
-    defer file.close();
-    const size = try file.getEndPos();
-    if (size > 2 * 1024 * 1024) return null;
-    return try file.readToEndAlloc(allocator, @intCast(size + 1));
 }

@@ -13,7 +13,7 @@
     "max_clients": 5
   },
   "tools": {
-    "enabled": ["bash", "file_read", "file_write", "file_diff", "amazon_search", "calc", "introspect", "meme_tool", "rebuild", "zig_test", "research_tool", "summon_subagent", "discord_history"],
+    "enabled": ["bash", "file_read", "file_write", "file_diff", "amazon_search", "calc", "introspect", "meme_tool", "rebuild", "zig_test", "research_tool", "summon_subagent"],
     "bash_require_confirmation": true,
     "bash_timeout_ms": 30000,
     "file_write_require_confirmation": true
