@@ -12,8 +12,9 @@ sleep 1
 pkill -9 -f clawforged 2>/dev/null
 pkill -9 -f "bridges/discord_bridge.py" 2>/dev/null
 sleep 0.3
-rm -f /home/garward/Scripts/Tools/ClawForge/data/clawforge.sock
-cd /home/garward/Scripts/Tools/ClawForge
+CLAWFORGE_ROOT="${CLAWFORGE_ROOT:-$(cd "$(dirname "$(readlink -f "$0")")" && pwd)}"
+rm -f "$CLAWFORGE_ROOT/data/clawforge.sock"
+cd "$CLAWFORGE_ROOT"
 
 if [ "$1" = "build" ]; then
     zig build 2>&1 || exit 1

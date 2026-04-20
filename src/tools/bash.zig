@@ -33,7 +33,7 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
         std.mem.indexOf(u8, command, "localhost:8081") != null)
     {
         return .{
-            .content = "BLOCKED: Cannot HTTP request your own server during a conversation (deadlock). Use sqlite3 to query the database directly: sqlite3 /home/garward/Scripts/Tools/ClawForge/data/workspace.db \"<SQL>\"",
+            .content = "BLOCKED: Cannot HTTP request your own server during a conversation (deadlock). Use sqlite3 to query the database directly: sqlite3 \"$CLAWFORGE_ROOT/data/workspace.db\" \"<SQL>\"",
             .model_content = "BLOCKED: Local self-HTTP request rejected to avoid deadlock. Query the SQLite DB directly instead.",
             .is_error = true,
         };

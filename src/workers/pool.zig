@@ -39,6 +39,7 @@ pub const WorkerPool = struct {
         model_override: ?[]const u8,
         allowed_tools: ?[]const u8,
         is_subagent: bool,
+        is_explore: bool,
         confirm_ctx: ?*anyopaque,
         confirm_fn: ?*const fn (ctx: *anyopaque, tool_name: []const u8, tool_id: []const u8, input_preview: []const u8) bool,
     ) BackgroundChatOutput = null,
@@ -245,6 +246,7 @@ pub const WorkerPool = struct {
             model_override: ?[]const u8,
             allowed_tools: ?[]const u8,
             is_subagent: bool,
+            is_explore: bool,
             confirm_ctx: ?*anyopaque,
             confirm_fn: ?*const fn (ctx: *anyopaque, tool_name: []const u8, tool_id: []const u8, input_preview: []const u8) bool,
         ) BackgroundChatOutput,
@@ -463,33 +465,104 @@ pub const WorkerPool = struct {
                     job.model_override,
                     job.allowed_tools,
                     job.is_subagent,
+                    job.is_explore,
                     @ptrCast(&confirm_ctx),
                     &bgConfirmCallback,
                 );
+
+                // Auto-chain: if this was a successful explore subagent and the
+                // dispatcher asked for chaining, run a dispatcher continuation
+                // turn. The continuation ingests the brief as a synthetic user
+                // message and its model-generated response replaces the raw
+                // brief as the stored result — so the polling adapter sees a
+                // dispatcher reply instead of a JSON dump.
+                var final_output = output;
+                var continuation_msg_opt: ?[]u8 = null;
+                if (output.ok and job.auto_chain and job.is_explore) {
+                    const brief = output.text orelse "";
+                    const cont_msg = std.fmt.allocPrint(
+                        self.allocator,
+                        \\[EXPLORE SUBAGENT RESULT — synthetic continuation]
+                        \\
+                        \\A prior explore subagent you dispatched has returned its 3-layer brief. It is
+                        \\included below verbatim. The user is still waiting for your reply to their
+                        \\original request (visible earlier in this session). Using this brief:
+                        \\
+                        \\- If the user's intent was clear and actionable, summon_subagent(mode='execute')
+                        \\  now with the findings: drop layer2_facts + layer3_evidence into known_facts,
+                        \\  layer1_map paths into target_files, and add a crisp task + acceptance.
+                        \\- If the user asked you to 'explore first', 'show me the plan', or similar, DO
+                        \\  NOT summon execute. Instead, write a concise plain-text summary of what you
+                        \\  found (key files, what needs to change, any risks) and ask for their
+                        \\  green-light to proceed.
+                        \\
+                        \\Your reply will be sent directly to the user — keep it brief and natural in
+                        \\your normal voice. Do not quote the raw JSON back at them.
+                        \\
+                        \\--- BRIEF ---
+                        \\{s}
+                        \\--- END BRIEF ---
+                    ,
+                        .{brief},
+                    ) catch null;
+
+                    if (cont_msg) |cm| {
+                        continuation_msg_opt = cm;
+                        // Run dispatcher continuation. is_subagent=false so the
+                        // engine pulls session history and applies the normal
+                        // background-agent adapter context; is_explore=false so
+                        // the voice-pass (if applicable) runs.
+                        var cont_confirm_ctx = BgConfirmCtx{ .pool = self, .job_id = &job.job_id };
+                        const cont_output = process_fn(
+                            process_ctx,
+                            &job.job_id,
+                            cm,
+                            &job.session_id,
+                            job.model_override,
+                            job.chain_allowed_tools orelse job.allowed_tools,
+                            false,
+                            false,
+                            @ptrCast(&cont_confirm_ctx),
+                            &bgConfirmCallback,
+                        );
+                        if (cont_output.ok) {
+                            // Free the brief — we're replacing it with the continuation response.
+                            if (output.text) |t| self.allocator.free(t);
+                            final_output = cont_output;
+                            std.log.info("Background chat: job {s} auto-chained dispatcher continuation", .{job.job_id[0..8]});
+                        } else {
+                            // Continuation failed — keep the raw brief as the result so the user
+                            // at least sees something. Log the chain failure.
+                            std.log.err("Background chat: auto-chain continuation failed for job {s}: {s}", .{
+                                job.job_id[0..8], cont_output.error_message orelse "unknown",
+                            });
+                        }
+                    }
+                }
 
                 // Clear active job tracking
                 self.active_job_id = null;
                 self.tool_event_log.endJob(&job.job_id);
 
-                if (output.ok) {
+                if (final_output.ok) {
                     self.result_store.put(.{
                         .job_id = job.job_id,
                         .status = .completed,
-                        .text = output.text,
-                        .model = output.model,
-                        .input_tokens = output.input_tokens,
-                        .output_tokens = output.output_tokens,
+                        .text = final_output.text,
+                        .model = final_output.model,
+                        .input_tokens = final_output.input_tokens,
+                        .output_tokens = final_output.output_tokens,
                         .callback_channel = job.callback_channel,
                         .timestamp = std.time.timestamp(),
                     });
                     std.log.info("Background chat: job {s} completed ({d} in / {d} out tokens)", .{
-                        job.job_id[0..8], output.input_tokens, output.output_tokens,
+                        job.job_id[0..8], final_output.input_tokens, final_output.output_tokens,
                     });
                 } else {
                     self.result_store.put(.{
                         .job_id = job.job_id,
                         .status = .failed,
-                        .text = output.error_message,
+                        .text = final_output.error_message,
                         .model = null,
                         .input_tokens = 0,
                         .output_tokens = 0,
@@ -497,14 +570,16 @@ pub const WorkerPool = struct {
                         .timestamp = std.time.timestamp(),
                     });
                     std.log.err("Background chat: job {s} failed: {s}", .{
-                        job.job_id[0..8], output.error_message orelse "unknown error",
+                        job.job_id[0..8], final_output.error_message orelse "unknown error",
                     });
                 }
 
-                // Free owned job strings (message, model_override)
+                // Free owned job strings (message, model_override, continuation msg, chain tools)
                 // callback_channel ownership transfers to the result
                 self.allocator.free(job.message);
                 if (job.model_override) |mo| self.allocator.free(mo);
+                if (job.chain_allowed_tools) |cat| self.allocator.free(cat);
+                if (continuation_msg_opt) |cm| self.allocator.free(cm);
             } else {
                 self.background_chat_queue.waitOrTimeout(100_000_000);
             }
@@ -522,6 +597,7 @@ pub const WorkerPool = struct {
         if (job.model_override) |mo| self.allocator.free(mo);
         if (job.callback_channel) |cc| self.allocator.free(cc);
         if (job.allowed_tools) |at| self.allocator.free(at);
+        if (job.chain_allowed_tools) |at| self.allocator.free(at);
     }
 };
 
@@ -577,6 +653,20 @@ pub const BackgroundChatJob = struct {
     /// engine uses this to skip session history and apply a hard
     /// subagent-execution adapter context.
     is_subagent: bool = false,
+    /// True when this is an explore-mode subagent. The engine skips the
+    /// persona voice-pass on completion so the raw 3-layer JSON brief is
+    /// preserved for the dispatcher to consume.
+    is_explore: bool = false,
+    /// If true and is_explore is true and the subagent completes successfully,
+    /// the worker will run a dispatcher continuation turn (feeding the brief
+    /// back as a synthetic user message) before storing the final result.
+    /// The stored result is the dispatcher's response, so the polling adapter
+    /// (Discord/web) sees a model-generated summary / next-action message
+    /// instead of the raw JSON brief.
+    auto_chain: bool = false,
+    /// Allowed tools for the dispatcher continuation (used when auto_chain is
+    /// true). Typically the parent dispatcher's tool set. Owned by engine.
+    chain_allowed_tools: ?[]const u8 = null,
     cancelled: std.atomic.Value(bool),
 };
 

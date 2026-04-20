@@ -1684,24 +1684,33 @@
             }
         }
 
+        // Lazy-load state: per-page cursor for scroll-up history loads
+        const PAGE_SIZE = 50;
+        let lazyState = { sessionId: null, oldestSeq: null, hasMore: false, loading: false };
+
         async function loadSessionMessages(sessionId) {
             dom.messagesEl.innerHTML = '';
+            lazyState = { sessionId, oldestSeq: null, hasMore: false, loading: false };
             if (!sessionId) {
                 showEmptyState();
                 return;
             }
 
-            // Show loading
             const loadEl = document.createElement('div');
             loadEl.className = 'msg-loading';
             loadEl.innerHTML = '<div class="spinner"></div> Loading messages...';
             dom.messagesEl.appendChild(loadEl);
 
             try {
-                const messages = await apiGet('/api/messages?session_id=' + encodeURIComponent(sessionId));
+                const resp = await apiGet('/api/messages?session_id=' + encodeURIComponent(sessionId) + '&limit=' + PAGE_SIZE);
                 dom.messagesEl.innerHTML = '';
 
-                if (!messages || messages.length === 0) {
+                const messages = (resp && resp.messages) || [];
+                const pag = (resp && resp.pagination) || {};
+                lazyState.oldestSeq = pag.oldest_seq;
+                lazyState.hasMore = !!pag.has_more;
+
+                if (messages.length === 0) {
                     showEmptyState();
                     return;
                 }
@@ -1724,6 +1733,7 @@
                     state.tokenTotals.messages++;
                 });
                 updateTokenDisplay();
+                renderLoadMoreIndicator();
                 scrollToBottom();
             } catch (e) {
                 dom.messagesEl.innerHTML = '';
@@ -1732,6 +1742,84 @@
                 errEl.textContent = 'Could not load messages: ' + e.message;
                 dom.messagesEl.appendChild(errEl);
             }
+        }
+
+        function renderLoadMoreIndicator() {
+            const existing = document.getElementById('load-more-indicator');
+            if (existing) existing.remove();
+            if (!lazyState.hasMore) return;
+            const el = document.createElement('div');
+            el.id = 'load-more-indicator';
+            el.style.cssText = 'padding: 10px; text-align: center; color: var(--text-dim); font-size: 12px;';
+            el.textContent = lazyState.loading ? 'Loading older messages…' : 'Scroll up to load older messages';
+            dom.messagesEl.insertBefore(el, dom.messagesEl.firstChild);
+        }
+
+        async function loadOlderMessages() {
+            if (!lazyState.sessionId || !lazyState.hasMore || lazyState.loading || lazyState.oldestSeq == null) return;
+            lazyState.loading = true;
+            renderLoadMoreIndicator();
+
+            // Preserve scroll anchor — remember offset from bottom
+            const scrollEl = dom.messagesEl;
+            const prevFromBottom = scrollEl.scrollHeight - scrollEl.scrollTop;
+
+            try {
+                const resp = await apiGet('/api/messages?session_id=' + encodeURIComponent(lazyState.sessionId)
+                    + '&limit=' + PAGE_SIZE + '&before_seq=' + lazyState.oldestSeq);
+                const messages = (resp && resp.messages) || [];
+                const pag = (resp && resp.pagination) || {};
+                lazyState.oldestSeq = pag.oldest_seq != null ? pag.oldest_seq : lazyState.oldestSeq;
+                lazyState.hasMore = !!pag.has_more;
+
+                // Prepend oldest→newest at top of container
+                const frag = document.createDocumentFragment();
+                const tmp = document.createElement('div');
+                // Build each message into tmp, move its last child into frag in order
+                for (const msg of messages) {
+                    const tokens = (msg.input_tokens || msg.output_tokens)
+                        ? { input: msg.input_tokens || 0, output: msg.output_tokens || 0 }
+                        : null;
+                    // appendMessage appends to dom.messagesEl — capture the element it adds
+                    const beforeCount = dom.messagesEl.children.length;
+                    appendMessage(msg.role, msg.content, {
+                        tokens: tokens,
+                        model: msg.model_used,
+                        time: msg.created_at,
+                        skipScroll: true,
+                    });
+                    const newEl = dom.messagesEl.children[dom.messagesEl.children.length - 1];
+                    if (newEl) frag.appendChild(newEl); // detaches from messagesEl
+                    if (tokens) {
+                        state.tokenTotals.input += tokens.input;
+                        state.tokenTotals.output += tokens.output;
+                    }
+                    state.tokenTotals.messages++;
+                }
+                updateTokenDisplay();
+
+                // Insert fragment at top (above any existing load-more indicator)
+                const firstReal = document.getElementById('load-more-indicator');
+                if (firstReal) firstReal.remove();
+                dom.messagesEl.insertBefore(frag, dom.messagesEl.firstChild);
+            } catch (e) {
+                console.error('Failed loading older messages', e);
+            } finally {
+                lazyState.loading = false;
+                renderLoadMoreIndicator();
+                // Restore scroll position relative to bottom
+                scrollEl.scrollTop = scrollEl.scrollHeight - prevFromBottom;
+            }
+        }
+
+        // Scroll-up trigger (attach once)
+        if (dom.messagesEl && !dom.messagesEl.dataset.lazyBound) {
+            dom.messagesEl.dataset.lazyBound = '1';
+            dom.messagesEl.addEventListener('scroll', () => {
+                if (dom.messagesEl.scrollTop < 80 && lazyState.hasMore && !lazyState.loading) {
+                    loadOlderMessages();
+                }
+            });
         }
 
         /* ============================
@@ -1805,8 +1893,9 @@
             if (!state.currentSession) return;
             const el = document.getElementById('compaction-status');
             try {
-                const msgs = await apiGet('/api/messages?session_id=' + state.currentSession);
-                const msgCount = msgs ? msgs.length : 0;
+                // Fetch 1 message just to get session existence; rely on token-total message count for UI
+                const resp = await apiGet('/api/messages?session_id=' + state.currentSession + '&limit=1');
+                const msgCount = state.tokenTotals.messages || ((resp && resp.messages) ? resp.messages.length : 0);
 
                 // Check summaries via introspect-style query (use message count heuristic)
                 const threshold = 40;

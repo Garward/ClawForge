@@ -1,5 +1,6 @@
 const std = @import("std");
 const json = std.json;
+const common = @import("common");
 const registry = @import("registry.zig");
 
 pub const definition = registry.ToolDefinition{
@@ -14,18 +15,22 @@ pub const definition = registry.ToolDefinition{
     .handler = &execute,
 };
 
-const SEARCH_SCRIPT = "/home/garward/Scripts/Tools/ClawForge/tools/amazon_search.py";
-const PYTHON = "/home/garward/Scripts/Tools/.venv/bin/python3";
-
 fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult {
     if (input != .object) {
         return .{ .content = "Expected JSON object with 'query' or 'queries'", .is_error = true };
     }
 
+    const python = common.config.getPython(allocator) catch
+        return .{ .content = "Failed to resolve python", .is_error = true };
+    defer allocator.free(python);
+    const search_script = common.config.getToolScript(allocator, "amazon_search.py") catch
+        return .{ .content = "Failed to resolve search script", .is_error = true };
+    defer allocator.free(search_script);
+
     // Build argv dynamically
     var argv_list: std.ArrayList([]const u8) = .{};
-    argv_list.append(allocator, PYTHON) catch return .{ .content = "Alloc error", .is_error = true };
-    argv_list.append(allocator, SEARCH_SCRIPT) catch return .{ .content = "Alloc error", .is_error = true };
+    argv_list.append(allocator, python) catch return .{ .content = "Alloc error", .is_error = true };
+    argv_list.append(allocator, search_script) catch return .{ .content = "Alloc error", .is_error = true };
 
     // Support both "query" (single) and "queries" (parallel array)
     if (input.object.get("queries")) |queries| {

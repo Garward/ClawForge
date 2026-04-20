@@ -1,5 +1,6 @@
 const std = @import("std");
 const json = std.json;
+const common = @import("common");
 const api = @import("api");
 const storage = @import("storage");
 const sandbox_mod = @import("sandbox.zig");
@@ -174,7 +175,8 @@ pub const ToolGenerator = struct {
     /// Write a generated tool's script to disk and register it in the tool registry.
     fn registerGeneratedTool(self: *ToolGenerator, tool: GeneratedTool) !void {
         // Ensure tools/generated/ directory exists
-        const gen_dir = "/home/garward/Scripts/Tools/ClawForge/tools/generated";
+        const gen_dir = try common.config.resolveProjectPath(self.allocator, "tools/generated");
+        defer self.allocator.free(gen_dir);
         std.fs.makeDirAbsolute(gen_dir) catch |err| {
             if (err != error.PathAlreadyExists) return err;
         };

@@ -1,5 +1,6 @@
 const std = @import("std");
 const json = std.json;
+const common = @import("common");
 const api_messages = @import("api").messages;
 const bash = @import("bash.zig");
 const file_read = @import("file_read.zig");
@@ -68,7 +69,7 @@ pub const summon_subagent_def = ToolDefinition{
         "Returns a job ID; the user (for execute) or you (for explore) receives the result " ++
         "automatically when it completes.",
     .input_schema_json =
-        \\{"type":"object","properties":{"mode":{"type":"string","enum":["execute","explore"],"description":"'execute' (default) = worker that makes changes. 'explore' = read-only research agent that returns a structured 3-layer brief."},"task":{"type":"string","description":"For execute: one-sentence goal (the end state). For explore: the question to investigate (e.g. 'How does the dispatcher wire summon_subagent results back to Discord?')."},"context":{"type":"string","description":"Why this matters / the user's actual words. The subagent does not see chat history."},"target_files":{"type":"array","items":{"type":"string"},"description":"For execute: files the subagent will read or modify (REQUIRED non-empty for execute unless pure-discovery). For explore: hint paths to focus recon on (optional)."},"known_facts":{"type":"array","items":{"type":"string"},"description":"Findings the subagent should NOT re-derive. Paste relevant lines from a prior explore subagent's brief here. e.g. 'handleSummonSubagent is at engine.zig:1868'."},"acceptance":{"type":"string","description":"For execute (REQUIRED): concrete testable stop condition. e.g. 'zig build succeeds AND new function visible in engine.zig'. Not used by explore."},"constraints":{"type":"array","items":{"type":"string"},"description":"Things the subagent must NOT do. e.g. 'do not modify discord_adapter.zig'."},"out_of_scope":{"type":"array","items":{"type":"string"},"description":"Related work to resist. Stops scope creep."},"model":{"type":"string","description":"Optional model id override. Inherits parent's model by default."}},"required":["task"]}
+        \\{"type":"object","properties":{"mode":{"type":"string","enum":["execute","explore"],"description":"'execute' (default) = worker that makes changes. 'explore' = read-only research agent that returns a structured 3-layer brief."},"task":{"type":"string","description":"For execute: one-sentence goal (the end state). For explore: the question to investigate (e.g. 'How does the dispatcher wire summon_subagent results back to Discord?')."},"context":{"type":"string","description":"Why this matters / the user's actual words. The subagent does not see chat history."},"target_files":{"type":"array","items":{"type":"string"},"description":"For execute: files the subagent will read or modify (REQUIRED non-empty for execute unless pure-discovery). For explore: hint paths to focus recon on (optional)."},"known_facts":{"type":"array","items":{"type":"string"},"description":"Findings the subagent should NOT re-derive. Paste relevant lines from a prior explore subagent's brief here. e.g. 'handleSummonSubagent is at engine.zig:1868'."},"acceptance":{"type":"string","description":"For execute (REQUIRED): concrete testable stop condition. e.g. 'zig build succeeds AND new function visible in engine.zig'. Not used by explore."},"constraints":{"type":"array","items":{"type":"string"},"description":"Things the subagent must NOT do. e.g. 'do not modify discord_adapter.zig'."},"out_of_scope":{"type":"array","items":{"type":"string"},"description":"Related work to resist. Stops scope creep."},"model":{"type":"string","description":"Optional model id override. Inherits parent's model by default."},"wait":{"type":"boolean","description":"If true, block this tool call until the subagent completes and return its full result as the tool_result (useful for in-turn chaining). Default false."},"chain":{"type":"boolean","description":"Explore only. If true (default for explore), after the subagent returns the worker automatically runs a dispatcher continuation turn that ingests the brief and generates the user-facing reply (summary, or auto-summon of execute). The polling adapter sees the continuation's reply, not the raw JSON. Ignored when wait=true or mode=execute."}},"required":["task"]}
     ,
     .requires_confirmation = false,
     .handler = null,
@@ -305,10 +306,10 @@ pub const ToolRegistry = struct {
         };
         const input_str = input_aw.written();
 
-        const interpreter = if (std.mem.eql(u8, lang, "bash"))
-            "/bin/bash"
-        else
-            "/home/garward/Scripts/Tools/.venv/bin/python3";
+        const is_bash = std.mem.eql(u8, lang, "bash");
+        const interpreter_owned: ?[]const u8 = if (is_bash) null else (common.config.getPython(self.allocator) catch null);
+        defer if (interpreter_owned) |p| self.allocator.free(p);
+        const interpreter: []const u8 = if (is_bash) "/bin/bash" else (interpreter_owned orelse "python3");
 
         const result = std.process.Child.run(.{
             .allocator = self.allocator,

@@ -1563,7 +1563,7 @@ pub const Engine = struct {
                         break :blk res;
                     } else if (std.mem.eql(u8, tool_call.name, "summon_subagent")) blk: {
                         std.log.info("Special tool: summon_subagent", .{});
-                        break :blk self.handleSummonSubagent(tool_call.input, &sess.id, &spawned_subagent_ids, model);
+                        break :blk self.handleSummonSubagent(tool_call.input, &sess.id, &spawned_subagent_ids, model, chat_req.allowed_tools);
                     } else if (std.mem.eql(u8, tool_call.name, "file_diff") and
                         !fileDiffHasBeenRead(tool_call.input, &read_paths)) blk:
                     {
@@ -2169,6 +2169,7 @@ pub const Engine = struct {
         parent_session_id: *const [36]u8,
         spawned_ids: *std.ArrayList([36]u8),
         parent_model: []const u8,
+        parent_allowed_tools: ?[]const u8,
     ) tools.ToolResult {
         const wp = self.worker_pool orelse return .{
             .content = "summon_subagent unavailable: no worker pool configured",
@@ -2190,6 +2191,29 @@ pub const Engine = struct {
             .content = "summon_subagent: 'mode' must be 'execute' or 'explore'.",
             .is_error = true,
         };
+
+        // wait: true → block until subagent completes and return result as tool_result.
+        // Default: false for both modes now that auto-chain is the preferred flow
+        // for explore (dispatcher stays snappy, continuation runs async on the
+        // worker thread). Dispatcher can still pass wait=true for in-turn chaining.
+        const wait_sync: bool = if (input.object.get("wait")) |w|
+            (if (w == .bool) w.bool else false)
+        else
+            false;
+
+        // chain: when true (explore only), the worker automatically runs a
+        // dispatcher continuation turn once the subagent returns, feeding the
+        // 3-layer brief back into the dispatcher. The continuation's reply
+        // replaces the raw brief as the stored result — so the polling adapter
+        // sees a model-generated summary / next-action message. Default true
+        // for explore (makes the "fire and forget" UX work naturally), ignored
+        // for execute (no brief to chain on) and when wait_sync is true (the
+        // dispatcher already sees the brief in-turn and can chain itself).
+        const chain_async: bool = if (input.object.get("chain")) |c|
+            (if (c == .bool) c.bool else is_explore)
+        else
+            is_explore;
+        const auto_chain_effective = is_explore and chain_async and !wait_sync;
 
         const task_val = input.object.get("task") orelse return .{
             .content = "summon_subagent: missing required 'task' field (one-sentence goal for execute, or question for explore).",
@@ -2479,6 +2503,14 @@ pub const Engine = struct {
         else
             null;
 
+        // When auto-chain is on, duplicate the parent dispatcher's tool set so
+        // the continuation has the same capabilities (file_diff, summon_subagent
+        // for a follow-up execute, etc.).
+        const chain_allowed_dup: ?[]const u8 = if (auto_chain_effective)
+            (if (parent_allowed_tools) |pat| (self.allocator.dupe(u8, pat) catch null) else null)
+        else
+            null;
+
         // Build compact target_files JSON once, for both pending-cache metadata
         // and eventual write-back (stored on the Engine's pending_explore_cache
         // map keyed by job_id).
@@ -2525,16 +2557,53 @@ pub const Engine = struct {
             .callback_channel = null,
             .allowed_tools = allowed_dup,
             .is_subagent = true,
+            .is_explore = is_explore,
+            .auto_chain = auto_chain_effective,
+            .chain_allowed_tools = chain_allowed_dup,
             .cancelled = std.atomic.Value(bool).init(false),
         });
 
         spawned_ids.append(self.allocator, job_id) catch {};
 
-        std.log.info("Spawned subagent job {s}", .{job_id});
+        std.log.info("Spawned subagent job {s} (wait={})", .{ job_id, wait_sync });
+
+        if (wait_sync) {
+            // Block until the job completes, up to a generous ceiling. Explore
+            // subagents typically finish in 30-120s; we allow 10 minutes for
+            // deeper investigations.
+            const max_wait_ms: u64 = 10 * 60 * 1000;
+            const poll_interval_ms: u64 = 500;
+            var waited_ms: u64 = 0;
+            while (waited_ms < max_wait_ms) {
+                if (wp.getBackgroundResult(&job_id)) |res| {
+                    const body = res.text orelse "(empty result)";
+                    const status_str = switch (res.status) {
+                        .completed => "completed",
+                        .failed => "failed",
+                        .cancelled => "cancelled",
+                    };
+                    const is_err = res.status != .completed;
+                    const msg = std.fmt.allocPrint(
+                        self.allocator,
+                        "Subagent {s} (mode={s}, job {s}).\n\n{s}",
+                        .{ status_str, mode_str, job_id, body },
+                    ) catch "Subagent completed.";
+                    return .{ .content = msg, .is_error = is_err };
+                }
+                std.Thread.sleep(poll_interval_ms * std.time.ns_per_ms);
+                waited_ms += poll_interval_ms;
+            }
+            const msg = std.fmt.allocPrint(
+                self.allocator,
+                "Subagent timeout after {d}s (mode={s}, job {s}). The job may still be running — check back with a follow-up or poll the job id.",
+                .{ max_wait_ms / 1000, mode_str, job_id },
+            ) catch "Subagent timeout.";
+            return .{ .content = msg, .is_error = true };
+        }
 
         const result_text = std.fmt.allocPrint(
             self.allocator,
-            "Subagent dispatched (mode={s}). Job ID: {s}. For execute: the user receives the result automatically. For explore: poll the job result, parse the 3-layer JSON brief, then summon an execute subagent with the findings dropped into known_facts and target_files.",
+            "Subagent dispatched (mode={s}, async). Job ID: {s}. The user will receive the result automatically when it completes. (To block this tool call until the subagent finishes, pass wait=true.)",
             .{ mode_str, job_id },
         ) catch "Subagent dispatched.";
 
@@ -2784,6 +2853,7 @@ pub const Engine = struct {
         model_override: ?[]const u8,
         allowed_tools: ?[]const u8,
         is_subagent: bool,
+        is_explore: bool,
         confirm_ctx: ?*anyopaque,
         confirm_fn: ?*const fn (ctx: *anyopaque, tool_name: []const u8, tool_id: []const u8, input_preview: []const u8) bool,
     ) workers.BackgroundChatOutput {
@@ -2844,7 +2914,10 @@ pub const Engine = struct {
                 // dry technical dump. Only fires for subagents (user-initiated
                 // /api/chat/background calls keep their raw output).
                 var final_text = chat.text;
-                if (is_subagent) {
+                // Explore subagents return structured JSON the dispatcher parses;
+                // never voice-rewrite that payload. Execute subagent output still
+                // gets polished so the user sees the parent persona's voice.
+                if (is_subagent and !is_explore) {
                     if (session_id) |sid| {
                         if (self.rewriteInPersonaVoice(sid, chat.text)) |polished| {
                             // Free the original terse text — we've replaced it.

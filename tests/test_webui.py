@@ -1,16 +1,19 @@
-#!/home/garward/Scripts/Tools/.venv/bin/python3
+#!/usr/bin/env python3
 """
 Playwright tests for ClawForge Web UI.
 Run with: python tests/test_webui.py
 Requires: pip install playwright && playwright install chromium
 """
 
+import os
 import subprocess
 import time
 import sys
+from pathlib import Path
 from playwright.sync_api import sync_playwright, expect
 
-DAEMON_PATH = "/home/garward/Scripts/Tools/ClawForge/zig-out/bin/clawforged"
+_ROOT = Path(os.environ.get("CLAWFORGE_ROOT") or Path(__file__).resolve().parent.parent)
+DAEMON_PATH = os.environ.get("CLAWFORGE_DAEMON") or str(_ROOT / "zig-out" / "bin" / "clawforged")
 WEB_URL = "http://127.0.0.1:8081"
 
 

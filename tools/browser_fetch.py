@@ -1,4 +1,4 @@
-#!/home/garward/Scripts/Tools/.venv/bin/python3
+#!/usr/bin/env python3
 """
 Generic Playwright-based browser fetcher with stealth mode.
 

@@ -1,5 +1,6 @@
 const std = @import("std");
 const json = std.json;
+const common = @import("common");
 const registry = @import("registry.zig");
 
 pub const definition = registry.ToolDefinition{
@@ -13,9 +14,6 @@ pub const definition = registry.ToolDefinition{
     .handler = &execute,
 };
 
-const RESEARCH_SCRIPT = "/home/garward/Scripts/Tools/ClawForge/tools/research_tool.py";
-const PYTHON = "/home/garward/Scripts/Tools/.venv/bin/python3";
-
 fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult {
     var input_aw: std.Io.Writer.Allocating = .init(allocator);
     json.Stringify.value(input, .{}, &input_aw.writer) catch {
@@ -23,9 +21,16 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
     };
     const input_str = input_aw.written();
 
+    const python = common.config.getPython(allocator) catch
+        return .{ .content = "Failed to resolve python", .is_error = true };
+    defer allocator.free(python);
+    const script = common.config.getToolScript(allocator, "research_tool.py") catch
+        return .{ .content = "Failed to resolve research script", .is_error = true };
+    defer allocator.free(script);
+
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "/usr/bin/timeout", "30", PYTHON, RESEARCH_SCRIPT, input_str },
+        .argv = &.{ "/usr/bin/timeout", "30", python, script, input_str },
         .max_output_bytes = 512 * 1024,
     }) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Research tool error: {s}", .{@errorName(err)}) catch

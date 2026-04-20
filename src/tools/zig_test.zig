@@ -1,5 +1,6 @@
 const std = @import("std");
 const json = std.json;
+const common = @import("common");
 const registry = @import("registry.zig");
 
 pub const definition = registry.ToolDefinition{
@@ -16,8 +17,6 @@ pub const definition = registry.ToolDefinition{
     .handler = &execute,
 };
 
-const project_root = "/home/garward/Scripts/Tools/ClawForge";
-
 fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult {
     const mode = blk: {
         if (input == .object) {
@@ -29,6 +28,10 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
     };
 
     if (std.mem.eql(u8, mode, "build")) {
+        const project_root = common.config.getProjectRoot(allocator) catch
+            return .{ .content = "Failed to resolve project root", .is_error = true };
+        defer allocator.free(project_root);
+
         const result = std.process.Child.run(.{
             .allocator = allocator,
             .argv = &.{ "/usr/bin/timeout", "90", "zig", "build" },
@@ -92,7 +95,9 @@ fn formatCompilerResult(
     defer allocator.free(diagnostics);
 
     const success = result.term == .Exited and result.term.Exited == 0;
-    const subject = path orelse project_root;
+    const project_root_owned = if (path == null) (common.config.getProjectRoot(allocator) catch null) else null;
+    defer if (project_root_owned) |p| allocator.free(p);
+    const subject = path orelse (project_root_owned orelse ".");
     const term_text = formatTermination(allocator, result.term) catch "process status unavailable";
     defer if (term_text.ptr != "process status unavailable".ptr) allocator.free(term_text);
     const mode_label = if (std.mem.eql(u8, mode, "build")) "BUILD" else "AST-CHECK";

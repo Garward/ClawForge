@@ -1,6 +1,6 @@
 {
   "api": {
-    "token_file": "/home/garward/Scripts/Tools/Anthropic/token.txt",
+    "token_file": "data/anthropic-token.txt",
     "base_url": "https://api.anthropic.com",
     "default_model": "claude-sonnet-4-20250514",
     "max_tokens": 8192,

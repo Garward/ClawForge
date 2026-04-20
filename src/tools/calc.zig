@@ -1,5 +1,6 @@
 const std = @import("std");
 const json = std.json;
+const common = @import("common");
 const registry = @import("registry.zig");
 
 pub const definition = registry.ToolDefinition{
@@ -17,9 +18,6 @@ pub const definition = registry.ToolDefinition{
     .handler = &execute,
 };
 
-const CALC_SCRIPT = "/home/garward/Scripts/Tools/ClawForge/tools/calc.py";
-const PYTHON = "/home/garward/Scripts/Tools/.venv/bin/python3";
-
 fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult {
     // Serialize the input JSON back to a string to pass to the Python script
     var input_aw: std.Io.Writer.Allocating = .init(allocator);
@@ -32,9 +30,16 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
         return .{ .content = "Empty input", .is_error = true };
     }
 
+    const python = common.config.getPython(allocator) catch
+        return .{ .content = "Failed to resolve python", .is_error = true };
+    defer allocator.free(python);
+    const script = common.config.getToolScript(allocator, "calc.py") catch
+        return .{ .content = "Failed to resolve calc script", .is_error = true };
+    defer allocator.free(script);
+
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ PYTHON, CALC_SCRIPT, input_str },
+        .argv = &.{ python, script, input_str },
         .max_output_bytes = 64 * 1024,
     }) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Failed to run calc: {s}", .{@errorName(err)}) catch

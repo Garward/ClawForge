@@ -3,7 +3,7 @@ const fs = std.fs;
 const json = std.json;
 
 pub const ApiConfig = struct {
-    token_file: []const u8 = "/home/garward/Scripts/Tools/Anthropic/token.txt",
+    token_file: []const u8 = "data/anthropic-token.txt",
     base_url: []const u8 = "https://api.anthropic.com",
     default_model: []const u8 = "claude-sonnet-4-20250514",
     max_tokens: u32 = 8192,
@@ -237,26 +237,56 @@ pub const Config = struct {
     }
 };
 
-/// Resolve a path relative to the project root (exe dir's grandparent)
+/// Get the project root directory.
+/// Priority: CLAWFORGE_ROOT env var, else derived from exe path (exe_dir/../..).
+/// Caller owns returned memory.
+pub fn getProjectRoot(allocator: std.mem.Allocator) ![]const u8 {
+    if (std.process.getEnvVarOwned(allocator, "CLAWFORGE_ROOT")) |v| {
+        return v;
+    } else |_| {}
+
+    const exe_dir = try std.fs.selfExeDirPathAlloc(allocator);
+    defer allocator.free(exe_dir);
+    const parent1 = std.fs.path.dirname(exe_dir) orelse exe_dir;
+    const root = std.fs.path.dirname(parent1) orelse parent1;
+    return try allocator.dupe(u8, root);
+}
+
+/// Resolve a path relative to the project root.
 pub fn resolveProjectPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    // If already absolute, just dupe it
     if (std.fs.path.isAbsolute(path)) {
         return try allocator.dupe(u8, path);
     }
+    const root = try getProjectRoot(allocator);
+    defer allocator.free(root);
+    return try std.fs.path.join(allocator, &.{ root, path });
+}
 
-    // Get exe directory and find project root
-    const exe_dir = try std.fs.selfExeDirPathAlloc(allocator);
-    defer allocator.free(exe_dir);
+/// Path to the SQLite workspace DB.
+pub fn getDbPath(allocator: std.mem.Allocator) ![]const u8 {
+    if (std.process.getEnvVarOwned(allocator, "CLAWFORGE_DB")) |v| return v else |_| {}
+    return resolveProjectPath(allocator, "data/workspace.db");
+}
 
-    // Go up from zig-out/bin to project root
-    const parent1 = std.fs.path.dirname(exe_dir) orelse exe_dir;
-    const project_root = std.fs.path.dirname(parent1) orelse parent1;
+/// Path to python interpreter used for tool scripts.
+/// Priority: CLAWFORGE_PYTHON env, then .env CLAWFORGE_PYTHON, then "python3" on PATH.
+pub fn getPython(allocator: std.mem.Allocator) ![]const u8 {
+    if (std.process.getEnvVarOwned(allocator, "CLAWFORGE_PYTHON")) |v| return v else |_| {}
+    if (loadEnvKey(allocator, "CLAWFORGE_PYTHON")) |v| return v else |_| {}
+    return try allocator.dupe(u8, "python3");
+}
 
-    return try std.fs.path.join(allocator, &.{ project_root, path });
+/// Path to a tool script under tools/.
+pub fn getToolScript(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    const rel = try std.fmt.allocPrint(allocator, "tools/{s}", .{name});
+    defer allocator.free(rel);
+    return resolveProjectPath(allocator, rel);
 }
 
 pub fn loadApiKey(allocator: std.mem.Allocator, token_path: []const u8) ![]const u8 {
-    const file = try fs.openFileAbsolute(token_path, .{});
+    const resolved = try resolveProjectPath(allocator, token_path);
+    defer allocator.free(resolved);
+    const file = try fs.openFileAbsolute(resolved, .{});
     defer file.close();
 
     const content = try file.readToEndAlloc(allocator, 1024);

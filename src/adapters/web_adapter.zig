@@ -1788,63 +1788,222 @@ pub const WebAdapter = struct {
     }
 
     fn handleApiMessages(self: *WebAdapter, stream: std.net.Stream, path: []const u8) !void {
-        // Parse session_id from query string: /api/messages?session_id=UUID
+        // Parse query params: /api/messages?session_id=UUID&limit=50&before_seq=1234
         const session_id = blk: {
             if (std.mem.indexOf(u8, path, "session_id=")) |idx| {
                 const param_start = idx + "session_id=".len;
                 const rest = path[param_start..];
-                // Take until & or end
                 const end = std.mem.indexOf(u8, rest, "&") orelse rest.len;
                 if (end >= 36) break :blk rest[0..36];
             }
-            // No session_id — return messages from current/latest session
             break :blk @as(?[]const u8, null);
         };
 
-        // Query messages via sqlite3
-        const db_path = "/home/garward/Scripts/Tools/ClawForge/data/workspace.db";
-        var query_buf: [512]u8 = undefined;
-        const query = if (session_id) |sid|
+        // limit: default 50, clamped to [1, 200]
+        var limit: u32 = 50;
+        if (std.mem.indexOf(u8, path, "limit=")) |idx| {
+            const ps = idx + "limit=".len;
+            const rest = path[ps..];
+            const end = std.mem.indexOf(u8, rest, "&") orelse rest.len;
+            const parsed = std.fmt.parseInt(u32, rest[0..end], 10) catch 50;
+            limit = std.math.clamp(parsed, 1, 200);
+        }
+
+        // before_seq: optional cursor — fetch messages with sequence < this
+        var before_seq: ?i64 = null;
+        if (std.mem.indexOf(u8, path, "before_seq=")) |idx| {
+            const ps = idx + "before_seq=".len;
+            const rest = path[ps..];
+            const end = std.mem.indexOf(u8, rest, "&") orelse rest.len;
+            if (std.fmt.parseInt(i64, rest[0..end], 10)) |v| {
+                before_seq = v;
+            } else |_| {}
+        }
+
+        const db_path = try common.config.getDbPath(self.allocator);
+        defer self.allocator.free(db_path);
+
+        // Resolve session id (either given, or latest active)
+        var sid_buf: [64]u8 = undefined;
+        const sid_expr: []const u8 = if (session_id) |sid|
+            std.fmt.bufPrint(&sid_buf, "'{s}'", .{sid}) catch "NULL"
+        else
+            "(SELECT id FROM sessions WHERE status='active' ORDER BY updated_at DESC LIMIT 1)";
+
+        // Build inner page query: descending by sequence, limited, optionally cursor-bounded
+        // Fetch limit+1 to detect has_more. Then outer query re-sorts ascending.
+        var query_buf: [1024]u8 = undefined;
+        const query = if (before_seq) |bs|
             std.fmt.bufPrint(&query_buf,
-                "SELECT role, content, datetime(created_at, 'unixepoch') as created_at, " ++
+                "SELECT * FROM (" ++
+                "SELECT sequence, role, content, datetime(created_at, 'unixepoch') as created_at, " ++
                 "model_used, input_tokens, output_tokens " ++
-                "FROM messages WHERE session_id = '{s}' ORDER BY sequence ASC;",
-                .{sid},
+                "FROM messages WHERE session_id = {s} AND sequence < {d} " ++
+                "ORDER BY sequence DESC LIMIT {d}" ++
+                ") ORDER BY sequence ASC;",
+                .{ sid_expr, bs, limit + 1 },
             ) catch ""
         else
             std.fmt.bufPrint(&query_buf,
-                "SELECT role, content, datetime(created_at, 'unixepoch') as created_at, " ++
+                "SELECT * FROM (" ++
+                "SELECT sequence, role, content, datetime(created_at, 'unixepoch') as created_at, " ++
                 "model_used, input_tokens, output_tokens " ++
-                "FROM messages WHERE session_id = (" ++
-                "SELECT id FROM sessions WHERE status='active' ORDER BY updated_at DESC LIMIT 1" ++
+                "FROM messages WHERE session_id = {s} " ++
+                "ORDER BY sequence DESC LIMIT {d}" ++
                 ") ORDER BY sequence ASC;",
-                .{},
+                .{ sid_expr, limit + 1 },
             ) catch "";
 
         if (query.len == 0) {
-            try self.sendHttp(stream, "200 OK", "application/json", "[]");
+            try self.sendHttp(stream, "200 OK", "application/json",
+                "{\"messages\":[],\"pagination\":{\"has_more\":false,\"oldest_seq\":null,\"newest_seq\":null}}");
             return;
         }
 
         const result = std.process.Child.run(.{
             .allocator = self.allocator,
             .argv = &.{ "sqlite3", "-json", "-readonly", db_path, query },
-            .max_output_bytes = 1024 * 1024,
+            .max_output_bytes = 4 * 1024 * 1024,
         }) catch {
             try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"DB query failed\"}");
             return;
         };
-
         defer self.allocator.free(result.stderr);
+        defer self.allocator.free(result.stdout);
 
-        if (result.stdout.len == 0) {
-            try self.sendHttp(stream, "200 OK", "application/json", "[]");
-            self.allocator.free(result.stdout);
+        // Parse rows, detect has_more, extract oldest/newest sequence
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, if (result.stdout.len == 0) "[]" else result.stdout, .{}) catch {
+            try self.sendHttp(stream, "200 OK", "application/json",
+                "{\"messages\":[],\"pagination\":{\"has_more\":false,\"oldest_seq\":null,\"newest_seq\":null}}");
+            return;
+        };
+        defer parsed.deinit();
+
+        if (parsed.value != .array) {
+            try self.sendHttp(stream, "200 OK", "application/json",
+                "{\"messages\":[],\"pagination\":{\"has_more\":false,\"oldest_seq\":null,\"newest_seq\":null}}");
             return;
         }
 
-        try self.sendHttp(stream, "200 OK", "application/json", result.stdout);
-        self.allocator.free(result.stdout);
+        var arr = parsed.value.array;
+        const total_returned = arr.items.len;
+        const has_more = total_returned > limit;
+
+        // If has_more, drop the first (oldest) row since we over-fetched going DESC then ASC-sorted
+        const msgs_slice = if (has_more) arr.items[1..] else arr.items[0..];
+
+        var oldest_seq: ?i64 = null;
+        var newest_seq: ?i64 = null;
+        if (msgs_slice.len > 0) {
+            if (msgs_slice[0].object.get("sequence")) |v| {
+                if (v == .integer) oldest_seq = v.integer;
+            }
+            if (msgs_slice[msgs_slice.len - 1].object.get("sequence")) |v| {
+                if (v == .integer) newest_seq = v.integer;
+            }
+        }
+
+        // Serialize response — manually emit each msg field to avoid re-stringify API churn.
+        var out: std.ArrayList(u8) = .{};
+        defer out.deinit(self.allocator);
+        const a = self.allocator;
+        try out.appendSlice(a, "{\"messages\":[");
+        for (msgs_slice, 0..) |msg, mi| {
+            if (mi > 0) try out.append(a, ',');
+            try out.append(a, '{');
+            if (msg != .object) {
+                try out.append(a, '}');
+                continue;
+            }
+            var it = msg.object.iterator();
+            var first = true;
+            while (it.next()) |kv| {
+                if (!first) try out.append(a, ',');
+                first = false;
+                try out.append(a, '"');
+                try out.appendSlice(a, kv.key_ptr.*);
+                try out.appendSlice(a, "\":");
+                try appendJsonValue(&out, a, kv.value_ptr.*);
+            }
+            try out.append(a, '}');
+        }
+        try out.appendSlice(a, "],\"pagination\":{\"has_more\":");
+        try out.appendSlice(a, if (has_more) "true" else "false");
+        try out.appendSlice(a, ",\"oldest_seq\":");
+        if (oldest_seq) |s| {
+            var nb: [24]u8 = undefined;
+            const ns = std.fmt.bufPrint(&nb, "{d}", .{s}) catch "null";
+            try out.appendSlice(a, ns);
+        } else try out.appendSlice(a, "null");
+        try out.appendSlice(a, ",\"newest_seq\":");
+        if (newest_seq) |s| {
+            var nb: [24]u8 = undefined;
+            const ns = std.fmt.bufPrint(&nb, "{d}", .{s}) catch "null";
+            try out.appendSlice(a, ns);
+        } else try out.appendSlice(a, "null");
+        try out.appendSlice(a, "}}");
+
+        try self.sendHttp(stream, "200 OK", "application/json", out.items);
+    }
+
+    fn appendJsonValue(out: *std.ArrayList(u8), a: std.mem.Allocator, v: std.json.Value) !void {
+        switch (v) {
+            .null => try out.appendSlice(a, "null"),
+            .bool => |b| try out.appendSlice(a, if (b) "true" else "false"),
+            .integer => |n| {
+                var nb: [24]u8 = undefined;
+                const ns = std.fmt.bufPrint(&nb, "{d}", .{n}) catch "0";
+                try out.appendSlice(a, ns);
+            },
+            .float => |f| {
+                var nb: [32]u8 = undefined;
+                const ns = std.fmt.bufPrint(&nb, "{d}", .{f}) catch "0";
+                try out.appendSlice(a, ns);
+            },
+            .number_string => |s| try out.appendSlice(a, s),
+            .string => |s| {
+                try out.append(a, '"');
+                for (s) |ch| {
+                    switch (ch) {
+                        '"' => try out.appendSlice(a, "\\\""),
+                        '\\' => try out.appendSlice(a, "\\\\"),
+                        '\n' => try out.appendSlice(a, "\\n"),
+                        '\r' => try out.appendSlice(a, "\\r"),
+                        '\t' => try out.appendSlice(a, "\\t"),
+                        else => {
+                            if (ch < 0x20) {
+                                var eb: [8]u8 = undefined;
+                                const es = std.fmt.bufPrint(&eb, "\\u{x:0>4}", .{ch}) catch "";
+                                try out.appendSlice(a, es);
+                            } else try out.append(a, ch);
+                        },
+                    }
+                }
+                try out.append(a, '"');
+            },
+            .array => |arr2| {
+                try out.append(a, '[');
+                for (arr2.items, 0..) |item, i| {
+                    if (i > 0) try out.append(a, ',');
+                    try appendJsonValue(out, a, item);
+                }
+                try out.append(a, ']');
+            },
+            .object => |obj2| {
+                try out.append(a, '{');
+                var it2 = obj2.iterator();
+                var first2 = true;
+                while (it2.next()) |kv2| {
+                    if (!first2) try out.append(a, ',');
+                    first2 = false;
+                    try out.append(a, '"');
+                    try out.appendSlice(a, kv2.key_ptr.*);
+                    try out.appendSlice(a, "\":");
+                    try appendJsonValue(out, a, kv2.value_ptr.*);
+                }
+                try out.append(a, '}');
+            },
+        }
     }
 
     fn serve404(self: *WebAdapter, stream: std.net.Stream) !void {

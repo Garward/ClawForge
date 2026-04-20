@@ -10,15 +10,27 @@ Strategy:
 4. Maintain workflow continuity and context coherence
 """
 
+import os
 import sys
 import json
 import sqlite3
 import re
+from pathlib import Path
 from typing import Dict, List, Tuple, Set
 from datetime import datetime, timedelta
 
+def get_project_root() -> Path:
+    env = os.environ.get("CLAWFORGE_ROOT")
+    if env:
+        return Path(env)
+    # This script lives at <root>/tools/smart_context_pruner.py
+    return Path(__file__).resolve().parent.parent
+
 def get_db_path():
-    return "/home/garward/Scripts/Tools/ClawForge/data/workspace.db"
+    env = os.environ.get("CLAWFORGE_DB")
+    if env:
+        return env
+    return str(get_project_root() / "data" / "workspace.db")
 
 def estimate_tokens(text: str) -> int:
     """Rough token estimation: ~4 chars per token"""

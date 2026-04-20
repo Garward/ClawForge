@@ -1,4 +1,4 @@
-#!/home/garward/Scripts/Tools/.venv/bin/python3
+#!/usr/bin/env python3
 """
 Amazon product search tool for ClawForge.
 Uses browser_fetch.py (Playwright) to render Amazon search pages,
@@ -14,12 +14,17 @@ Output: JSON array of product results to stdout.
 
 import asyncio
 import json
+import os
 import re
 import sys
 import urllib.parse
 from html.parser import HTMLParser
 
-sys.path.insert(0, "/home/garward/Scripts/Tools")
+# browser_fetch lives outside the repo; user supplies its directory via
+# CLAWFORGE_EXTRA_PYPATH (colon-separated, like PYTHONPATH).
+for _p in filter(None, (os.environ.get("CLAWFORGE_EXTRA_PYPATH") or "").split(":")):
+    if _p and _p not in sys.path:
+        sys.path.insert(0, _p)
 from browser_fetch import BrowserFetcher, PLAYWRIGHT_AVAILABLE
 
 if PLAYWRIGHT_AVAILABLE:

@@ -1,4 +1,4 @@
-#!/home/garward/Scripts/Tools/.venv/bin/python3
+#!/usr/bin/env python3
 """
 Hybrid search tool for ClawForge.
 Combines FTS5 keyword search with vector cosine similarity via RRF merging.
@@ -12,12 +12,15 @@ Usage:
 
 import json
 import math
+import os
 import sqlite3
 import struct
 import sys
 import urllib.request
+from pathlib import Path
 
-DB_PATH = "/home/garward/Scripts/Tools/ClawForge/data/workspace.db"
+_ROOT = Path(os.environ.get("CLAWFORGE_ROOT") or Path(__file__).resolve().parent.parent)
+DB_PATH = os.environ.get("CLAWFORGE_DB") or str(_ROOT / "data" / "workspace.db")
 OLLAMA_URL = "http://127.0.0.1:11434/api/embeddings"
 EMBED_MODEL = "nomic-embed-text"
 RRF_K = 60.0  # Standard RRF constant

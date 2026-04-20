@@ -1,5 +1,6 @@
 const std = @import("std");
 const json = std.json;
+const common = @import("common");
 const registry = @import("registry.zig");
 
 pub const definition = registry.ToolDefinition{
@@ -22,7 +23,6 @@ pub const definition = registry.ToolDefinition{
     .handler = &execute,
 };
 
-const DB_PATH = "/home/garward/Scripts/Tools/ClawForge/data/workspace.db";
 
 fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult {
     if (input != .object) {
@@ -92,10 +92,14 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
 
     const query = sql orelse return .{ .content = "Failed to build query", .is_error = true };
 
+    const db_path = common.config.getDbPath(allocator) catch
+        return .{ .content = "Failed to resolve DB path", .is_error = true };
+    defer allocator.free(db_path);
+
     // Run sqlite3 with the query
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "sqlite3", "-json", "-readonly", DB_PATH, query },
+        .argv = &.{ "sqlite3", "-json", "-readonly", db_path, query },
         .max_output_bytes = 256 * 1024,
     }) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "SQLite query failed: {s}", .{@errorName(err)}) catch
@@ -121,9 +125,6 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
     return .{ .content = result.stdout, .is_error = false };
 }
 
-const SEARCH_SCRIPT = "/home/garward/Scripts/Tools/ClawForge/tools/hybrid_search.py";
-const PYTHON = "/home/garward/Scripts/Tools/.venv/bin/python3";
-
 fn executeSemanticSearch(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult {
     // Serialize input to JSON for the Python script
     var input_aw: std.Io.Writer.Allocating = .init(allocator);
@@ -132,9 +133,16 @@ fn executeSemanticSearch(allocator: std.mem.Allocator, input: json.Value) regist
     };
     const input_str = input_aw.written();
 
+    const python = common.config.getPython(allocator) catch
+        return .{ .content = "Failed to resolve python", .is_error = true };
+    defer allocator.free(python);
+    const script = common.config.getToolScript(allocator, "hybrid_search.py") catch
+        return .{ .content = "Failed to resolve search script", .is_error = true };
+    defer allocator.free(script);
+
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ PYTHON, SEARCH_SCRIPT, input_str },
+        .argv = &.{ python, script, input_str },
         .max_output_bytes = 512 * 1024,
     }) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Semantic search failed: {s}", .{@errorName(err)}) catch
@@ -156,12 +164,14 @@ fn executeSemanticSearch(allocator: std.mem.Allocator, input: json.Value) regist
     return .{ .content = result.stdout, .is_error = false };
 }
 
-const PROJECT_ROOT = "/home/garward/Scripts/Tools/ClawForge";
-
 fn executeProjectTree(allocator: std.mem.Allocator, query: ?[]const u8, limit_str: []const u8) registry.ToolResult {
     // Parse depth limit from limit_str (default 4)
     const max_depth = std.fmt.parseInt(u8, limit_str, 10) catch 4;
     const depth_str = std.fmt.allocPrint(allocator, "{d}", .{@min(max_depth, 8)}) catch "4";
+
+    const project_root = common.config.getProjectRoot(allocator) catch
+        return .{ .content = "Failed to resolve project root", .is_error = true };
+    defer allocator.free(project_root);
 
     if (query) |q| {
         // Safety: reject anything with shell metacharacters
@@ -180,7 +190,7 @@ fn executeProjectTree(allocator: std.mem.Allocator, query: ?[]const u8, limit_st
 
         if (is_subdir) {
             // Treat as subdirectory — list that subtree
-            const target = std.fmt.allocPrint(allocator, "{s}/{s}", .{ PROJECT_ROOT, q }) catch
+            const target = std.fmt.allocPrint(allocator, "{s}/{s}", .{ project_root, q }) catch
                 return .{ .content = "Path too long", .is_error = true };
 
             const result = std.process.Child.run(.{
@@ -208,13 +218,13 @@ fn executeProjectTree(allocator: std.mem.Allocator, query: ?[]const u8, limit_st
             }
 
             // Strip the project root prefix from each line for cleaner output
-            return .{ .content = stripProjectRoot(allocator, result.stdout) orelse result.stdout, .is_error = false };
+            return .{ .content = stripProjectRoot(allocator, project_root, result.stdout) orelse result.stdout, .is_error = false };
         } else {
             // Glob pattern — use find with -name
             const result = std.process.Child.run(.{
                 .allocator = allocator,
                 .argv = &.{
-                    "find", PROJECT_ROOT,
+                    "find", project_root,
                     "-maxdepth", depth_str,
                     "-name", q,
                     "-not", "-path", "*/.zig-cache/*",
@@ -234,14 +244,14 @@ fn executeProjectTree(allocator: std.mem.Allocator, query: ?[]const u8, limit_st
                 return .{ .content = "No files matching pattern", .is_error = false };
             }
 
-            return .{ .content = stripProjectRoot(allocator, result.stdout) orelse result.stdout, .is_error = false };
+            return .{ .content = stripProjectRoot(allocator, project_root, result.stdout) orelse result.stdout, .is_error = false };
         }
     } else {
         // No query — show full project tree with default depth
         const result = std.process.Child.run(.{
             .allocator = allocator,
             .argv = &.{
-                "find", PROJECT_ROOT,
+                "find", project_root,
                 "-maxdepth", depth_str,
                 "-not", "-path", "*/.zig-cache/*",
                 "-not", "-path", "*/__pycache__/*",
@@ -264,13 +274,14 @@ fn executeProjectTree(allocator: std.mem.Allocator, query: ?[]const u8, limit_st
         }
 
         // Sort the output for readability
-        return .{ .content = stripProjectRoot(allocator, result.stdout) orelse result.stdout, .is_error = false };
+        return .{ .content = stripProjectRoot(allocator, project_root, result.stdout) orelse result.stdout, .is_error = false };
     }
 }
 
-/// Strip the PROJECT_ROOT prefix from each line of find output for cleaner display.
-fn stripProjectRoot(allocator: std.mem.Allocator, raw: []const u8) ?[]const u8 {
-    const prefix = PROJECT_ROOT ++ "/";
+/// Strip the project root prefix from each line of find output for cleaner display.
+fn stripProjectRoot(allocator: std.mem.Allocator, project_root: []const u8, raw: []const u8) ?[]const u8 {
+    const prefix = std.fmt.allocPrint(allocator, "{s}/", .{project_root}) catch return null;
+    defer allocator.free(prefix);
     var out: std.ArrayList(u8) = .{};
     var iter = std.mem.splitScalar(u8, raw, '\n');
     var first = true;
@@ -280,7 +291,7 @@ fn stripProjectRoot(allocator: std.mem.Allocator, raw: []const u8) ?[]const u8 {
         first = false;
         if (std.mem.startsWith(u8, line, prefix)) {
             out.appendSlice(allocator, line[prefix.len..]) catch return null;
-        } else if (std.mem.eql(u8, line, PROJECT_ROOT)) {
+        } else if (std.mem.eql(u8, line, project_root)) {
             out.appendSlice(allocator, ".") catch return null;
         } else {
             out.appendSlice(allocator, line) catch return null;
