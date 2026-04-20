@@ -19,7 +19,7 @@
 --
 -- WORKSPACE LAYOUT (logical, within user.db namespace tree):
 --
---   garward/
+--   <user>/
 --   ├── shared/                      # Cross-project knowledge and tools
 --   │   ├── knowledge/               # Distilled insights (the knowledge table)
 --   │   └── tools/                   # Shared configs, scripts, templates
@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS namespaces (
 -- Updated via triggers when namespace tree changes
 CREATE TABLE IF NOT EXISTS namespace_paths (
     namespace_id INTEGER PRIMARY KEY REFERENCES namespaces(id) ON DELETE CASCADE,
-    full_path    TEXT NOT NULL UNIQUE,   -- "garward/cli/project-clawforge"
+    full_path    TEXT NOT NULL UNIQUE,   -- "<user>/cli/project-clawforge"
     depth        INTEGER NOT NULL        -- 0 = root user, 1 = adapter, 2+ = context
 );
 

@@ -262,10 +262,10 @@ Sends to daemon core. Adapter's job is DONE until response.
 
   Request {
     message: "If we were to learn 1 thing from...",
-    user: "garward",
+    user: "<user>",
     adapter: "cli",
     session_id: "abc-123" (or null for new),
-    interface_meta: { cwd: "/home/garward/Scripts/Tools/ClawForge" }
+    interface_meta: { cwd: "ClawForge" }
   }
 
 
@@ -906,53 +906,10 @@ EXAMPLE: Recipe request with declined tool
 
 ## Framework Intelligence vs LLM Intelligence
 
-Lesson from MO2Veteran (/home/garward/Games/Games/Mortal Online 2/MO2Veteran/):
-A hand-built expert system for a complex game achieved ~5% hallucination rate
-by guiding a smart LLM through structured data with explicit routing, citation
-requirements, and constraint enforcement. But it only works with smart models
-because the LLM does ALL the hard work (routing, formula math, constraint checking).
 
-ClawForge's job is to move that work into the framework so dumb models work too.
+ClawForge's job is to move all major LLM work into the framework so dumb models work too.
 
 ```
-WHAT THE FRAMEWORK DOES (deterministic, reliable, any model):
-═══════════════════════════════════════════════════
-
-  a) QUERY ROUTING
-     MO2Veteran: LLM reads a 183-line routing map and picks files
-     ClawForge:  Hybrid search + learned routing rules find sources
-                 Code classifies query type, not the LLM
-     WHY: A haiku model can't reliably classify 75+ question types.
-          But a database query that matches "pet points" → pets table is instant.
-
-  b) SOURCE RETRIEVAL
-     MO2Veteran: LLM reads multiple markdown/JSON files
-     ClawForge:  Framework retrieves from DB, joins across tables
-                 Context already assembled before LLM sees it
-     WHY: Dumb models skip files, misread JSON, lose track of context.
-          Framework just runs SQL queries — never misreads.
-
-  c) FORMULA EXECUTION
-     MO2Veteran: LLM does mental math with embedded formulas
-     ClawForge:  Calculator tools execute formulas, return results
-                 LLM never does math — just reports the answer
-     WHY: LLMs are bad at math. Even smart ones get formulas wrong
-          ~10% of the time. Code gets them right 100% of the time.
-
-  d) CONSTRAINT VALIDATION
-     MO2Veteran: LLM checks rules like "don't exceed pet point cap"
-     ClawForge:  Response validator checks constraints after LLM responds
-                 If response violates a stored constraint → re-prompt
-     WHY: LLMs forget constraints mid-response, especially long ones.
-          Code doesn't forget.
-
-  e) CROSS-REFERENCING
-     MO2Veteran: LLM reads 3 files and synthesizes
-     ClawForge:  Framework does the joins, gives LLM one coherent context
-                 "Here are the race stats, gift options, and build template"
-     WHY: Dumb models can't hold 3 sources in working memory.
-          Framework does the join; LLM just reads the result.
-
 
 WHAT THE LLM DOES (the part that actually needs language understanding):
 ═══════════════════════════════════════════════════
@@ -997,15 +954,15 @@ THE SPLIT:
 ```
 USER: "let's pick up where we left off on clawforge"
 ADAPTER: CLI
-CWD: /home/garward/Scripts/Tools/ClawForge
+CWD: $CLAWFORGE_ROOT
 
 REQUEST:
   {
     message: "let's pick up where we left off on clawforge",
-    user: "garward",
+    user: "<user>",
     adapter: "cli",
     session_id: null (new session),
-    interface_meta: { cwd: "/home/garward/Scripts/Tools/ClawForge" }
+    interface_meta: { cwd: "$CLAWFORGE_ROOT" }
   }
 
 SESSION RESOLUTION:
@@ -1078,7 +1035,7 @@ PROJECT: none (unattached — this is a meta question)
 REQUEST:
   {
     message: "across everything we've built, what's the one...",
-    user: "garward",
+    user: "<user>",
     adapter: "discord",
     session_id: "disc-789",
     interface_meta: { guild: "dev-server", channel: "dev-general" }
@@ -1165,7 +1122,7 @@ PROJECT: none → will create new
 REQUEST:
   {
     message: "I want to plan a 2-week trip to Japan...",
-    user: "garward",
+    user: "<user>",
     adapter: "web",
     session_id: null (new session),
     interface_meta: { browser: "firefox" }
@@ -1254,7 +1211,7 @@ PROJECT: auto-attached to "clawforge" (channel mapping)
 REQUEST:
   {
     message: "what error is this showing?",
-    user: "garward",
+    user: "<user>",
     adapter: "discord",
     session_id: "disc-456",
     attachments: [{ name: "screenshot.png", path: "/tmp/upload_abc.png",
@@ -1365,16 +1322,16 @@ WHAT CAN GO WRONG:
 ```
 USER: "delete all the old session json files in data/sessions/"
 ADAPTER: CLI
-CWD: /home/garward/Scripts/Tools/ClawForge
+CWD: $CLAWFORGE_ROOT
 PROJECT: auto-attached to "clawforge"
 
 REQUEST:
   {
     message: "delete all the old session json files in data/sessions/",
-    user: "garward",
+    user: "<user>",
     adapter: "cli",
     session_id: "cli-999",
-    interface_meta: { cwd: "/home/garward/Scripts/Tools/ClawForge" }
+    interface_meta: { cwd: "$CLAWFORGE_ROOT" }
   }
 
 SESSION RESOLUTION:

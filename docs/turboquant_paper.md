@@ -101,12 +101,12 @@ The llama.cpp TurboQuant fork (`llama.cpp-turboquant-hip`) implements **PolarQua
 
 ## Local Build
 
-Binary: `/home/garward/Scripts/Tools/llama.cpp-turboquant-hip/build-hip/bin/llama-server`
+Binary: `$LLAMA_TURBOQUANT_BUILD/bin/llama-server`
 
 Launch command:
 ```bash
 HSA_OVERRIDE_GFX_VERSION=11.0.0 \
-/home/garward/Scripts/Tools/llama.cpp-turboquant-hip/build-hip/bin/llama-server \
+$LLAMA_TURBOQUANT_BUILD/bin/llama-server \
   -m /path/to/qwen3-coder-30b-a3b-q4_k_m.gguf \
   --ctx-size 65536 \
   --cache-type-k turbo4 --cache-type-v turbo4 \
