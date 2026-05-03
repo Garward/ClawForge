@@ -107,6 +107,16 @@ pub const OpenRouterConfig = struct {
     default_model: []const u8 = "x-ai/grok-4.1-fast",
 };
 
+pub const CodexConfig = struct {
+    /// Codex (ChatGPT subscription) provider via OAuth from `~/.codex/auth.json`.
+    /// Authenticate with the Codex CLI (`codex login`) before enabling.
+    enabled: bool = false,
+    /// Path to the auth.json produced by Codex CLI. Tilde-expanded at load.
+    auth_path: []const u8 = "~/.codex/auth.json",
+    base_url: []const u8 = "https://chatgpt.com/backend-api",
+    default_model: []const u8 = "gpt-5",
+};
+
 pub const DiscordConfig = struct {
     enabled: bool = false,
     token_file: []const u8 = "",
@@ -149,6 +159,7 @@ const ConfigData = struct {
     ollama: OllamaConfig = .{},
     openai: OpenAIConfig = .{},
     openrouter: OpenRouterConfig = .{},
+    codex: CodexConfig = .{},
     discord: DiscordConfig = .{},
     context: ContextConfig = .{},
     vision: VisionConfig = .{},
@@ -166,6 +177,7 @@ pub const Config = struct {
     ollama: OllamaConfig,
     openai: OpenAIConfig,
     openrouter: OpenRouterConfig,
+    codex: CodexConfig,
     discord: DiscordConfig,
     context: ContextConfig,
     vision: VisionConfig,
@@ -183,6 +195,7 @@ pub const Config = struct {
             .ollama = .{},
             .openai = .{},
             .openrouter = .{},
+            .codex = .{},
             .discord = .{},
             .context = .{},
             .vision = .{},
@@ -229,6 +242,7 @@ pub const Config = struct {
             .ollama = parsed.value.ollama,
             .openai = parsed.value.openai,
             .openrouter = parsed.value.openrouter,
+            .codex = parsed.value.codex,
             .discord = parsed.value.discord,
             .context = parsed.value.context,
             .vision = parsed.value.vision,

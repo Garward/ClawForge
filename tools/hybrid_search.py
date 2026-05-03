@@ -60,8 +60,9 @@ def fts_search(conn: sqlite3.Connection, query: str, source_type: str | None, li
     """Run FTS5 search across messages, summaries, and knowledge."""
     results = []
 
-    # Escape FTS query (simple: wrap terms in double quotes for phrase-safe matching)
-    safe_query = query.replace('"', '""')
+    # Escape FTS query: strip apostrophes (FTS5 rejects them even when doubled),
+    # then double any embedded quotes for phrase-safe matching.
+    safe_query = query.replace("'", "").replace('"', '""')
 
     if source_type is None or source_type == "message":
         try:

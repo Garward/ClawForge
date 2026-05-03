@@ -98,6 +98,11 @@ pub const ContentBlock = union(enum) {
     image: ImageBlock,
     tool_use: ToolUseBlock,
     tool_result: ToolResultBlock,
+    /// Codex (OpenAI Responses API) reasoning item. Opaque encrypted blob the
+    /// model produces alongside text/function_calls; replaying it in the next
+    /// request preserves chain-of-thought across tool rounds. Other providers
+    /// ignore this block type.
+    reasoning: ReasoningBlock,
 
     pub const TextBlock = struct {
         text: []const u8,
@@ -120,6 +125,11 @@ pub const ContentBlock = union(enum) {
         tool_use_id: []const u8,
         content: []const u8,
         is_error: bool = false,
+    };
+
+    pub const ReasoningBlock = struct {
+        id: []const u8,
+        encrypted_content: []const u8,
     };
 };
 
@@ -202,8 +212,14 @@ pub const MessageRequest = struct {
             w.append(&out, allocator, @tagName(msg.role));
             w.append(&out, allocator, "\",\"content\":[");
 
-            for (msg.content, 0..) |block, block_idx| {
-                if (block_idx > 0) w.append(&out, allocator, ",");
+            var emitted_blocks: usize = 0;
+            for (msg.content) |block| {
+                // Anthropic doesn't accept reasoning blocks in input; skip them
+                // so the wire payload stays valid. (Codex consumes them via its
+                // own input-item emitter.)
+                if (block == .reasoning) continue;
+                if (emitted_blocks > 0) w.append(&out, allocator, ",");
+                emitted_blocks += 1;
                 switch (block) {
                     .text => |t| {
                         w.append(&out, allocator, "{\"type\":\"text\",\"text\":\"");
@@ -242,6 +258,7 @@ pub const MessageRequest = struct {
                         }
                         w.append(&out, allocator, "}");
                     },
+                    .reasoning => unreachable,
                 }
             }
             w.append(&out, allocator, "]}");
@@ -278,6 +295,14 @@ pub const ToolUseInfo = struct {
     input: std.json.Value, // Parsed input for execution
 };
 
+/// Codex-only: encrypted reasoning item emitted alongside the assistant
+/// turn. Replayed verbatim as an input item in the next request to preserve
+/// chain-of-thought across tool rounds.
+pub const ReasoningInfo = struct {
+    id: []const u8,
+    encrypted_content: []const u8,
+};
+
 pub const MessageResponse = struct {
     id: []const u8,
     model: []const u8,
@@ -285,6 +310,7 @@ pub const MessageResponse = struct {
     content: []ContentBlock,
     text_content: []const u8, // Extracted text from content blocks
     tool_use: []const ToolUseInfo, // Tool calls requested by the model
+    reasoning_items: []const ReasoningInfo = &.{},
     stop_reason: ?[]const u8,
     usage: Usage,
     /// Arena that owns all string/value memory in this response.

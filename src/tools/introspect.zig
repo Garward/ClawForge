@@ -393,14 +393,7 @@ fn buildMessageSearchQuery(allocator: std.mem.Allocator, query: ?[]const u8, rol
         "JOIN messages m ON m.rowid = fts.rowid " ++
         "WHERE messages_fts MATCH '",
     ) catch return null;
-    // Escape single quotes in search term
-    for (search_term) |ch| {
-        if (ch == '\'') {
-            parts.appendSlice(allocator, "''") catch return null;
-        } else {
-            parts.append(allocator, ch) catch return null;
-        }
-    }
+    appendFtsTerm(&parts, allocator, search_term);
     parts.appendSlice(allocator, "'") catch return null;
 
     if (role) |r| {
@@ -459,6 +452,16 @@ fn appendEscaped(parts: *std.ArrayList(u8), allocator: std.mem.Allocator, text: 
     }
 }
 
+// FTS5 rejects apostrophes in MATCH terms even when SQL-doubled, so strip them
+// entirely. Also SQL-escape any remaining single quotes (none after stripping,
+// but kept for clarity should future non-apostrophe quotes appear).
+fn appendFtsTerm(parts: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) void {
+    for (text) |ch| {
+        if (ch == '\'') continue;
+        parts.append(allocator, ch) catch return;
+    }
+}
+
 fn buildKnowledgeSearchQuery(allocator: std.mem.Allocator, query: ?[]const u8, category: ?[]const u8, limit: []const u8) ?[]const u8 {
     var parts: std.ArrayList(u8) = .{};
 
@@ -473,7 +476,7 @@ fn buildKnowledgeSearchQuery(allocator: std.mem.Allocator, query: ?[]const u8, c
             "JOIN knowledge k ON k.rowid = fts.rowid " ++
             "WHERE knowledge_fts MATCH '",
         ) catch return null;
-        appendEscaped(&parts, allocator, q);
+        appendFtsTerm(&parts, allocator, q);
         parts.appendSlice(allocator, "'") catch return null;
         if (category) |c| {
             parts.appendSlice(allocator, " AND k.category = '") catch return null;
@@ -540,7 +543,7 @@ fn buildSummarySearchQuery(allocator: std.mem.Allocator, query: ?[]const u8, dat
             "JOIN summaries s ON s.rowid = fts.rowid " ++
             "WHERE summaries_fts MATCH '",
         ) catch return null;
-        appendEscaped(&parts, allocator, q);
+        appendFtsTerm(&parts, allocator, q);
         parts.appendSlice(allocator, "'") catch return null;
     } else {
         parts.appendSlice(allocator,

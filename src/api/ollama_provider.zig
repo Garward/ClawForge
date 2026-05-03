@@ -70,6 +70,9 @@ pub const OllamaClient = struct {
                     },
                     .tool_use => |tu| char_count += tu.name.len + tu.id.len + 256,
                     .tool_result => |tr| char_count += tr.content.len + tr.tool_use_id.len + 64,
+                    // Reasoning blocks are codex-only; ollama drops them on the
+                    // wire so they don't count toward num_ctx.
+                    .reasoning => {},
                 }
             }
         }

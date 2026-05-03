@@ -70,6 +70,21 @@ pub const WebAdapter = struct {
         const self: *WebAdapter = @ptrCast(@alignCast(ptr));
         while (self.running) {
             if (self.server) |*server| {
+                // Poll first so SIGTERM-triggered stop can break us out of
+                // accept(). Closing the listening fd from another thread does
+                // not reliably wake a blocked accept on Linux.
+                var pfds = [_]std.posix.pollfd{.{
+                    .fd = server.stream.handle,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                }};
+                const ready = std.posix.poll(&pfds, 500) catch |err| {
+                    if (!self.running) return;
+                    std.log.debug("Web poll error: {}", .{err});
+                    continue;
+                };
+                if (ready == 0) continue;
+
                 const conn = server.accept() catch |err| {
                     if (!self.running) return;
                     std.log.debug("Web accept error: {}", .{err});
@@ -1334,6 +1349,28 @@ pub const WebAdapter = struct {
         if (self.engine.config.openrouter.enabled) {
             out.appendSlice(arena, ",{\"name\":\"openrouter\",\"models\":[") catch {};
             self.appendOpenRouterModels(&out, arena) catch {};
+            out.appendSlice(arena, "]}") catch {};
+        }
+
+        // Codex (ChatGPT subscription via OAuth) — static list of the
+        // models the Responses API exposes today. Free-form input is also
+        // accepted via `/model codex:<id>`.
+        if (self.engine.config.codex.enabled) {
+            const codex_models = [_][]const u8{
+                "codex:codex",
+                "codex:gpt-5",
+                "codex:gpt-5-codex",
+                "codex:gpt-5.1-codex",
+                "codex:gpt-5.1-codex-mini",
+                "codex:gpt-5.3-codex",
+            };
+            out.appendSlice(arena, ",{\"name\":\"codex\",\"models\":[") catch {};
+            for (codex_models, 0..) |m, i| {
+                if (i > 0) out.appendSlice(arena, ",") catch {};
+                out.appendSlice(arena, "\"") catch {};
+                out.appendSlice(arena, m) catch {};
+                out.appendSlice(arena, "\"") catch {};
+            }
             out.appendSlice(arena, "]}") catch {};
         }
 

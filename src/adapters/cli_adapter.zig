@@ -93,6 +93,20 @@ pub const CliAdapter = struct {
         const socket_fd = self.socket_fd orelse return;
 
         while (self.running) {
+            // Poll with timeout so SIGTERM can break us out within 500ms
+            // (posix.accept retries internally on EINTR, so we can't rely on signal alone)
+            var pfds = [_]posix.pollfd{.{
+                .fd = socket_fd,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = posix.poll(&pfds, 500) catch |err| {
+                if (!self.running) break;
+                std.log.err("Poll failed: {}", .{err});
+                continue;
+            };
+            if (ready == 0) continue;
+
             var client_addr: posix.sockaddr.un = undefined;
             var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.un);
 
@@ -120,6 +134,20 @@ pub const CliAdapter = struct {
 
     fn handleClient(self: *CliAdapter, client_fd: posix.socket_t) !void {
         while (self.running) {
+            // Wait for incoming data with timeout, so SIGTERM can break us
+            // out of an idle keep-alive client (e.g. discord bridge connected
+            // but not sending). Bare readExact would block indefinitely.
+            var pfds = [_]posix.pollfd{.{
+                .fd = client_fd,
+                .events = posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = posix.poll(&pfds, 500) catch |err| {
+                if (!self.running) break;
+                return err;
+            };
+            if (ready == 0) continue;
+
             // Read length prefix
             var len_buf: [4]u8 = undefined;
             readExact(client_fd, &len_buf) catch |err| {

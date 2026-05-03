@@ -583,6 +583,7 @@ pub const Engine = struct {
         adapter_context: ?[]const u8,
         user_message: ?[]const u8,
         retrieval_query: ?[]const u8,
+        active_subagents_layer: ?[]const u8,
     ) ![]const u8 {
         var layers = try prompt_mod.buildFromState(
             self.allocator,
@@ -591,6 +592,7 @@ pub const Engine = struct {
             session_system_prompt,
             adapter_context,
         );
+        layers.active_subagents = active_subagents_layer;
 
         // Layer 3.5: Active plan — load from session DB and inject.
         // This survives compaction because it's rebuilt from the DB each turn.
@@ -953,8 +955,9 @@ pub const Engine = struct {
         // task is a machine-generated instruction from the dispatcher, not
         // a real user turn, and persisting it pollutes the dispatcher's
         // session history with directive boilerplate.
+        var user_msg_id: ?i64 = null;
         if (!chat_req.is_subagent) {
-            _ = self.message_store.addUserMessage(&sess.id, chat_req.message) catch {
+            user_msg_id = self.message_store.addUserMessage(&sess.id, chat_req.message) catch {
                 return .{ .response = .{ .error_resp = .{
                     .code = "MESSAGE_ERROR",
                     .message = "Failed to add message",
@@ -1147,12 +1150,24 @@ pub const Engine = struct {
         // FTS query. The dispatcher (the actual user-facing turn) is where
         // memory injection matters.
         const retrieval_query: ?[]const u8 = if (chat_req.is_subagent) null else chat_req.message;
+
+        // Active subagents layer: dispatcher only. Auto-injects per-session
+        // status of background jobs spawned via summon_subagent so the
+        // dispatcher can answer "how's that going" without tool-calling.
+        const active_subagents_layer: ?[]const u8 = blk_sa: {
+            if (chat_req.is_subagent) break :blk_sa null;
+            const wp = self.worker_pool orelse break :blk_sa null;
+            break :blk_sa wp.formatActiveSubagentsLayer(self.allocator, &sess.id);
+        };
+        defer if (active_subagents_layer) |s| self.allocator.free(s);
+
         const system_prompt: ?[]const u8 = self.buildSystemPrompt(
             &sess.id,
             sess.system_prompt,
             effective_adapter_context,
             chat_req.message,
             retrieval_query,
+            active_subagents_layer,
         ) catch sess.system_prompt;
 
         var owned_tool_defs: std.ArrayList([]const api.messages.ToolDefinition) = .{};
@@ -1162,8 +1177,9 @@ pub const Engine = struct {
         }
 
         // Subagents (confirmer != null) must not recursively summon more
-        // subagents — nested job IDs aren't tracked by adapters, so results
-        // get orphaned. Strip summon_subagent from their tool set.
+        // subagents or manage other subagents — nested job IDs aren't tracked
+        // by adapters and stop/redirect from a child would race with the
+        // dispatcher. Strip the entire subagent-control set from their tools.
         const is_subagent = confirmer != null;
 
         // Tool selection: allowed_tools filter > all enabled tools
@@ -1171,16 +1187,20 @@ pub const Engine = struct {
             var names: [32][]const u8 = undefined;
             var count: usize = 0;
             var iter = std.mem.splitScalar(u8, at, ',');
-            while (iter.next()) |name| {
+            outer: while (iter.next()) |name| {
                 const trimmed = std.mem.trim(u8, name, " ");
                 if (trimmed.len == 0 or count >= 32) continue;
-                if (is_subagent and std.mem.eql(u8, trimmed, "summon_subagent")) continue;
+                if (is_subagent) {
+                    for (tools.ToolRegistry.SUBAGENT_HIDDEN_TOOLS) |hidden| {
+                        if (std.mem.eql(u8, trimmed, hidden)) continue :outer;
+                    }
+                }
                 names[count] = trimmed;
                 count += 1;
             }
             break :blk if (count > 0) self.tool_registry.getToolDefinitionsFiltered(names[0..count]) else null;
         } else if (is_subagent)
-            self.tool_registry.getToolDefinitionsExcluding("summon_subagent")
+            self.tool_registry.getToolDefinitionsExcludingMany(&tools.ToolRegistry.SUBAGENT_HIDDEN_TOOLS)
         else
             self.tool_registry.getToolDefinitions();
 
@@ -1312,6 +1332,9 @@ pub const Engine = struct {
         }
 
         var cancelled = false;
+        var stopped_by_dispatcher = false;
+        var stop_reason_buf: [80]u8 = undefined;
+        var stop_reason_len: usize = 0;
         var tool_round: usize = 0;
         while (tool_round < 100) : (tool_round += 1) {
             // Check if the client disconnected (SSE write failed)
@@ -1320,6 +1343,68 @@ pub const Engine = struct {
                     std.log.info("Stream cancelled by client at tool round {d}", .{tool_round});
                     cancelled = true;
                     break;
+                }
+            }
+
+            // Subagent cooperative stop: dispatcher invoked subagent_stop.
+            // Polled at the round boundary so the subagent emits accumulated
+            // state instead of being killed mid-API-call.
+            if (is_subagent) {
+                if (self.worker_pool) |wp| {
+                    if (wp.active_job_id) |jid_val| {
+                        if (wp.isSubagentStopRequested(&jid_val)) {
+                            std.log.info("Subagent stop requested by dispatcher at tool round {d} — halting", .{tool_round});
+                            cancelled = true;
+                            stopped_by_dispatcher = true;
+                            if (wp.getSubagent(&jid_val)) |rec| {
+                                const r = rec.stopReasonSlice();
+                                const n = @min(r.len, stop_reason_buf.len);
+                                @memcpy(stop_reason_buf[0..n], r[0..n]);
+                                stop_reason_len = n;
+                            }
+                            break;
+                        }
+
+                        // Pending redirect: append a synthetic user message at
+                        // this seam so the next API call sees the new directive.
+                        var redirect_buf: [512]u8 = undefined;
+                        const redirect_len = wp.consumeSubagentRedirect(&jid_val, &redirect_buf);
+                        if (redirect_len > 0) {
+                            const wrapped = std.fmt.allocPrint(
+                                self.allocator,
+                                "=== URGENT REDIRECT FROM YOUR DISPATCHER ===\n" ++
+                                    "Your previous instructions are SUPERSEDED. Stop whatever you were doing. " ++
+                                    "Discard the original task plan. Do NOT continue the prior work. " ++
+                                    "Your new and ONLY task is below — follow it exactly:\n\n" ++
+                                    "{s}\n\n" ++
+                                    "=== END REDIRECT ===\n" ++
+                                    "Acknowledge briefly, then execute the new task. Do not return to the old one.",
+                                .{redirect_buf[0..redirect_len]},
+                            ) catch null;
+                            if (wrapped) |wtext| {
+                                const text_block = self.allocator.alloc(api.messages.ContentBlock, 1) catch null;
+                                if (text_block) |tb| {
+                                    tb[0] = .{ .text = .{ .text = wtext } };
+                                    const prev = current_request.messages;
+                                    const extended = self.allocator.alloc(api.messages.Message, prev.len + 1) catch null;
+                                    if (extended) |ex| {
+                                        @memcpy(ex[0..prev.len], prev);
+                                        ex[prev.len] = .{ .role = .user, .content = tb };
+                                        current_request.messages = ex;
+                                        std.log.info(
+                                            "Subagent redirect injected at tool round {d}: {d} chars",
+                                            .{ tool_round, redirect_len },
+                                        );
+                                    } else {
+                                        self.allocator.free(wtext);
+                                        self.allocator.free(tb);
+                                    }
+                                } else {
+                                    self.allocator.free(wtext);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1410,10 +1495,19 @@ pub const Engine = struct {
             // Build messages for next API round: assistant(tool_use) → user(tool_results)
             // Execute each tool, emit events, record in DB, and build result messages.
             {
-                // Assistant message: text preamble + tool_use blocks
+                // Assistant message: text preamble + reasoning items + tool_use blocks.
+                // Reasoning items are codex-only encrypted blobs; replaying them in
+                // the next request preserves chain-of-thought across tool rounds.
+                // Other providers' serializers skip the .reasoning variant.
                 var assistant_blocks: std.ArrayList(api.messages.ContentBlock) = .{};
                 if (api_response.text_content.len > 0) {
                     assistant_blocks.append(self.allocator, .{ .text = .{ .text = api_response.text_content } }) catch {};
+                }
+                for (api_response.reasoning_items) |r| {
+                    assistant_blocks.append(self.allocator, .{ .reasoning = .{
+                        .id = r.id,
+                        .encrypted_content = r.encrypted_content,
+                    } }) catch {};
                 }
                 for (api_response.tool_use) |tu| {
                     assistant_blocks.append(self.allocator, .{ .tool_use = .{
@@ -1503,6 +1597,9 @@ pub const Engine = struct {
                                 .content = tool_call.input_json,
                                 .timestamp = std.time.timestamp(),
                             });
+                            if (wp.active_job_id) |jid_val| {
+                                wp.markSubagentLastTool(&jid_val, tool_call.name);
+                            }
                         }
                     }
 
@@ -1564,6 +1661,15 @@ pub const Engine = struct {
                     } else if (std.mem.eql(u8, tool_call.name, "summon_subagent")) blk: {
                         std.log.info("Special tool: summon_subagent", .{});
                         break :blk self.handleSummonSubagent(tool_call.input, &sess.id, &spawned_subagent_ids, model, chat_req.allowed_tools);
+                    } else if (std.mem.eql(u8, tool_call.name, "subagent_inspect")) blk: {
+                        std.log.info("Special tool: subagent_inspect", .{});
+                        break :blk self.handleSubagentInspect(tool_call.input, &sess.id);
+                    } else if (std.mem.eql(u8, tool_call.name, "subagent_stop")) blk: {
+                        std.log.info("Special tool: subagent_stop", .{});
+                        break :blk self.handleSubagentStop(tool_call.input, &sess.id);
+                    } else if (std.mem.eql(u8, tool_call.name, "subagent_redirect")) blk: {
+                        std.log.info("Special tool: subagent_redirect", .{});
+                        break :blk self.handleSubagentRedirect(tool_call.input, &sess.id);
                     } else if (std.mem.eql(u8, tool_call.name, "file_diff") and
                         !fileDiffHasBeenRead(tool_call.input, &read_paths)) blk:
                     {
@@ -1747,13 +1853,17 @@ pub const Engine = struct {
                 }
 
                 current_request.messages = extended;
-                current_request.tools = self.selectFollowupToolDefinitions(chat_req.message, api_response.tool_use);
+                current_request.tools = self.selectFollowupToolDefinitions(chat_req.message, api_response.tool_use, is_subagent);
                 if (current_request.tools) |defs| {
                     owned_tool_defs.append(self.allocator, defs) catch {};
                 }
                 // Keep persona/system flavor on the initial user-facing round only.
                 // Intermediate tool-work rounds should focus on the task state, not chat style.
-                current_request.system = null;
+                // Exception: codex (OpenAI Responses API) requires `instructions` on every
+                // request — dropping it returns 400 "Instructions are required".
+                if (!std.mem.eql(u8, active_provider.getName(), "codex")) {
+                    current_request.system = null;
+                }
                 // Keep streaming enabled so tool use progress is visible to the user.
                 // current_request.stream stays as-is (true if emitter present).
             }
@@ -1762,10 +1872,25 @@ pub const Engine = struct {
         if (cancelled) {
             final_stop_reason = "cancelled";
             // Append cancellation note so the stored message is self-documenting
+            const stopped_note: []const u8 = if (stopped_by_dispatcher) blk: {
+                if (stop_reason_len > 0) {
+                    break :blk std.fmt.allocPrint(
+                        self.allocator,
+                        "[Subagent stopped by dispatcher: {s}]",
+                        .{stop_reason_buf[0..stop_reason_len]},
+                    ) catch "[Subagent stopped by dispatcher]";
+                }
+                break :blk "[Subagent stopped by dispatcher]";
+            } else "[Response stopped by user]";
+            const stopped_note_in_run: []const u8 = if (stopped_by_dispatcher)
+                "[Subagent stopped by dispatcher during tool execution]"
+            else
+                "[Response stopped by user during tool execution]";
             if (text_parts.items.len > 0) {
-                text_parts.appendSlice(self.allocator, "\n\n[Response stopped by user]") catch {};
+                text_parts.appendSlice(self.allocator, "\n\n") catch {};
+                text_parts.appendSlice(self.allocator, stopped_note) catch {};
             } else if (tool_log.items.len > 0) {
-                text_parts.appendSlice(self.allocator, "[Response stopped by user during tool execution]") catch {};
+                text_parts.appendSlice(self.allocator, stopped_note_in_run) catch {};
             }
         }
 
@@ -1817,7 +1942,7 @@ pub const Engine = struct {
         } else final_text;
 
         // Store assistant response in DB
-        _ = self.message_store.addAssistantMessage(
+        const assistant_msg_id: ?i64 = self.message_store.addAssistantMessage(
             &sess.id,
             stored_text,
             model,
@@ -1825,12 +1950,13 @@ pub const Engine = struct {
             null,
             @as(?i64, @intCast(total_input_tokens)),
             @as(?i64, @intCast(total_output_tokens)),
-        ) catch |err| {
+        ) catch |err| blk: {
             std.log.warn("Failed to save assistant message: {}", .{err});
+            break :blk null;
         };
 
         // POST-RESPONSE HOOKS
-        self.postResponseHooks(&sess.id, chat_req.message, final_text);
+        self.postResponseHooks(&sess.id, chat_req.message, final_text, user_msg_id, assistant_msg_id);
 
         // Dupe model string before freeing session info (model may alias sess.model)
         const result_model = self.allocator.dupe(u8, model) catch "unknown";
@@ -2156,6 +2282,262 @@ pub const Engine = struct {
         _ = stmt.step() catch return;
     }
 
+    /// Parse a job_id string from a tool input object. Returns the [36]u8 array
+    /// or null with an error message in `err_out` (which is a static string).
+    fn parseJobIdInput(input: std.json.Value, err_out: *[]const u8) ?[36]u8 {
+        if (input != .object) {
+            err_out.* = "input must be an object with a job_id field";
+            return null;
+        }
+        const jid_val = input.object.get("job_id") orelse {
+            err_out.* = "missing required 'job_id' field";
+            return null;
+        };
+        if (jid_val != .string or jid_val.string.len != 36) {
+            err_out.* = "'job_id' must be a 36-character UUID string";
+            return null;
+        }
+        var jid: [36]u8 = undefined;
+        @memcpy(&jid, jid_val.string[0..36]);
+        return jid;
+    }
+
+    /// Handle a subagent_inspect tool call. Read-only view of subagent state.
+    fn handleSubagentInspect(
+        self: *Engine,
+        input: std.json.Value,
+        parent_session_id: *const [36]u8,
+    ) tools.ToolResult {
+        const wp = self.worker_pool orelse return .{
+            .content = "subagent_inspect unavailable: no worker pool configured",
+            .is_error = true,
+        };
+
+        var err: []const u8 = "";
+        const job_id = parseJobIdInput(input, &err) orelse return .{
+            .content = std.fmt.allocPrint(self.allocator, "subagent_inspect: {s}", .{err}) catch err,
+            .is_error = true,
+        };
+
+        const rec = wp.getSubagent(&job_id) orelse return .{
+            .content = "subagent_inspect: no subagent with that job_id (it may have been evicted from the registry).",
+            .is_error = true,
+        };
+
+        // Scope check: only allow inspecting subagents spawned in this session.
+        if (!std.mem.eql(u8, &rec.parent_session_id, parent_session_id)) {
+            return .{
+                .content = "subagent_inspect: that job_id belongs to a different session. You can only inspect subagents you spawned.",
+                .is_error = true,
+            };
+        }
+
+        const depth: []const u8 = blk: {
+            if (input.object.get("depth")) |d| {
+                if (d == .string) break :blk d.string;
+            }
+            break :blk "summary";
+        };
+
+        if (std.mem.eql(u8, depth, "summary")) {
+            const txt = wp.formatSubagentSummary(self.allocator, &job_id) orelse return .{
+                .content = "subagent_inspect: failed to format summary",
+                .is_error = true,
+            };
+            return .{ .content = txt };
+        }
+
+        if (std.mem.eql(u8, depth, "full")) {
+            // If a final result is stored, return that. Otherwise return current
+            // status + tool count + brief.
+            if (wp.getBackgroundResult(&job_id)) |res| {
+                const status_str = switch (res.status) {
+                    .completed => "completed",
+                    .failed => "failed",
+                    .cancelled => "cancelled",
+                };
+                const body = res.text orelse "(no output)";
+                const max_body: usize = 4096;
+                const body_trimmed = if (body.len > max_body) body[0..max_body] else body;
+                const truncation_note: []const u8 = if (body.len > max_body) "\n…[truncated]" else "";
+                const out = std.fmt.allocPrint(
+                    self.allocator,
+                    "Subagent {s} {s} (mode={s}). Final result:\n\n{s}{s}",
+                    .{ job_id[0..8], status_str, if (rec.is_explore) "explore" else "execute", body_trimmed, truncation_note },
+                ) catch "Subagent inspect (full): allocation failed.";
+                return .{ .content = out };
+            }
+            // Still running — surface current state.
+            const events = wp.getToolEvents(&job_id, 0);
+            const summary = wp.formatSubagentSummary(self.allocator, &job_id) orelse "(no summary)";
+            defer if (!std.mem.eql(u8, summary, "(no summary)")) self.allocator.free(summary);
+            const out = std.fmt.allocPrint(
+                self.allocator,
+                "Subagent {s} not yet complete. {d} tool events recorded so far.\n\n{s}",
+                .{ job_id[0..8], events.events.len, summary },
+            ) catch "Subagent inspect (full): allocation failed.";
+            return .{ .content = out };
+        }
+
+        if (std.mem.eql(u8, depth, "tools")) {
+            const events = wp.getToolEvents(&job_id, 0);
+            var buf: std.ArrayList(u8) = .{};
+            defer buf.deinit(self.allocator);
+            const w = buf.writer(self.allocator);
+            w.print("Subagent {s} tool history ({d} events):\n", .{ job_id[0..8], events.events.len }) catch {};
+            const max_events: usize = 64;
+            const max_content_per_event: usize = 400;
+            for (events.events, 0..) |maybe_ev, i| {
+                if (i >= max_events) {
+                    w.writeAll("…[older events truncated]\n") catch {};
+                    break;
+                }
+                const ev = maybe_ev orelse continue;
+                const kind: []const u8 = switch (ev.event_type) {
+                    .tool_use => "→ tool_use",
+                    .tool_result => "← tool_result",
+                };
+                const err_tag: []const u8 = if (ev.is_error) " [error]" else "";
+                const content = if (ev.content.len > max_content_per_event)
+                    ev.content[0..max_content_per_event]
+                else
+                    ev.content;
+                w.print("{s} {s}{s}: {s}\n", .{ kind, ev.tool_name, err_tag, content }) catch {};
+            }
+            const owned = self.allocator.dupe(u8, buf.items) catch return .{
+                .content = "subagent_inspect (tools): allocation failed",
+                .is_error = true,
+            };
+            return .{ .content = owned };
+        }
+
+        return .{
+            .content = "subagent_inspect: 'depth' must be one of: summary, full, tools.",
+            .is_error = true,
+        };
+    }
+
+    /// Handle a subagent_stop tool call. Cooperative — flips a flag the engine's
+    /// round loop polls between rounds. The subagent emits accumulated state.
+    fn handleSubagentStop(
+        self: *Engine,
+        input: std.json.Value,
+        parent_session_id: *const [36]u8,
+    ) tools.ToolResult {
+        const wp = self.worker_pool orelse return .{
+            .content = "subagent_stop unavailable: no worker pool configured",
+            .is_error = true,
+        };
+
+        var err: []const u8 = "";
+        const job_id = parseJobIdInput(input, &err) orelse return .{
+            .content = std.fmt.allocPrint(self.allocator, "subagent_stop: {s}", .{err}) catch err,
+            .is_error = true,
+        };
+
+        const rec = wp.getSubagent(&job_id) orelse return .{
+            .content = "subagent_stop: no subagent with that job_id",
+            .is_error = true,
+        };
+        if (!std.mem.eql(u8, &rec.parent_session_id, parent_session_id)) {
+            return .{
+                .content = "subagent_stop: that job_id belongs to a different session",
+                .is_error = true,
+            };
+        }
+        if (rec.status == .completed or rec.status == .failed or rec.status == .stopped) {
+            return .{
+                .content = "subagent_stop: subagent has already finished. Use subagent_inspect(depth='full') to see its result.",
+            };
+        }
+
+        const reason: []const u8 = blk: {
+            if (input.object.get("reason")) |r| {
+                if (r == .string and r.string.len > 0) break :blk r.string;
+            }
+            break :blk "(no reason provided)";
+        };
+
+        if (!wp.requestSubagentStop(&job_id, reason)) {
+            return .{
+                .content = "subagent_stop: registry no longer tracks this job",
+                .is_error = true,
+            };
+        }
+
+        const out = std.fmt.allocPrint(
+            self.allocator,
+            "OK. Stop requested for subagent {s}; it will halt at its next round boundary. Reason recorded: {s}. " ++
+                "This call SUCCEEDED — do NOT call subagent_stop again for this job_id. " ++
+                "Do NOT poll. End your turn or proceed to the next user request. " ++
+                "If you want the final state once it halts, call subagent_inspect once with depth='full' (not subagent_stop).",
+            .{ job_id[0..8], reason },
+        ) catch "OK. Stop queued. Do not call subagent_stop again for this job.";
+        return .{ .content = out };
+    }
+
+    /// Handle a subagent_redirect tool call. Queues a new instruction the
+    /// subagent's chat loop consumes at the next round boundary.
+    fn handleSubagentRedirect(
+        self: *Engine,
+        input: std.json.Value,
+        parent_session_id: *const [36]u8,
+    ) tools.ToolResult {
+        const wp = self.worker_pool orelse return .{
+            .content = "subagent_redirect unavailable: no worker pool configured",
+            .is_error = true,
+        };
+
+        var err: []const u8 = "";
+        const job_id = parseJobIdInput(input, &err) orelse return .{
+            .content = std.fmt.allocPrint(self.allocator, "subagent_redirect: {s}", .{err}) catch err,
+            .is_error = true,
+        };
+
+        const rec = wp.getSubagent(&job_id) orelse return .{
+            .content = "subagent_redirect: no subagent with that job_id",
+            .is_error = true,
+        };
+        if (!std.mem.eql(u8, &rec.parent_session_id, parent_session_id)) {
+            return .{
+                .content = "subagent_redirect: that job_id belongs to a different session",
+                .is_error = true,
+            };
+        }
+        if (rec.status == .completed or rec.status == .failed or rec.status == .stopped) {
+            return .{
+                .content = "subagent_redirect: subagent has already finished. Spawn a new one with summon_subagent.",
+            };
+        }
+
+        const new_instruction: []const u8 = blk: {
+            if (input.object.get("new_instruction")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            return .{
+                .content = "subagent_redirect: missing required 'new_instruction' (non-empty string).",
+                .is_error = true,
+            };
+        };
+
+        if (!wp.queueSubagentRedirect(&job_id, new_instruction)) {
+            return .{
+                .content = "subagent_redirect: registry no longer tracks this job",
+                .is_error = true,
+            };
+        }
+
+        const out = std.fmt.allocPrint(
+            self.allocator,
+            "OK. Redirect for subagent {s} is queued and will fire at its next round boundary. " ++
+                "This call SUCCEEDED — do NOT call subagent_redirect again for this job_id. " ++
+                "Do NOT poll. End your turn or proceed to the next user request. " ++
+                "If you want to verify the redirect was consumed, call subagent_inspect once with depth='full' (not subagent_redirect).",
+            .{job_id[0..8]},
+        ) catch "OK. Redirect queued. Do not call subagent_redirect again for this job.";
+        return .{ .content = out };
+    }
+
     /// Handle a summon_subagent tool call by enqueueing a BackgroundChatJob.
     /// The subagent inherits the parent's session so it sees the same persona/history,
     /// and inherits the parent's model string (including any `provider:` prefix) so
@@ -2301,6 +2683,16 @@ pub const Engine = struct {
                 \\bash (for grep/find/cat/ls/head/tail only — do NOT use destructive commands),
                 \\and introspect. You do NOT have file_write, file_diff, or summon_subagent.
                 \\
+                \\
+            ) catch {};
+
+            if (prompt_mod.buildEnvironmentBlock(self.allocator)) |env_block| {
+                defer self.allocator.free(env_block);
+                w.print("--- Environment ---\n{s}\n", .{env_block}) catch {};
+            } else |_| {}
+
+            w.writeAll(
+                \\
                 \\HARD RULES:
                 \\1. Your FIRST response MUST contain a tool_use block. No text-only replies.
                 \\2. Do recon passes. If initial findings point you elsewhere, follow the lead.
@@ -2334,6 +2726,9 @@ pub const Engine = struct {
                 \\   then emit the JSON.
                 \\6. If you can't find something, say so in invariants/confidence — do not
                 \\   fabricate.
+                \\7. When using introspect semantic_search, ALWAYS pass source_type='knowledge'
+                \\   or 'summary'. The default retrieves recent conversation messages, which
+                \\   include this dispatch and your own announcement — useless for code recon.
                 \\
                 \\
             ) catch {};
@@ -2367,6 +2762,16 @@ pub const Engine = struct {
                 \\You are an autonomous file/code/shell worker. You are NOT the
                 \\dispatcher. Ignore any chat-style patterns from prior conversation.
                 \\
+                \\
+            ) catch {};
+
+            if (prompt_mod.buildEnvironmentBlock(self.allocator)) |env_block| {
+                defer self.allocator.free(env_block);
+                w.print("--- Environment ---\n{s}\n", .{env_block}) catch {};
+            } else |_| {}
+
+            w.writeAll(
+                \\
                 \\HARD RULES:
                 \\1. Your FIRST response MUST contain a tool_use block. No text-only replies.
                 \\2. NEVER write "Let me...", "I'll...", "Dispatching...", "Firing off...",
@@ -2377,7 +2782,32 @@ pub const Engine = struct {
                 \\5. Call `plan` with operation "update" to mark your step "done" and
                 \\   include a "notes" field with key findings/paths/gotchas so later
                 \\   subagents inherit context.
+                \\6. Treat target_files, known_facts, constraints, out_of_scope, and
+                \\   acceptance as the source of truth for this job. Do NOT invent
+                \\   missing context from chat history.
+                \\7. If a tool fails, is blocked, or returns empty data, you have NO
+                \\   result from that tool. Do not pretend it worked. Try another
+                \\   path or report the blocker plainly.
+                \\8. Default execution loop: read the relevant files first, make the
+                \\   smallest change that satisfies the task, then verify against the
+                \\   acceptance criteria before declaring completion.
+                \\9. Do not ask the user questions unless you are truly blocked and
+                \\   the brief/current files cannot answer them. Prefer inference from
+                \\   the brief, plan, and repository over bouncing the task back.
+                \\10. Resist scope creep. If you notice unrelated issues, mention them
+                \\    in the final report but do not fix them unless required by the
+                \\    task or acceptance criteria.
+                \\11. When using introspect semantic_search, ALWAYS pass source_type='knowledge'
+                \\    or 'summary'. The default retrieves recent conversation messages,
+                \\    including this dispatch — useless for code work.
                 \\
+                \\TOOL PRIORITY:
+                \\- Use the best tool for the immediate need, not the loudest one.
+                \\- Read/inspect first: file_read, introspect, safe bash.
+                \\- Mutate only after you've seen the real file contents.
+                \\- Prefer the minimum number of tool calls needed to finish well.
+                \\- When acceptance mentions build/test behavior, verify it with the
+                \\  relevant tool or command instead of assuming the change works.
                 \\
             ) catch {};
 
@@ -2459,6 +2889,17 @@ pub const Engine = struct {
             if (acceptance_val) |a| {
                 w.print("--- ACCEPTANCE (you are done when) ---\n{s}\n", .{a}) catch {};
             }
+
+            w.writeAll(
+                \\
+                \\--- FINAL REPORT FORMAT ---
+                \\Return a terse factual summary covering:
+                \\- what changed
+                \\- which files/commands were involved
+                \\- how you verified the acceptance criteria
+                \\- any remaining risk or blocker
+                \\
+            ) catch {};
         }
 
         // Explore cache lookup: only applies when the caller passed target_files
@@ -2549,6 +2990,8 @@ pub const Engine = struct {
             self.registerPendingExploreCache(&job_id, ck, task_dup, tf_dup);
         }
 
+        wp.registerSubagent(&job_id, parent_session_id, is_explore, task_val.string);
+
         wp.enqueueBackgroundChat(.{
             .job_id = job_id,
             .message = wrapped_task,
@@ -2618,6 +3061,8 @@ pub const Engine = struct {
         session_id: *const [36]u8,
         user_message: []const u8,
         assistant_response: []const u8,
+        user_msg_id: ?i64,
+        assistant_msg_id: ?i64,
     ) void {
         if (self.worker_pool) |wp| {
             // ASYNC PATH — enqueue work items, return immediately.
@@ -2636,10 +3081,19 @@ pub const Engine = struct {
                 wp.enqueueExtract(session_id.*, user_message, assistant_response);
             }
 
-            // Hook 4: Embed the assistant response for future semantic search
-            // (user message gets embedded too, but by the message store hook)
-            if (assistant_response.len > 50) {
-                wp.enqueueEmbed("message", 0, assistant_response, null);
+            // Hook 4: Embed both sides of the exchange for future semantic search.
+            // Each embedding row is keyed by the messages.id rowid so the
+            // UNIQUE(source_type, source_id) constraint doesn't collapse every
+            // message into a single overwritten slot.
+            if (user_msg_id) |uid| {
+                if (user_message.len > 50) {
+                    wp.enqueueEmbed("message", uid, user_message, null);
+                }
+            }
+            if (assistant_msg_id) |aid| {
+                if (assistant_response.len > 50) {
+                    wp.enqueueEmbed("message", aid, assistant_response, null);
+                }
             }
         } else {
             // SYNC FALLBACK — call workers directly (blocks the response).
@@ -3010,6 +3464,12 @@ pub const Engine = struct {
             "claude-haiku-3-5-20241022    (fast, cheap)",
             "claude-sonnet-4-20250514     (default, coding)",
             "claude-opus-4-20250514       (smart, architecture)",
+            "codex:codex                  (ChatGPT subscription, default)",
+            "codex:gpt-5                  (ChatGPT subscription)",
+            "codex:gpt-5-codex            (ChatGPT subscription, coding)",
+            "codex:gpt-5.1-codex          (ChatGPT subscription, coding)",
+            "codex:gpt-5.1-codex-mini     (ChatGPT subscription, fast)",
+            "codex:gpt-5.3-codex          (ChatGPT subscription, latest)",
         };
         return .{ .response = .{ .model_list = models } };
     }
@@ -3324,6 +3784,7 @@ pub const Engine = struct {
         self: *Engine,
         user_message: []const u8,
         tool_uses: []const api.messages.ToolUseInfo,
+        is_subagent: bool,
     ) ?[]const api.messages.ToolDefinition {
         var names: [12][]const u8 = undefined;
         var count: usize = 0;
@@ -3354,6 +3815,16 @@ pub const Engine = struct {
                 addToolName(&names, &count, "bash");
                 addToolName(&names, &count, "file_read");
                 addToolName(&names, &count, "file_diff");
+            } else if (std.mem.eql(u8, tool_use.name, "plan")) {
+                // After planning, the dispatcher's natural next moves are to
+                // delegate the work (summon_subagent) or do quick verification
+                // reads itself. Without these companions the model lands in
+                // round 1 with only [calc, introspect, plan] and reports it
+                // "doesn't have summon_subagent" — even though the schema was
+                // present in round 0.
+                if (!is_subagent) addToolName(&names, &count, "summon_subagent");
+                addToolName(&names, &count, "file_read");
+                addToolName(&names, &count, "bash");
             }
         }
 
@@ -3477,6 +3948,7 @@ fn estimateMessageChars(messages: []const api.messages.Message) usize {
                 // Input is structured JSON here, so this is only a rough size estimate for logging.
                 .tool_use => |tool_use| total += tool_use.id.len + tool_use.name.len + 64,
                 .tool_result => |tool_result| total += tool_result.tool_use_id.len + tool_result.content.len,
+                .reasoning => |r| total += r.encrypted_content.len + r.id.len,
             }
         }
     }

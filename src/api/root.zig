@@ -5,6 +5,8 @@ pub const provider = @import("provider.zig");
 pub const anthropic_provider = @import("anthropic_provider.zig");
 pub const ollama_provider = @import("ollama_provider.zig");
 pub const openai_provider = @import("openai_provider.zig");
+pub const codex_oauth = @import("codex_oauth.zig");
+pub const codex_provider = @import("codex_provider.zig");
 
 pub const AnthropicClient = anthropic.AnthropicClient;
 pub const StreamHandler = anthropic.StreamHandler;
@@ -17,3 +19,5 @@ pub const Provider = provider.Provider;
 pub const ProviderRegistry = provider.ProviderRegistry;
 pub const OllamaClient = ollama_provider.OllamaClient;
 pub const OpenAIClient = openai_provider.OpenAIClient;
+pub const CodexClient = codex_provider.CodexClient;
+pub const CodexAuthStore = codex_oauth.Store;

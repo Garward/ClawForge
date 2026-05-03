@@ -204,7 +204,7 @@ pub const Statement = struct {
 pub const Database = struct {
     conn: Connection,
     allocator: std.mem.Allocator,
-    path: []const u8,
+    path: [:0]const u8,
     /// Extra connections vended to worker threads. Cleaned up on deinit.
     extra_conns: std.ArrayList(Connection),
 
@@ -233,7 +233,7 @@ pub const Database = struct {
     /// The returned connection has WAL pragmas applied and is safe for concurrent use.
     /// Caller does NOT need to close it — Database.deinit() handles cleanup.
     pub fn openConnection(self: *Database) !*Connection {
-        var conn = try Connection.open(@ptrCast(self.path.ptr));
+        var conn = try Connection.open(self.path.ptr);
         errdefer conn.close();
         try conn.applyPragmas();
         try self.extra_conns.append(self.allocator, conn);

@@ -523,6 +523,9 @@ pub fn buildChatCompletionsBodyEx(
                 .image => |img| try image_blocks.append(arena, img),
                 .tool_use => |tu| try tool_use_blocks.append(arena, tu),
                 .tool_result => |tr| try tool_result_blocks.append(arena, tr),
+                // Reasoning blocks are codex-only; the chat-completions wire
+                // doesn't carry them.
+                .reasoning => {},
             }
         }
 

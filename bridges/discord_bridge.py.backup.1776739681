@@ -667,21 +667,6 @@ class ClawForgeBridge(discord.Client):
             log.warning("Pillow preprocess failed for %s: %s", raw_path.name, e)
             return None, ""
 
-    async def _pulse_typing(self, channel: discord.TextChannel) -> None:
-        """Send repeated typing indicators until cancelled.
-
-        Discord's typing indicator lasts ~10s; re-send every 8s so the user
-        sees *something* while the dispatcher is thinking. Cancel this task
-        as soon as you have a reply ready to prevent the eternal "typing..."
-        UX hang.
-        """
-        try:
-            while True:
-                await channel.trigger_typing()
-                await asyncio.sleep(8)
-        except asyncio.CancelledError:
-            pass
-
     async def dispatcher_chat(
         self,
         message_text: str,

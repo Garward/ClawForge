@@ -154,6 +154,37 @@ pub fn main() !void {
     }
     defer if (openrouter_client) |*orc| orc.deinit();
 
+    // Create Codex (ChatGPT OAuth) provider if enabled. Reads `~/.codex/auth.json`
+    // produced by the Codex CLI; we only consume the OAuth tokens, never run
+    // the interactive login here. The store self-refreshes on access.
+    var codex_auth_store: ?api.CodexAuthStore = null;
+    var codex_client: ?api.CodexClient = null;
+    if (config.codex.enabled) {
+        const expanded_path = expandTilde(allocator, config.codex.auth_path) catch |err| blk: {
+            std.log.warn("Codex: tilde expansion failed for {s}: {}", .{ config.codex.auth_path, err });
+            break :blk @as([]u8, @constCast(config.codex.auth_path));
+        };
+        defer if (expanded_path.ptr != config.codex.auth_path.ptr) allocator.free(expanded_path);
+
+        if (api.CodexAuthStore.init(allocator, expanded_path)) |store| {
+            codex_auth_store = store;
+            codex_client = api.CodexClient.init(
+                allocator,
+                &codex_auth_store.?,
+                config.codex.base_url,
+                config.codex.default_model,
+            );
+            provider_registry.register("codex", codex_client.?.provider()) catch {};
+            std.log.info("Codex provider registered (model={s}, auth={s})", .{
+                config.codex.default_model,
+                expanded_path,
+            });
+        } else |err| {
+            std.log.warn("Codex enabled but auth load failed ({s}): {} — skipping. Run `codex login` to authenticate.", .{ expanded_path, err });
+        }
+    }
+    defer if (codex_auth_store) |*s| s.deinit();
+
     // Map tiers to providers from config
     provider_registry.mapTier("fast", config.routing.fast_provider) catch {};
     provider_registry.mapTier("default", config.routing.default_provider) catch {};
@@ -410,9 +441,21 @@ pub fn main() !void {
     };
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+    // SIGHUP: konsole/bash send this to background children when the tab/shell
+    // closes during system shutdown. Without it the daemon outlives its parent
+    // and hangs user@1000 stop for the full timeout.
+    std.posix.sigaction(std.posix.SIG.HUP, &act, null);
 
     // Log registered adapters
     const registered = adapters.listRegisteredAdapters(allocator, &database.conn) catch &.{};
+    defer {
+        for (registered) |a| {
+            allocator.free(a.name);
+            allocator.free(a.display_name);
+            allocator.free(a.version);
+        }
+        if (registered.len > 0) allocator.free(registered);
+    }
     for (registered) |a| {
         std.log.info("Adapter: {s} ({s}) v{s}", .{ a.name, a.display_name, a.version });
     }
@@ -429,4 +472,16 @@ fn runAdapter(wa: *adapters.WebAdapter) void {
 
 fn runDiscordAdapter(da: *adapters.DiscordAdapter) void {
     da.adapter().run();
+}
+
+/// Expand a leading `~/` (or bare `~`) into `$HOME/...`. Returns the input
+/// slice unchanged if no expansion is needed; otherwise returns a freshly
+/// allocated slice the caller owns. Falls back to the original string on
+/// missing $HOME.
+fn expandTilde(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (path.len == 0 or path[0] != '~') return @constCast(path);
+    const home = std.posix.getenv("HOME") orelse return @constCast(path);
+    if (path.len == 1) return allocator.dupe(u8, home);
+    if (path[1] != '/') return @constCast(path);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ home, path[1..] });
 }

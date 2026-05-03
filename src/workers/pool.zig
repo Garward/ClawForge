@@ -54,6 +54,9 @@ pub const WorkerPool = struct {
     // Safe because there is exactly one background chat worker thread.
     active_job_id: ?[36]u8 = null,
 
+    // Per-session index of subagent jobs (active + recently completed).
+    subagent_registry: SubagentRegistry = .{},
+
     // Tool confirmation gate (one at a time — single background thread)
     confirmation_mutex: std.Thread.Mutex = .{},
     confirmation_cond: std.Thread.Condition = .{},
@@ -310,6 +313,223 @@ pub const WorkerPool = struct {
         return self.tool_event_log.getEvents(job_id, cursor);
     }
 
+    /// Register a subagent job in the per-session index. Called by the engine
+    /// when summon_subagent enqueues a BackgroundChatJob.
+    pub fn registerSubagent(
+        self: *WorkerPool,
+        job_id: *const [36]u8,
+        parent_session_id: *const [36]u8,
+        is_explore: bool,
+        brief: []const u8,
+    ) void {
+        self.subagent_registry.register(job_id, parent_session_id, is_explore, brief);
+    }
+
+    /// Update a subagent's lifecycle status. Called from the bg chat worker.
+    pub fn markSubagentStatus(self: *WorkerPool, job_id: *const [36]u8, status: SubagentStatus) void {
+        self.subagent_registry.markStatus(job_id, status);
+    }
+
+    /// Request a subagent to stop at its next round boundary. Returns true if
+    /// the job was found in the registry. The engine's round loop polls
+    /// isSubagentStopRequested between rounds and emits accumulated state.
+    pub fn requestSubagentStop(self: *WorkerPool, job_id: *const [36]u8, reason: []const u8) bool {
+        return self.subagent_registry.requestStop(job_id, reason);
+    }
+
+    /// Update the most-recent tool name for a subagent. Owned in fixed buffer.
+    pub fn markSubagentLastTool(self: *WorkerPool, job_id: *const [36]u8, tool_name: []const u8) void {
+        self.subagent_registry.markLastTool(job_id, tool_name);
+    }
+
+    /// Whether a stop has been requested for the given subagent job.
+    pub fn isSubagentStopRequested(self: *WorkerPool, job_id: *const [36]u8) bool {
+        return self.subagent_registry.isStopRequested(job_id);
+    }
+
+    /// Queue a redirect message for the given subagent. Returns true on success.
+    pub fn queueSubagentRedirect(self: *WorkerPool, job_id: *const [36]u8, instruction: []const u8) bool {
+        return self.subagent_registry.queueRedirect(job_id, instruction);
+    }
+
+    /// Consume any pending redirect for the given subagent. Returns the
+    /// number of bytes copied into `out` (0 if none pending).
+    pub fn consumeSubagentRedirect(self: *WorkerPool, job_id: *const [36]u8, out: []u8) usize {
+        return self.subagent_registry.consumeRedirect(job_id, out);
+    }
+
+    /// Snapshot all subagent records for a parent session into out (capacity = SubagentRegistry.MAX_PER_SESSION).
+    /// Returns the number of records written.
+    pub fn snapshotSubagentsForSession(
+        self: *WorkerPool,
+        parent_session_id: *const [36]u8,
+        out: *[SubagentRegistry.MAX_PER_SESSION]SubagentRecord,
+    ) usize {
+        return self.subagent_registry.forSession(parent_session_id, out);
+    }
+
+    /// Look up a single subagent record by job_id.
+    pub fn getSubagent(self: *WorkerPool, job_id: *const [36]u8) ?SubagentRecord {
+        return self.subagent_registry.getById(job_id);
+    }
+
+    /// Format the Active Subagents context layer for a given parent session.
+    /// Returns null when there are no active or recently-completed subagents.
+    /// Caller owns the returned allocation. Caps total length at ~LAYER_CAP bytes.
+    pub fn formatActiveSubagentsLayer(
+        self: *WorkerPool,
+        allocator: std.mem.Allocator,
+        parent_session_id: *const [36]u8,
+    ) ?[]u8 {
+        const LAYER_CAP: usize = 1024;
+        const KEEP_COMPLETED_SECS: i64 = 30 * 60;
+        const MAX_COMPLETED_SHOWN: usize = 5;
+
+        var records: [SubagentRegistry.MAX_PER_SESSION]SubagentRecord = undefined;
+        const n = self.subagent_registry.forSession(parent_session_id, &records);
+        if (n == 0) return null;
+
+        const now = std.time.timestamp();
+
+        // Partition into active vs eligible-completed; sort completed newest-first.
+        var active_idx: [SubagentRegistry.MAX_PER_SESSION]usize = undefined;
+        var active_n: usize = 0;
+        var done_idx: [SubagentRegistry.MAX_PER_SESSION]usize = undefined;
+        var done_n: usize = 0;
+        for (records[0..n], 0..) |rec, i| {
+            switch (rec.status) {
+                .pending, .running => {
+                    active_idx[active_n] = i;
+                    active_n += 1;
+                },
+                .completed, .failed, .stopped => {
+                    if (rec.completed_at) |ct| {
+                        if ((now - ct) <= KEEP_COMPLETED_SECS) {
+                            done_idx[done_n] = i;
+                            done_n += 1;
+                        }
+                    }
+                },
+            }
+        }
+        if (active_n == 0 and done_n == 0) return null;
+
+        // Sort completed by completed_at desc.
+        std.sort.insertion(usize, done_idx[0..done_n], records[0..n], struct {
+            fn lt(ctx: []const SubagentRecord, a: usize, b: usize) bool {
+                const ca = ctx[a].completed_at orelse 0;
+                const cb = ctx[b].completed_at orelse 0;
+                return ca > cb;
+            }
+        }.lt);
+        const done_show = @min(done_n, MAX_COMPLETED_SHOWN);
+
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(allocator);
+        const w = buf.writer(allocator);
+
+        w.writeAll("Active Subagents (auto-injected; use subagent_inspect/stop to manage):\n") catch {};
+
+        for (active_idx[0..active_n]) |i| {
+            self.appendSubagentLine(allocator, &records[i], now, w) catch {};
+            if (buf.items.len > LAYER_CAP) break;
+        }
+        if (done_show > 0 and buf.items.len < LAYER_CAP) {
+            w.writeAll("Recently completed:\n") catch {};
+            for (done_idx[0..done_show]) |i| {
+                self.appendSubagentLine(allocator, &records[i], now, w) catch {};
+                if (buf.items.len > LAYER_CAP) break;
+            }
+        }
+
+        // Truncate if we ran over.
+        if (buf.items.len > LAYER_CAP) {
+            buf.shrinkRetainingCapacity(LAYER_CAP);
+            buf.appendSlice(allocator, "…\n") catch {};
+        }
+
+        return buf.toOwnedSlice(allocator) catch null;
+    }
+
+    /// Format a single subagent's status as a one-line summary.
+    /// Caller owns the returned allocation.
+    pub fn formatSubagentSummary(
+        self: *WorkerPool,
+        allocator: std.mem.Allocator,
+        job_id: *const [36]u8,
+    ) ?[]u8 {
+        const rec = self.subagent_registry.getById(job_id) orelse return null;
+        const now = std.time.timestamp();
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(allocator);
+        self.appendSubagentLine(allocator, &rec, now, buf.writer(allocator)) catch return null;
+        return buf.toOwnedSlice(allocator) catch null;
+    }
+
+    fn appendSubagentLine(
+        self: *WorkerPool,
+        allocator: std.mem.Allocator,
+        rec: *const SubagentRecord,
+        now: i64,
+        w: anytype,
+    ) !void {
+        _ = self;
+        _ = allocator;
+        const status_str = switch (rec.status) {
+            .pending => "queued",
+            .running => "running",
+            .completed => "done",
+            .failed => "failed",
+            .stopped => "stopped",
+        };
+        const mode_str = if (rec.is_explore) "explore" else "execute";
+        const age_secs: i64 = switch (rec.status) {
+            .pending, .running => now - rec.spawned_at,
+            else => now - (rec.completed_at orelse rec.spawned_at),
+        };
+        const age_buf = formatAge(age_secs);
+
+        try w.print("- [{s} {s}] job {s} {s}: {s}", .{
+            status_str,
+            age_buf.slice(),
+            rec.job_id[0..8],
+            mode_str,
+            rec.briefSlice(),
+        });
+
+        // Append last tool for active jobs (read from owned fixed buffer).
+        if (rec.status == .running or rec.status == .pending) {
+            if (rec.last_tool_len > 0) {
+                try w.print(" | last_tool={s}", .{rec.lastToolSlice()});
+            }
+        } else if (rec.status == .stopped and rec.stop_reason_len > 0) {
+            try w.print(" | reason={s}", .{rec.stopReasonSlice()});
+        }
+
+        try w.writeAll("\n");
+    }
+
+    const AgeBuf = struct {
+        buf: [16]u8 = undefined,
+        len: usize = 0,
+        pub fn slice(self: *const AgeBuf) []const u8 {
+            return self.buf[0..self.len];
+        }
+    };
+
+    fn formatAge(secs: i64) AgeBuf {
+        var a = AgeBuf{};
+        const abs_s: i64 = if (secs < 0) 0 else secs;
+        if (abs_s < 60) {
+            a.len = (std.fmt.bufPrint(&a.buf, "{d}s", .{abs_s}) catch return a).len;
+        } else if (abs_s < 3600) {
+            a.len = (std.fmt.bufPrint(&a.buf, "{d}m", .{@divTrunc(abs_s, 60)}) catch return a).len;
+        } else {
+            a.len = (std.fmt.bufPrint(&a.buf, "{d}h", .{@divTrunc(abs_s, 3600)}) catch return a).len;
+        }
+        return a;
+    }
+
     /// Check if there's a pending confirmation for a given job.
     pub fn getPendingConfirmation(self: *WorkerPool, job_id: *const [36]u8) ?PendingConfirmation {
         self.confirmation_mutex.lock();
@@ -456,6 +676,11 @@ pub const WorkerPool = struct {
                 self.tool_event_log.startJob(&job.job_id);
                 self.active_job_id = job.job_id;
 
+                // Transition subagent registry status to running (no-op for non-subagent jobs).
+                if (job.is_subagent) {
+                    self.subagent_registry.markStatus(&job.job_id, .running);
+                }
+
                 var confirm_ctx = BgConfirmCtx{ .pool = self, .job_id = &job.job_id };
                 const output = process_fn(
                     process_ctx,
@@ -543,6 +768,14 @@ pub const WorkerPool = struct {
                 // Clear active job tracking
                 self.active_job_id = null;
                 self.tool_event_log.endJob(&job.job_id);
+
+                if (job.is_subagent) {
+                    const final_status: SubagentStatus = if (final_output.ok)
+                        (if (self.subagent_registry.isStopRequested(&job.job_id)) .stopped else .completed)
+                    else
+                        .failed;
+                    self.subagent_registry.markStatus(&job.job_id, final_status);
+                }
 
                 if (final_output.ok) {
                     self.result_store.put(.{
@@ -774,6 +1007,236 @@ pub const ToolEventLog = struct {
             }
         }
         return .{ .events = &.{}, .new_cursor = cursor };
+    }
+};
+
+pub const SubagentStatus = enum { pending, running, completed, failed, stopped };
+
+/// One subagent job's record in the per-session registry.
+/// Fixed-size strings keep this trivially copyable for snapshot reads.
+pub const SubagentRecord = struct {
+    job_id: [36]u8,
+    parent_session_id: [36]u8,
+    is_explore: bool,
+    spawned_at: i64,
+    completed_at: ?i64 = null,
+    status: SubagentStatus = .pending,
+    brief: [96]u8 = [_]u8{0} ** 96,
+    brief_len: u8 = 0,
+    stop_requested: bool = false,
+    stop_reason: [80]u8 = [_]u8{0} ** 80,
+    stop_reason_len: u8 = 0,
+
+    /// Pending redirect injected by subagent_redirect. Consumed at the next
+    /// round boundary by the engine and appended as a user-role message.
+    redirect_pending: bool = false,
+    redirect_text: [512]u8 = [_]u8{0} ** 512,
+    redirect_text_len: u16 = 0,
+
+    /// Most recent tool name observed for this subagent. Owned (fixed buffer)
+    /// so reads from the dispatcher are safe across arena boundaries.
+    last_tool: [32]u8 = [_]u8{0} ** 32,
+    last_tool_len: u8 = 0,
+
+    pub fn briefSlice(self: *const SubagentRecord) []const u8 {
+        return self.brief[0..self.brief_len];
+    }
+
+    pub fn stopReasonSlice(self: *const SubagentRecord) []const u8 {
+        return self.stop_reason[0..self.stop_reason_len];
+    }
+
+    pub fn redirectSlice(self: *const SubagentRecord) []const u8 {
+        return self.redirect_text[0..self.redirect_text_len];
+    }
+
+    pub fn lastToolSlice(self: *const SubagentRecord) []const u8 {
+        return self.last_tool[0..self.last_tool_len];
+    }
+};
+
+/// Tracks subagent jobs by parent session_id. Active + recently completed.
+/// Bounded by capacity; oldest completed records are evicted when full.
+pub const SubagentRegistry = struct {
+    pub const MAX_RECORDS = 64;
+    pub const MAX_PER_SESSION = 16;
+
+    entries: [MAX_RECORDS]?SubagentRecord = [_]?SubagentRecord{null} ** MAX_RECORDS,
+    mutex: std.Thread.Mutex = .{},
+
+    pub fn register(
+        self: *SubagentRegistry,
+        job_id: *const [36]u8,
+        parent_session_id: *const [36]u8,
+        is_explore: bool,
+        brief: []const u8,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var rec = SubagentRecord{
+            .job_id = job_id.*,
+            .parent_session_id = parent_session_id.*,
+            .is_explore = is_explore,
+            .spawned_at = std.time.timestamp(),
+            .status = .pending,
+        };
+        const n = @min(brief.len, rec.brief.len);
+        @memcpy(rec.brief[0..n], brief[0..n]);
+        rec.brief_len = @intCast(n);
+
+        // Find empty slot, or evict oldest completed record.
+        var oldest_completed_idx: ?usize = null;
+        var oldest_completed_ts: i64 = std.math.maxInt(i64);
+        for (self.entries, 0..) |entry, i| {
+            if (entry == null) {
+                self.entries[i] = rec;
+                return;
+            }
+            const e = entry.?;
+            if (e.completed_at) |ct| {
+                if (ct < oldest_completed_ts) {
+                    oldest_completed_ts = ct;
+                    oldest_completed_idx = i;
+                }
+            }
+        }
+        if (oldest_completed_idx) |idx| {
+            self.entries[idx] = rec;
+        } else {
+            // All slots active — overwrite slot 0 to bound memory.
+            std.log.warn("SubagentRegistry full of active jobs, evicting slot 0", .{});
+            self.entries[0] = rec;
+        }
+    }
+
+    pub fn markStatus(self: *SubagentRegistry, job_id: *const [36]u8, status: SubagentStatus) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (&self.entries) |*entry| {
+            if (entry.*) |*rec| {
+                if (std.mem.eql(u8, &rec.job_id, job_id)) {
+                    rec.status = status;
+                    if (status == .completed or status == .failed or status == .stopped) {
+                        rec.completed_at = std.time.timestamp();
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    pub fn requestStop(self: *SubagentRegistry, job_id: *const [36]u8, reason: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (&self.entries) |*entry| {
+            if (entry.*) |*rec| {
+                if (std.mem.eql(u8, &rec.job_id, job_id)) {
+                    rec.stop_requested = true;
+                    const n = @min(reason.len, rec.stop_reason.len);
+                    @memcpy(rec.stop_reason[0..n], reason[0..n]);
+                    rec.stop_reason_len = @intCast(n);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Queue a redirect for a subagent. Returns true if the job was found.
+    /// Overwrites any previous pending redirect (latest wins).
+    pub fn queueRedirect(self: *SubagentRegistry, job_id: *const [36]u8, instruction: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (&self.entries) |*entry| {
+            if (entry.*) |*rec| {
+                if (std.mem.eql(u8, &rec.job_id, job_id)) {
+                    const n = @min(instruction.len, rec.redirect_text.len);
+                    @memcpy(rec.redirect_text[0..n], instruction[0..n]);
+                    rec.redirect_text_len = @intCast(n);
+                    rec.redirect_pending = true;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Consume the pending redirect for a subagent (clears the flag).
+    /// Copies the text into out and returns its length, or 0 if none pending.
+    pub fn consumeRedirect(self: *SubagentRegistry, job_id: *const [36]u8, out: []u8) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (&self.entries) |*entry| {
+            if (entry.*) |*rec| {
+                if (std.mem.eql(u8, &rec.job_id, job_id)) {
+                    if (!rec.redirect_pending) return 0;
+                    const n = @min(rec.redirect_text_len, out.len);
+                    @memcpy(out[0..n], rec.redirect_text[0..n]);
+                    rec.redirect_pending = false;
+                    rec.redirect_text_len = 0;
+                    return n;
+                }
+            }
+        }
+        return 0;
+    }
+
+    pub fn markLastTool(self: *SubagentRegistry, job_id: *const [36]u8, tool_name: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (&self.entries) |*entry| {
+            if (entry.*) |*rec| {
+                if (std.mem.eql(u8, &rec.job_id, job_id)) {
+                    const n = @min(tool_name.len, rec.last_tool.len);
+                    @memcpy(rec.last_tool[0..n], tool_name[0..n]);
+                    rec.last_tool_len = @intCast(n);
+                    return;
+                }
+            }
+        }
+    }
+
+    pub fn isStopRequested(self: *SubagentRegistry, job_id: *const [36]u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (&self.entries) |*entry| {
+            if (entry.*) |*rec| {
+                if (std.mem.eql(u8, &rec.job_id, job_id)) return rec.stop_requested;
+            }
+        }
+        return false;
+    }
+
+    pub fn forSession(
+        self: *SubagentRegistry,
+        parent_session_id: *const [36]u8,
+        out: *[MAX_PER_SESSION]SubagentRecord,
+    ) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var n: usize = 0;
+        for (self.entries) |entry| {
+            if (n >= MAX_PER_SESSION) break;
+            if (entry) |rec| {
+                if (std.mem.eql(u8, &rec.parent_session_id, parent_session_id)) {
+                    out[n] = rec;
+                    n += 1;
+                }
+            }
+        }
+        return n;
+    }
+
+    pub fn getById(self: *SubagentRegistry, job_id: *const [36]u8) ?SubagentRecord {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.entries) |entry| {
+            if (entry) |rec| {
+                if (std.mem.eql(u8, &rec.job_id, job_id)) return rec;
+            }
+        }
+        return null;
     }
 };
 

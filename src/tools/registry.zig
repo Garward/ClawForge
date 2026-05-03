@@ -59,17 +59,70 @@ pub const summon_subagent_def = ToolDefinition{
         "  mode='execute' (default) — the worker that does real changes (multi-file edits, " ++
         "builds, destructive shell). Requires a full brief: task + target_files + acceptance. " ++
         "Do NOT use execute mode for single-file edits or simple reads — handle those yourself " ++
-        "inline with file_read, file_diff, bash, introspect.\n" ++
+        "inline with file_read, file_diff, bash, introspect. The worker will treat the brief as " ++
+        "ground truth, read target files first, make the smallest viable change, and verify " ++
+        "acceptance before reporting done.\n" ++
         "\n" ++
         "Common pattern: dispatcher → explore subagent → read its 3-layer brief → execute " ++
         "subagent with the findings in known_facts + target_files.\n" ++
         "\n" ++
         "A subagent gets NONE of your conversation context — it only sees the brief. Empty or " ++
         "vague briefs are the #1 cause of failure. The subagent can view/update the shared plan. " ++
-        "Returns a job ID; the user (for execute) or you (for explore) receives the result " ++
-        "automatically when it completes.",
+        "Tool failures are treated as no-data, not success. Returns a job ID; the user (for " ++
+        "execute) or you (for explore) receives the result automatically when it completes.",
     .input_schema_json =
         \\{"type":"object","properties":{"mode":{"type":"string","enum":["execute","explore"],"description":"'execute' (default) = worker that makes changes. 'explore' = read-only research agent that returns a structured 3-layer brief."},"task":{"type":"string","description":"For execute: one-sentence goal (the end state). For explore: the question to investigate (e.g. 'How does the dispatcher wire summon_subagent results back to Discord?')."},"context":{"type":"string","description":"Why this matters / the user's actual words. The subagent does not see chat history."},"target_files":{"type":"array","items":{"type":"string"},"description":"For execute: files the subagent will read or modify (REQUIRED non-empty for execute unless pure-discovery). For explore: hint paths to focus recon on (optional)."},"known_facts":{"type":"array","items":{"type":"string"},"description":"Findings the subagent should NOT re-derive. Paste relevant lines from a prior explore subagent's brief here. e.g. 'handleSummonSubagent is at engine.zig:1868'."},"acceptance":{"type":"string","description":"For execute (REQUIRED): concrete testable stop condition. e.g. 'zig build succeeds AND new function visible in engine.zig'. Not used by explore."},"constraints":{"type":"array","items":{"type":"string"},"description":"Things the subagent must NOT do. e.g. 'do not modify discord_adapter.zig'."},"out_of_scope":{"type":"array","items":{"type":"string"},"description":"Related work to resist. Stops scope creep."},"model":{"type":"string","description":"Optional model id override. Inherits parent's model by default."},"wait":{"type":"boolean","description":"If true, block this tool call until the subagent completes and return its full result as the tool_result (useful for in-turn chaining). Default false."},"chain":{"type":"boolean","description":"Explore only. If true (default for explore), after the subagent returns the worker automatically runs a dispatcher continuation turn that ingests the brief and generates the user-facing reply (summary, or auto-summon of execute). The polling adapter sees the continuation's reply, not the raw JSON. Ignored when wait=true or mode=execute."}},"required":["task"]}
+    ,
+    .requires_confirmation = false,
+    .handler = null,
+};
+
+/// subagent_inspect — special tool. Engine-intercepted (needs worker_pool).
+/// Read-only view of a subagent's state. Available only to the dispatcher
+/// (filtered out for subagents like summon_subagent).
+pub const subagent_inspect_def = ToolDefinition{
+    .name = "subagent_inspect",
+    .description =
+        "Inspect a background subagent spawned via summon_subagent. " ++
+        "depth='summary' (1-line status — same as the auto-injected Active Subagents layer), " ++
+        "'full' (final result text if complete, otherwise current status + tool count), " ++
+        "or 'tools' (history of tool_use/tool_result events). Read-only — does not stop or " ++
+        "interrupt the subagent. Job IDs come from the Active Subagents layer or the " ++
+        "return value of summon_subagent.",
+    .input_schema_json =
+        \\{"type":"object","properties":{"job_id":{"type":"string","description":"36-char UUID of the subagent job."},"depth":{"type":"string","enum":["summary","full","tools"],"description":"Detail level. Default 'summary'."}},"required":["job_id"]}
+    ,
+    .requires_confirmation = false,
+    .handler = null,
+};
+
+/// subagent_stop — engine-intercepted. Cooperative stop at next round boundary.
+pub const subagent_stop_def = ToolDefinition{
+    .name = "subagent_stop",
+    .description =
+        "Stop a running subagent at its next round boundary. The subagent emits its " ++
+        "accumulated state as the final result and the job is marked completed-with-stop. " ++
+        "Cooperative — does NOT interrupt an in-flight API call. Use when a subagent is stuck, " ++
+        "off-track, or you want to lock in partial results. Retrieve them via " ++
+        "subagent_inspect(depth='full') after the stop takes effect.",
+    .input_schema_json =
+        \\{"type":"object","properties":{"job_id":{"type":"string","description":"36-char UUID of the subagent job."},"reason":{"type":"string","description":"Brief explanation of why you're stopping it (becomes part of the final result and visible in inspect)."}},"required":["job_id","reason"]}
+    ,
+    .requires_confirmation = false,
+    .handler = null,
+};
+
+/// subagent_redirect — engine-intercepted. Injects a new instruction at next round.
+pub const subagent_redirect_def = ToolDefinition{
+    .name = "subagent_redirect",
+    .description =
+        "Redirect a running subagent mid-flight by queueing a new instruction. The subagent " ++
+        "receives '[REDIRECT from dispatcher]: <message>' as a user-role message at its next " ++
+        "round boundary and continues with accumulated state intact. Does NOT interrupt an " ++
+        "in-flight API call. Use to pivot scope, narrow focus, or correct course without losing " ++
+        "the subagent's tool history.",
+    .input_schema_json =
+        \\{"type":"object","properties":{"job_id":{"type":"string","description":"36-char UUID of the subagent job."},"new_instruction":{"type":"string","description":"The redirect message. Be concrete: what to do differently, what to focus on or skip."}},"required":["job_id","new_instruction"]}
     ,
     .requires_confirmation = false,
     .handler = null,
@@ -139,7 +192,19 @@ pub const ToolRegistry = struct {
         try self.register(research_tool.definition);
         try self.register(plan_def);
         try self.register(summon_subagent_def);
+        try self.register(subagent_inspect_def);
+        try self.register(subagent_stop_def);
+        try self.register(subagent_redirect_def);
     }
+
+    /// Names of tools that only the dispatcher should see (subagents must not
+    /// recursively spawn or manage other subagents).
+    pub const SUBAGENT_HIDDEN_TOOLS = [_][]const u8{
+        "summon_subagent",
+        "subagent_inspect",
+        "subagent_stop",
+        "subagent_redirect",
+    };
 
     pub fn register(self: *ToolRegistry, tool: ToolDefinition) !void {
         try self.tools.put(tool.name, tool);
@@ -241,6 +306,12 @@ pub const ToolRegistry = struct {
     /// Like getToolDefinitions but drops any tool whose name matches `exclude`.
     /// Used for subagents, which must not see `summon_subagent` (no recursive spawning).
     pub fn getToolDefinitionsExcluding(self: *ToolRegistry, exclude: []const u8) ?[]const api_messages.ToolDefinition {
+        const excludes = [_][]const u8{exclude};
+        return self.getToolDefinitionsExcludingMany(&excludes);
+    }
+
+    /// Like getToolDefinitions but drops any tool whose name appears in `excludes`.
+    pub fn getToolDefinitionsExcludingMany(self: *ToolRegistry, excludes: []const []const u8) ?[]const api_messages.ToolDefinition {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.enabled.count() == 0) return null;
@@ -248,9 +319,11 @@ pub const ToolRegistry = struct {
         var buf: [MAX_TOOL_DEFS]api_messages.ToolDefinition = undefined;
         var idx: usize = 0;
         var it = self.enabled.keyIterator();
-        while (it.next()) |name| {
+        outer: while (it.next()) |name| {
             if (idx >= buf.len) break;
-            if (std.mem.eql(u8, name.*, exclude)) continue;
+            for (excludes) |ex| {
+                if (std.mem.eql(u8, name.*, ex)) continue :outer;
+            }
             if (self.tools.get(name.*)) |tool| {
                 buf[idx] = .{
                     .name = tool.name,

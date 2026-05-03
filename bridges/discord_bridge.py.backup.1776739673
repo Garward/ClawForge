@@ -667,21 +667,6 @@ class ClawForgeBridge(discord.Client):
             log.warning("Pillow preprocess failed for %s: %s", raw_path.name, e)
             return None, ""
 
-    async def _pulse_typing(self, channel: discord.TextChannel) -> None:
-        """Send repeated typing indicators until cancelled.
-
-        Discord's typing indicator lasts ~10s; re-send every 8s so the user
-        sees *something* while the dispatcher is thinking. Cancel this task
-        as soon as you have a reply ready to prevent the eternal "typing..."
-        UX hang.
-        """
-        try:
-            while True:
-                await channel.trigger_typing()
-                await asyncio.sleep(8)
-        except asyncio.CancelledError:
-            pass
-
     async def dispatcher_chat(
         self,
         message_text: str,
@@ -863,59 +848,47 @@ class ClawForgeBridge(discord.Client):
         prefixed = f"[Discord user: {username}] {content}"
         dispatcher_model = self.channel_models.get(channel_id)
 
-        # Fire dispatcher in background — don't hold typing() for the full
-        # model round-trip (can be 30s+ when summon_subagent is involved).
-        # We send an immediate typing indicator, then drop it as soon as the
-        # dispatcher returns its ack text, then hand off to poll_and_deliver.
-        async def _dispatch_and_deliver():
-            # Brief typing pulse (5s max) just to show we received the message.
-            # Cancelled as soon as dispatcher_chat returns.
-            typing_task = asyncio.create_task(self._pulse_typing(message.channel))
-            try:
-                result = await self.dispatcher_chat(
-                    prefixed,
-                    session_id,
-                    dispatcher_model,
-                    attachments=downloaded_attachments or None,
-                )
-            finally:
-                typing_task.cancel()
+        async with message.channel.typing():
+            result = await self.dispatcher_chat(
+                prefixed,
+                session_id,
+                dispatcher_model,
+                attachments=downloaded_attachments or None,
+            )
 
-            if result.get("error"):
-                await message.reply(result["error"], mention_author=False)
-                return
+        if result.get("error"):
+            await message.reply(result["error"], mention_author=False)
+            return
 
-            spawned = result.get("spawned_jobs", []) or []
-            raw_text = result.get("text", "")
-            # Extract media URLs from tool outputs before stripping the XML
-            media_urls = extract_media_urls(raw_text)
-            cleaned = strip_tool_calls(raw_text)
-            # Append any media URLs the model forgot to include in its text
-            for url in media_urls:
-                if url not in cleaned:
-                    cleaned = cleaned.rstrip() + "\n" + url if cleaned else url
-            if spawned:
-                # Prefer the dispatcher's actual generated text as the ack so
-                # each spawn feels unique. Strip XML tool-call markup first
-                # (Haiku sometimes emits <function_calls> blocks in its text).
-                # Fall back to a canned string only if nothing real survived.
-                if cleaned:
-                    await self.send_chunked(message, cleaned)
-                else:
-                    await message.reply(
-                        "On it — working on this in the background. I'll reply with the result.",
-                        mention_author=False,
-                    )
+        spawned = result.get("spawned_jobs", []) or []
+        raw_text = result.get("text", "")
+        # Extract media URLs from tool outputs before stripping the XML
+        media_urls = extract_media_urls(raw_text)
+        cleaned = strip_tool_calls(raw_text)
+        # Append any media URLs the model forgot to include in its text
+        for url in media_urls:
+            if url not in cleaned:
+                cleaned = cleaned.rstrip() + "\n" + url if cleaned else url
+        if spawned:
+            # Prefer the dispatcher's actual generated text as the ack so each
+            # spawn feels unique. Strip XML tool-call markup first (Haiku
+            # sometimes emits <function_calls> blocks in its text channel).
+            # Fall back to a canned string only if nothing real survived.
+            if cleaned:
+                await self.send_chunked(message, cleaned)
             else:
-                if cleaned:
-                    await self.send_chunked(message, cleaned)
+                await message.reply(
+                    "On it — working on this in the background. I'll reply with the result.",
+                    mention_author=False,
+                )
+        else:
+            if cleaned:
+                await self.send_chunked(message, cleaned)
 
-            for job_id in spawned:
-                self.channel_jobs[channel_id] = job_id
-                log.info("Subagent job %s spawned for #%s", job_id[:8], channel_name)
-                asyncio.create_task(self.poll_and_deliver(message, job_id, channel_id))
-
-        asyncio.create_task(_dispatch_and_deliver())
+        for job_id in spawned:
+            self.channel_jobs[channel_id] = job_id
+            log.info("Subagent job %s spawned for #%s", job_id[:8], channel_name)
+            asyncio.create_task(self.poll_and_deliver(message, job_id, channel_id))
 
     async def poll_and_deliver(self, original: discord.Message, job_id: str, channel_id: str):
         """Poll until background job completes, then post result."""

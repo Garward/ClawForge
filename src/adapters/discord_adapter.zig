@@ -115,12 +115,17 @@ pub const DiscordAdapter = struct {
     }
 
     pub fn stop(self: *Self) void {
-        if (!self.running.load(.acquire)) return;
+        // Don't early-return on !running: the signal handler in main.zig sets
+        // running=false on SIGTERM, but the python child must still be signalled
+        // here or run()'s c.wait() blocks forever.
         self.running.store(false, .release);
 
         if (self.child) |*c| {
-            _ = c.kill() catch |err| {
-                std.log.warn("Failed to kill Discord bridge: {}", .{err});
+            // Use raw posix.kill (not c.kill()) — Zig's Child.kill() also calls
+            // waitpid internally, which races with run()'s c.wait() and panics
+            // one of them with ECHILD. Just send the signal; let run() reap.
+            std.posix.kill(c.id, std.posix.SIG.TERM) catch |err| {
+                std.log.warn("Failed to signal Discord bridge: {}", .{err});
             };
             std.log.info("Discord bridge stop requested", .{});
         }

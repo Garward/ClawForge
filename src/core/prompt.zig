@@ -26,6 +26,12 @@ pub const PromptLayers = struct {
     /// instead to force plan creation on multi-step work.
     active_plan: ?[]const u8 = null,
 
+    /// Layer 3.55: Active subagents — auto-injected status of background jobs
+    /// spawned via summon_subagent in the current session. Lets the dispatcher
+    /// chat freely while subagents run without having to tool-call to check
+    /// their state. Dispatcher-only; subagents do not see this layer.
+    active_subagents: ?[]const u8 = null,
+
     /// Layer 3.6: Active skills — matched instruction templates.
     /// Injected after plan, before retrieved search results.
     skills: ?[]const []const u8 = null,
@@ -67,6 +73,42 @@ pub const RetrievedEntry = struct {
 pub const DEFAULT_PERSONA = @embedFile("default_persona.txt");
 
 const common = @import("common");
+
+/// Build a small "Environment" block injected into every assembled system prompt
+/// and into every worker subagent brief. Reports the daemon's working directory
+/// and the current UTC time so the model can resolve relative paths and reason
+/// about recent file mtimes ("edited 20 seconds ago"). Returns allocator-owned
+/// memory; caller frees.
+pub fn buildEnvironmentBlock(allocator: std.mem.Allocator) ![]const u8 {
+    const cwd_opt: ?[]const u8 = common.config.getProjectRoot(allocator) catch null;
+    defer if (cwd_opt) |c| allocator.free(c);
+
+    const ts: i64 = std.time.timestamp();
+    const epoch_secs = std.time.epoch.EpochSeconds{ .secs = @intCast(if (ts < 0) 0 else ts) };
+    const epoch_day = epoch_secs.getEpochDay();
+    const day_secs = epoch_secs.getDaySeconds();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    return std.fmt.allocPrint(
+        allocator,
+        "Working directory: {s}\n" ++
+            "Current time (UTC): {d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z\n" ++
+            "Unix timestamp: {d}\n" ++
+            "Tool paths: pass absolute paths to file_read/file_write/file_diff (relative paths are rejected). " ++
+            "Bash commands run with the working directory above as cwd, so relative paths are fine in bash.\n",
+        .{
+            cwd_opt orelse "(unknown)",
+            @as(u32, year_day.year),
+            month_day.month.numeric(),
+            @as(u32, month_day.day_index) + 1,
+            day_secs.getHoursIntoDay(),
+            day_secs.getMinutesIntoHour(),
+            day_secs.getSecondsIntoMinute(),
+            ts,
+        },
+    );
+}
 
 /// Load a persona file from config/personas/{name}.txt at runtime.
 /// Returns null if file not found. Caller owns the returned memory.
@@ -158,6 +200,15 @@ pub fn assemble(allocator: std.mem.Allocator, layers: PromptLayers, max_chars: u
         write(buf, &pos, DEFAULT_PERSONA);
     }
 
+    // Layer 1.5: Environment (cwd + current time). Always-on so the model
+    // never has to call `pwd` or guess what time it is to reason about file
+    // mtimes. Refreshed every assemble() call so the time is current per-turn.
+    if (buildEnvironmentBlock(allocator)) |env_block| {
+        defer allocator.free(env_block);
+        write(buf, &pos, "\n\n--- Environment ---\n");
+        write(buf, &pos, env_block);
+    } else |_| {}
+
     // Layer 2: User context
     if (layers.user_context) |user_ctx| {
         write(buf, &pos, "\n\n--- User Context [from knowledge] ---\n");
@@ -226,6 +277,15 @@ pub fn assemble(allocator: std.mem.Allocator, layers: PromptLayers, max_chars: u
             \\NOT required for read-only tools or for a single file_diff edit.
         );
         write(buf, &pos, "\n--- End Plan ---");
+    }
+
+    // Layer 3.55: Active subagents (live + recently-completed status)
+    if (layers.active_subagents) |sa| {
+        if (sa.len > 0) {
+            write(buf, &pos, "\n\n--- ");
+            write(buf, &pos, sa);
+            write(buf, &pos, "--- End Subagents ---");
+        }
     }
 
     // Layer 3.6: Skills (matched instruction templates)
