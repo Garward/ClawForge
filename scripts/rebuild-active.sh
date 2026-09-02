@@ -2,7 +2,7 @@
 set -euo pipefail
 
 runtime_root="${CLAWFORGE_RUNTIME_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-source_root="${CLAWFORGE_SOURCE_ROOT:-$(dirname "$runtime_root")/ClawForge}"
+source_root="${CLAWFORGE_SOURCE_ROOT:-$(dirname "$runtime_root")/repo}"
 log_file="${CLAWFORGE_REBUILD_LOG:-/tmp/clawforge_rebuild.log}"
 delay="${1:-5}"
 

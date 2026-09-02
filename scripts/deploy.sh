@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-runtime_root="${CLAWFORGE_RUNTIME_ROOT:-$(dirname "$repo_root")/ClawForge-active}"
+runtime_root="${CLAWFORGE_RUNTIME_ROOT:-$(dirname "$repo_root")/runtime}"
 
 if [[ "${1:-}" == "--build" ]]; then
     zig build \

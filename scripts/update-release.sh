@@ -2,7 +2,8 @@
 set -euo pipefail
 
 repository="${CLAWFORGE_UPDATE_REPOSITORY:-Garward/ClawForge}"
-install_root="${CLAWFORGE_INSTALL_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/clawforge}"
+script_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+install_root="${CLAWFORGE_INSTALL_ROOT:-$script_root}"
 latest_redirect="https://github.com/$repository/releases/latest"
 
 for command in curl python3 sha256sum; do

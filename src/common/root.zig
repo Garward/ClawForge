@@ -6,6 +6,7 @@ pub const sync = @import("sync.zig");
 pub const process = @import("process.zig");
 pub const net = @import("net.zig");
 pub const list_writer = @import("list_writer.zig");
+pub const version = @import("version.zig");
 
 pub const Config = config.Config;
 pub const RoutingConfig = config.RoutingConfig;

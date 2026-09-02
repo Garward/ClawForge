@@ -52,7 +52,7 @@ pub const WebAdapter = struct {
         return .{
             .name = "web",
             .display_name = "Web UI",
-            .version = "0.2.0",
+            .version = common.version.current,
             .ptr = @ptrCast(self),
             .vtable = &.{
                 .start = start,

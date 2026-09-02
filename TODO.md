@@ -21,7 +21,7 @@ immediately benefit from the user's entire history, preferences, and project sta
 - **Token-efficient**: surgical context injection via hybrid search (FTS5 + vector + RRF),
   session compaction, rolling project context. ~500 tokens of context, not 200k stuffing.
 
-## Current State (v0.2.0)
+## Current State (v0.2.1)
 
 ### Distribution and installation
 

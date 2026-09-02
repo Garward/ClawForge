@@ -38,7 +38,7 @@ pub const CliAdapter = struct {
         return .{
             .name = "cli",
             .display_name = "CLI Socket",
-            .version = "0.2.0",
+            .version = common.version.current,
             .ptr = @ptrCast(self),
             .vtable = &.{
                 .start = start,

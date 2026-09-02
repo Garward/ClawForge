@@ -6,7 +6,7 @@ SCRIPT_ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 # A source checkout delegates routine operation to its isolated active tree.
 # Set CLAWFORGE_RUN_FROM_SOURCE=1 only when deliberately testing in-place.
 if [ -d "$SCRIPT_ROOT/.git" ] && [ "${CLAWFORGE_RUN_FROM_SOURCE:-0}" != "1" ]; then
-    ACTIVE_ROOT="${CLAWFORGE_RUNTIME_ROOT:-$(dirname "$SCRIPT_ROOT")/ClawForge-active}"
+    ACTIVE_ROOT="${CLAWFORGE_RUNTIME_ROOT:-$(dirname "$SCRIPT_ROOT")/runtime}"
     if [ -x "$ACTIVE_ROOT/restart.sh" ]; then
         if [ "${1:-}" = "build" ]; then
             CLAWFORGE_RUNTIME_ROOT="$ACTIVE_ROOT" "$SCRIPT_ROOT/scripts/deploy.sh" --build || exit 1

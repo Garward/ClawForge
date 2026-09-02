@@ -43,19 +43,23 @@ pub const SkillStore = struct {
         return .{ .conn = conn, .allocator = allocator, .namespace_id = namespace_id };
     }
 
-    /// Add built-in operational guidance without replacing user-created skills.
+    /// Add or refresh built-in operational guidance without touching other skills.
     pub fn ensureBuiltinSkills(self: *SkillStore) !void {
         const now = common.sync.timestamp();
         var stmt = try self.conn.prepare(
-            "INSERT OR IGNORE INTO skills " ++
+            "INSERT INTO skills " ++
                 "(namespace_id, name, category, trigger_type, trigger_value, instruction, priority, enabled, created_at, updated_at) " ++
-                "VALUES (?, 'ClawForge operations', 'operations', 'keyword', ?, ?, 30, 1, ?, ?)",
+                "VALUES (?, 'ClawForge operations', 'operations', 'keyword', ?, ?, 30, 1, ?, ?) " ++
+                "ON CONFLICT(namespace_id, name) DO UPDATE SET " ++
+                "category = excluded.category, trigger_type = excluded.trigger_type, " ++
+                "trigger_value = excluded.trigger_value, instruction = excluded.instruction, " ++
+                "priority = excluded.priority, enabled = 1, updated_at = excluded.updated_at",
         );
         defer stmt.deinit();
         try stmt.bindInt64(1, self.namespace_id);
         try stmt.bindText(2, "clawforge,clawforged,clawforge-update,clawforge-active,workspace.db");
         try stmt.bindText(3,
-            \\For ClawForge operational questions, first distinguish the Git source checkout from the active runtime. Source deployments default to a sibling ClawForge-active directory; release installs default to ${XDG_DATA_HOME:-$HOME/.local/share}/clawforge. Confirm actual paths from CLAWFORGE_ROOT, CLAWFORGE_DB, CLAWFORGE_DAEMON, the running process, or .env instead of assuming.
+            \\For ClawForge operational questions, first distinguish the Git source checkout from the active runtime. The recommended source workspace is ClawForge/repo for Git and builds plus ClawForge/runtime for active use. Release installs default to ${XDG_DATA_HOME:-$HOME/.local/share}/clawforge. Confirm actual paths from CLAWFORGE_ROOT, CLAWFORGE_DB, CLAWFORGE_DAEMON, the running process, or .env instead of assuming.
             \\
             \\The active root owns mutable state: .env contains secrets and machine paths; config/config.json contains provider, routing, adapter, and tool settings; config/personas contains personas; data/workspace.db contains sessions, messages, knowledge, projects, and skills; data/auth-profiles.json and token files are sensitive. Never replace these during an update. Back up .env, config, and data before destructive maintenance or database repair.
             \\

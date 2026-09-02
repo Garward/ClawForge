@@ -57,4 +57,5 @@ find "$repo_root/tools" -maxdepth 1 -type f -name '*.py' -exec install -m 0755 -
 
 (cd "$dist_dir" && python3 -m zipfile -c "$archive_name.zip" "$archive_name")
 (cd "$dist_dir" && sha256sum "$archive_name.zip" > "$archive_name.zip.sha256")
+rm -rf "$package_dir"
 echo "Created $dist_dir/$archive_name.zip"

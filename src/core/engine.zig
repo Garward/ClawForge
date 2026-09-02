@@ -4413,7 +4413,7 @@ pub const Engine = struct {
         const count = self.session_store.sessionCount() catch 0;
 
         return .{ .response = .{ .status = .{
-            .version = "0.2.0",
+            .version = common.version.current,
             .uptime_seconds = uptime,
             .active_sessions = count,
             .current_session = if (self.session_store.active_session_id) |*id| id else null,

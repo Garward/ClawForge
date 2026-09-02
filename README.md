@@ -122,10 +122,18 @@ running instance:
 
 ```bash
 ./scripts/deploy.sh --build
-../ClawForge-active/restart.sh
+../runtime/restart.sh
 ```
 
-The default active directory is `../ClawForge-active`. Set
+The recommended source workspace has two clearly named directories:
+
+```text
+ClawForge/
+├── repo/       # Git checkout, builds, and release work
+└── runtime/    # Active config, secrets, database, tools, and binaries
+```
+
+The default active directory is `../runtime`. Set
 `CLAWFORGE_RUNTIME_ROOT` to put it elsewhere. Deployments update application
 files while preserving `.env`, `data/`, custom personas, and runtime config.
 The deployed rebuild helper builds in the source checkout and only replaces
@@ -143,8 +151,8 @@ Archives land in `dist/`. A release can be installed without root access on
 most x86_64 Linux systems, including WSL:
 
 ```bash
-unzip clawforge-0.2.0-linux-x86_64.zip
-cd clawforge-0.2.0-linux-x86_64
+unzip clawforge-0.2.1-linux-x86_64.zip
+cd clawforge-0.2.1-linux-x86_64
 ./install.sh
 ```
 
