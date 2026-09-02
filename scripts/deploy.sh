@@ -23,6 +23,7 @@ mkdir -p \
     "$runtime_root/bridges" \
     "$runtime_root/tools" \
     "$runtime_root/scripts" \
+    "$runtime_root/lib" \
     "$runtime_root/config/personas" \
     "$runtime_root/data"
 
@@ -32,8 +33,11 @@ if [[ -x "$repo_root/zig-out/bin/clawforge" ]]; then
 fi
 
 install -m 0755 "$repo_root/restart.sh" "$runtime_root/restart.sh"
+install -m 0755 "$repo_root/scripts/update-release.sh" "$runtime_root/update.sh"
 install -m 0755 "$repo_root/scripts/rebuild-active.sh" "$runtime_root/scripts/rebuild-active.sh"
+install -m 0644 "$repo_root/scripts/lib/release-ui.sh" "$runtime_root/lib/release-ui.sh"
 install -m 0644 "$repo_root/requirements.txt" "$runtime_root/requirements.txt"
+install -m 0644 "$repo_root/VERSION" "$runtime_root/VERSION"
 install -m 0644 "$repo_root/.env.example" "$runtime_root/.env.example"
 
 find "$repo_root/bridges" -maxdepth 1 -type f -name '*.py' -exec install -m 0755 -t "$runtime_root/bridges" {} +
