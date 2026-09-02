@@ -117,13 +117,21 @@ pub fn main(init: std.process.Init) !void {
     defer auth_store.deinit();
 
     // Initialize API client
+    var anthropic_available = true;
     var api_client = blk: {
         if (auth_store.getActiveCredential("anthropic")) |profile| {
             std.log.info("Using auth profile: {s}", .{profile.id});
             break :blk api.AnthropicClient.initWithCredential(allocator, &config, profile.credential);
         } else {
             std.log.info("No eligible auth profile, loading from token file", .{});
-            break :blk try api.AnthropicClient.init(allocator, &config);
+            break :blk api.AnthropicClient.init(allocator, &config) catch |err| fallback: {
+                anthropic_available = false;
+                std.log.warn(
+                    "Anthropic token unavailable ({}); continuing so another configured provider can be used",
+                    .{err},
+                );
+                break :fallback api.AnthropicClient.initWithCredential(allocator, &config, "");
+            };
         }
     };
     defer api_client.deinit();
@@ -204,7 +212,9 @@ pub fn main(init: std.process.Init) !void {
     // Create provider registry
     var provider_registry = api.ProviderRegistry.init(allocator);
     defer provider_registry.deinit();
-    provider_registry.register("anthropic", anthropic_prov) catch {};
+    if (anthropic_available) {
+        provider_registry.register("anthropic", anthropic_prov) catch {};
+    }
 
     // Create Ollama provider if enabled
     var ollama_client: ?api.OllamaClient = null;
@@ -293,8 +303,16 @@ pub fn main(init: std.process.Init) !void {
         config.routing.smart_provider,
     });
 
-    // Default provider = whatever "default" tier maps to
-    const default_provider = provider_registry.getForTier("default") orelse anthropic_prov;
+    // Prefer the configured default. If its optional credentials are absent,
+    // keep the daemon useful by selecting another available provider. Ollama
+    // is the token-free fallback. The inert compatibility client is last so
+    // the UI can still start before a model provider is configured.
+    const default_provider = provider_registry.getForTier("default") orelse
+        provider_registry.get("codex") orelse
+        provider_registry.get("openrouter") orelse
+        provider_registry.get("ollama") orelse
+        provider_registry.get("openai") orelse
+        anthropic_prov;
     var narrative_inference = inference.RegistryGateway.init(
         allocator,
         &provider_registry,

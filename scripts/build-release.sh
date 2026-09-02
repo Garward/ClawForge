@@ -38,6 +38,7 @@ mkdir -p \
     "$package_dir/zig-out/bin" \
     "$package_dir/bridges" \
     "$package_dir/tools" \
+    "$package_dir/lib" \
     "$package_dir/config/personas"
 
 install -m 0755 "$repo_root/zig-out/bin/clawforged" "$package_dir/zig-out/bin/clawforged"
@@ -45,6 +46,7 @@ install -m 0755 "$repo_root/zig-out/bin/clawforge" "$package_dir/zig-out/bin/cla
 install -m 0755 "$repo_root/restart.sh" "$package_dir/restart.sh"
 install -m 0755 "$repo_root/scripts/install-release.sh" "$package_dir/install.sh"
 install -m 0755 "$repo_root/scripts/update-release.sh" "$package_dir/update.sh"
+install -m 0644 "$repo_root/scripts/lib/release-ui.sh" "$package_dir/lib/release-ui.sh"
 install -m 0644 "$repo_root/requirements.txt" "$package_dir/requirements.txt"
 install -m 0644 "$repo_root/.env.example" "$package_dir/.env.example"
 install -m 0644 "$repo_root/config/config.json" "$package_dir/config/config.json"

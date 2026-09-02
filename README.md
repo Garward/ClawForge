@@ -151,16 +151,18 @@ Archives land in `dist/`. A release can be installed without root access on
 most x86_64 Linux systems, including WSL:
 
 ```bash
-unzip clawforge-0.2.2-linux-x86_64.zip
-cd clawforge-0.2.2-linux-x86_64
+unzip clawforge-0.2.3-linux-x86_64.zip
+cd clawforge-0.2.3-linux-x86_64
 ./install.sh
 ```
 
-The installer uses `${XDG_DATA_HOME:-$HOME/.local/share}/clawforge`, preserves
-existing configuration and data during upgrades, creates a Python virtual
-environment, and adds launchers under `~/.local/bin`. Pushing a `v*` tag runs
-the same packaging script and attaches the zip and SHA-256 checksum to a
-GitHub release.
+The guided installer explains each requirement, lets you confirm its paths,
+creates and selects a private Python environment, checks available model
+providers, and can start ClawForge when finished. No hosted-provider token is
+required: the clean-install default is local Ollama with `qwen3:4b`. Existing
+configuration and data are preserved during reinstalls. For automation, pass
+`--yes --no-start`. Pushing a `v*` tag runs the same packaging script and
+attaches the zip and SHA-256 checksum to a GitHub release.
 
 Future upgrades are one command:
 
@@ -168,8 +170,10 @@ Future upgrades are one command:
 clawforge-update
 ```
 
-The updater verifies the release checksum, preserves all runtime state, and
-restarts ClawForge only when it was already running.
+The guided updater shows the installed and available versions, explains what
+will be replaced and preserved, verifies the release checksum, and restarts
+ClawForge only when it was already running. Use `clawforge-update --check` to
+check without installing, or `clawforge-update --yes` for unattended updates.
 
 On startup, ClawForge also seeds a native `ClawForge operations` skill into the
 workspace database. It answers questions about runtime architecture, safe

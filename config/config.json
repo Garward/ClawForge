@@ -21,12 +21,12 @@
   },
   "routing": {
     "enabled": true,
-    "fast_model": "gpt-5.6-luna",
-    "default_model": "gpt-5.6-sol",
-    "smart_model": "gpt-5.6-sol",
-    "fast_provider": "codex",
-    "default_provider": "codex",
-    "smart_provider": "codex"
+    "fast_model": "qwen3:4b",
+    "default_model": "qwen3:4b",
+    "smart_model": "qwen3:4b",
+    "fast_provider": "ollama",
+    "default_provider": "ollama",
+    "smart_provider": "ollama"
   },
   "tools": {
     "enabled": ["bash", "file_find", "file_read", "file_write", "file_diff", "amazon_search", "calc", "introspect", "meme_tool", "playwright_mcp", "vision_read", "rebuild", "zig_test", "research_tool", "visual_audit", "summon_subagent", "subagent_inspect", "subagent_stop", "subagent_redirect", "discord_history"],
@@ -55,7 +55,7 @@
   "ollama": {
     "enabled": true,
     "base_url": "http://127.0.0.1:11434",
-    "default_model": "qwen2.5-coder:14b",
+    "default_model": "qwen3:4b",
     "num_ctx": 49152,
     "model_contexts": [
       {
