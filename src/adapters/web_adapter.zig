@@ -297,6 +297,10 @@ pub const WebAdapter = struct {
             (v == .bool and v.bool)
         else
             self.config.web.compact_tool_schemas;
+        const lite_mode = if (parsed.value.object.get("lite_mode")) |v|
+            (v == .bool and v.bool)
+        else
+            self.config.web.lite_mode;
         const plans_required = if (parsed.value.object.get("plans_required")) |v|
             (v == .bool and v.bool)
         else
@@ -314,6 +318,7 @@ pub const WebAdapter = struct {
             .model_override = model_override,
             .no_tools = no_tools,
             .compact_tool_schemas = compact_tool_schemas,
+            .lite_mode = lite_mode,
             .plans_required = plans_required,
             .allowed_tools = allowed_tools,
             .adapter_context = adapter_context,
@@ -431,6 +436,10 @@ pub const WebAdapter = struct {
             (v == .bool and v.bool)
         else
             self.config.web.compact_tool_schemas;
+        const lite_mode = if (parsed.value.object.get("lite_mode")) |v|
+            (v == .bool and v.bool)
+        else
+            self.config.web.lite_mode;
         const plans_required = if (parsed.value.object.get("plans_required")) |v|
             (v == .bool and v.bool)
         else
@@ -446,6 +455,7 @@ pub const WebAdapter = struct {
             .allowed_tools = allowed_tools,
             .adapter_context = adapter_context,
             .compact_tool_schemas = compact_tool_schemas,
+            .lite_mode = lite_mode,
             .plans_required = plans_required,
             .background = true,
             .attachments = attachments,
@@ -904,6 +914,10 @@ pub const WebAdapter = struct {
             (v == .bool and v.bool)
         else
             self.config.web.compact_tool_schemas;
+        const lite_mode = if (parsed.value.object.get("lite_mode")) |v|
+            (v == .bool and v.bool)
+        else
+            self.config.web.lite_mode;
         const plans_required = if (parsed.value.object.get("plans_required")) |v|
             (v == .bool and v.bool)
         else
@@ -929,6 +943,7 @@ pub const WebAdapter = struct {
             .model_override = model_override,
             .no_tools = no_tools,
             .compact_tool_schemas = compact_tool_schemas,
+            .lite_mode = lite_mode,
             .plans_required = plans_required,
             .allowed_tools = allowed_tools,
             .adapter_context = adapter_context,
@@ -1868,12 +1883,12 @@ pub const WebAdapter = struct {
             try self.sendHttp(stream, "405 Method Not Allowed", "text/plain", "Method Not Allowed");
             return;
         }
-        var out_buf: [96]u8 = undefined;
+        var out_buf: [128]u8 = undefined;
         const out = std.fmt.bufPrint(
             &out_buf,
-            "{{\"compact_tool_schemas\":{},\"plans_required\":{}}}",
-            .{ self.config.web.compact_tool_schemas, self.config.web.plans_required },
-        ) catch "{\"compact_tool_schemas\":false,\"plans_required\":true}";
+            "{{\"compact_tool_schemas\":{},\"lite_mode\":{},\"plans_required\":{}}}",
+            .{ self.config.web.compact_tool_schemas, self.config.web.lite_mode, self.config.web.plans_required },
+        ) catch "{\"compact_tool_schemas\":false,\"lite_mode\":false,\"plans_required\":true}";
         try self.sendHttp(stream, "200 OK", "application/json", out);
     }
 

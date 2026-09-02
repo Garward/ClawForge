@@ -42,6 +42,9 @@ talk to one daemon that handles:
   hybrid keyword/semantic search over everything the agent has ever seen.
 - **Explore cache** — repeat explore calls on the same files skip the
   model entirely (keyed by content hash, auto-invalidated on edit).
+- **Ollama Lite mode** — an opt-in consumer-hardware profile that trims
+  history and retrieval, selects compact tool schemas, caps output, and
+  bounds agent rounds without reducing hosted-model behavior.
 
 ## Requirements
 
@@ -74,14 +77,16 @@ cp .env.example .env
 $EDITOR .env
 ```
 
-Minimum you need for a useful setup:
+No Anthropic, Codex, or other hosted-provider token is required. The default
+configuration uses local Ollama with `qwen3:4b`. To use optional hosted
+providers, add only the credentials for the providers you select:
 
 ```bash
 # tools/*.py live here, shebangs use /usr/bin/env python3, so supply
 # a venv with playwright, requests, etc.
 CLAWFORGE_PYTHON=/path/to/venv/bin/python3
 
-# One or more API keys (at least one provider):
+# Optional hosted provider:
 OPENROUTER_API_KEY=sk-or-...
 # or put your Anthropic key in config.api.token_file (default: data/anthropic-token.txt)
 
@@ -98,6 +103,15 @@ works without any path env vars.
 Tune `config/config.json` for model preferences, routing tiers, and
 per-provider options (Ollama base URL, OpenRouter model, vision model,
 context window size, etc.).
+
+The web config panel includes **Ollama Lite mode**. It is enabled for clean
+local-first installs and remembered per browser. Existing installs remain
+opt-in. When enabled, Ollama turns use at most 24,000 characters of history,
+keep eight recent messages, inject up to three compact retrieval results,
+select only relevant tool schemas, cap each response at 2,048 tokens, retain
+one full tool-result round, and stop after six agent rounds. The setting is
+ignored for non-Ollama providers, so switching to a hosted model restores its
+normal budgets automatically.
 
 ## Run
 
@@ -151,8 +165,8 @@ Archives land in `dist/`. A release can be installed without root access on
 most x86_64 Linux systems, including WSL:
 
 ```bash
-unzip clawforge-0.2.3-linux-x86_64.zip
-cd clawforge-0.2.3-linux-x86_64
+unzip clawforge-0.2.4-linux-x86_64.zip
+cd clawforge-0.2.4-linux-x86_64
 ./install.sh
 ```
 

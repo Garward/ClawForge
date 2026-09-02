@@ -615,6 +615,7 @@ pub const Engine = struct {
         retrieval_query: ?[]const u8,
         active_subagents_layer: ?[]const u8,
         plans_required: bool,
+        lite_mode: bool,
     ) ![]const u8 {
         var layers = try prompt_mod.buildFromState(
             self.allocator,
@@ -655,7 +656,7 @@ pub const Engine = struct {
             const matched = ss.matchForContext(
                 tool_names_buf[0..tool_count],
                 user_message orelse "",
-                4000,
+                if (lite_mode) 1600 else 4000,
             ) catch &.{};
 
             if (matched.len > 0) {
@@ -678,7 +679,7 @@ pub const Engine = struct {
                 if (sanitizeFtsQuery(self.allocator, raw_query)) |clean_query| {
                     defer self.allocator.free(clean_query);
                     if (clean_query.len > 0) {
-                        const top_k: usize = 8;
+                        const top_k: usize = if (lite_mode) 3 else 8;
                         const results = self.hybridSearch(clean_query, top_k) catch &.{};
                         if (results.len > 0) {
                             const entries = try self.allocator.alloc(prompt_mod.RetrievedEntry, results.len);
@@ -690,7 +691,7 @@ pub const Engine = struct {
                                 ) catch "";
                                 // Cap individual entry length so a huge
                                 // message can't blow the prompt budget alone.
-                                const max_entry: usize = 800;
+                                const max_entry: usize = if (lite_mode) 500 else 800;
                                 const trimmed_text = if (r.text.len > max_entry)
                                     r.text[0..max_entry]
                                 else
@@ -709,8 +710,9 @@ pub const Engine = struct {
             }
         }
 
-        // ~32K chars ≈ ~8K tokens — reasonable system prompt budget
-        return try prompt_mod.assemble(self.allocator, layers, 32768);
+        // Lite mode keeps the fixed prompt small enough for consumer Ollama
+        // models while retaining persona, project, plan, and matched skills.
+        return try prompt_mod.assemble(self.allocator, layers, if (lite_mode) 18000 else 32768);
     }
 
     /// FTS5 query sanitizer: strip every char that isn't alphanumeric or
@@ -1468,6 +1470,10 @@ pub const Engine = struct {
         // provider for backwards compat.
         const resolved = self.resolveProviderForModel(model);
         const active_provider = resolved.provider;
+        // Lite mode is deliberately provider-scoped: enabling it must not
+        // silently reduce the capabilities of hosted Anthropic/OpenAI models.
+        const lite_mode = chat_req.lite_mode and std.mem.eql(u8, active_provider.getName(), "ollama");
+        if (lite_mode) std.log.info("Ollama Lite mode enabled for model {s}", .{resolved.model});
         if (!std.mem.eql(u8, active_provider.getName(), self.provider.getName())) {
             std.log.info("Provider switch: {s} → {s} (model={s})", .{
                 self.provider.getName(),
@@ -1506,9 +1512,9 @@ pub const Engine = struct {
             self.summary_store,
             &sess.id,
             context_mod.CompactConfig{
-                .compact_threshold = self.config.context.compact_threshold,
-                .recent_window = self.config.context.recent_window,
-                .max_context_chars = self.config.context.max_context_chars,
+                .compact_threshold = if (lite_mode) 24000 else self.config.context.compact_threshold,
+                .recent_window = if (lite_mode) 8 else self.config.context.recent_window,
+                .max_context_chars = if (lite_mode) 24000 else self.config.context.max_context_chars,
             },
         ) catch |err| {
             std.log.err("Build messages failed: {}", .{err});
@@ -1733,6 +1739,7 @@ pub const Engine = struct {
             retrieval_query,
             active_subagents_layer,
             chat_req.plans_required,
+            lite_mode,
         ) catch sess.system_prompt;
 
         var owned_tool_defs: std.ArrayList([]const api.messages.ToolDefinition) = .empty;
@@ -1753,7 +1760,7 @@ pub const Engine = struct {
             self.selectAllowedToolDefinitions(at, is_subagent)
         else if (is_subagent)
             self.tool_registry.getToolDefinitionsExcludingMany(&tools.ToolRegistry.SUBAGENT_HIDDEN_TOOLS)
-        else if (chat_req.compact_tool_schemas)
+        else if (chat_req.compact_tool_schemas or lite_mode)
             self.selectToolDefinitionsForMessage(chat_req.message)
         else
             self.tool_registry.getToolDefinitions();
@@ -1803,7 +1810,7 @@ pub const Engine = struct {
                 prompt_mod.loadPersona(vision_arena, name) orelse prompt_mod.DEFAULT_PERSONA
             else
                 prompt_mod.DEFAULT_PERSONA;
-            const max_persona_anchor: usize = 3200;
+            const max_persona_anchor: usize = if (lite_mode) 1200 else 3200;
             break :blk_persona_anchor persona_text[0..@min(persona_text.len, max_persona_anchor)];
         };
         const effective_system: ?[]const u8 = blk_sys: {
@@ -1837,7 +1844,7 @@ pub const Engine = struct {
 
         const api_request = api.MessageRequest{
             .model = resolved.model,
-            .max_tokens = self.config.api.max_tokens,
+            .max_tokens = if (lite_mode) @min(self.config.api.max_tokens, 2048) else self.config.api.max_tokens,
             .messages = msgs,
             .system = effective_system,
             .tools = if (chat_req.no_tools) null else initial_tools,
@@ -1852,7 +1859,8 @@ pub const Engine = struct {
         // The LLM may request tool calls. We execute them (with confirmation
         // if needed), send results back, and loop until the LLM gives a
         // final text response (stop_reason != "tool_use").
-        // Max 10 tool rounds to prevent infinite loops.
+        // Hosted models retain the high agency ceiling. Consumer Ollama
+        // models use a smaller ceiling so context cannot grow without bound.
         // ============================================================
         var total_input_tokens: u32 = 0;
         var total_output_tokens: u32 = 0;
@@ -1930,7 +1938,8 @@ pub const Engine = struct {
         var stop_reason_buf: [80]u8 = undefined;
         var stop_reason_len: usize = 0;
         var tool_round: usize = 0;
-        while (tool_round < 100) : (tool_round += 1) {
+        const max_tool_rounds: usize = if (lite_mode) 6 else 100;
+        while (tool_round < max_tool_rounds) : (tool_round += 1) {
             // Check if the client disconnected (SSE write failed)
             if (emitter) |em| {
                 if (em.isCancelled()) {
@@ -2364,7 +2373,7 @@ pub const Engine = struct {
                         break :blk res;
                     } else if (std.mem.eql(u8, tool_call.name, "summon_subagent")) blk: {
                         std.log.info("Special tool: summon_subagent", .{});
-                        break :blk self.handleSummonSubagent(tool_call.input, &sess.id, &spawned_subagent_ids, model, chat_req.delegated_model_override, chat_req.allowed_tools, chat_req.plans_required);
+                        break :blk self.handleSummonSubagent(tool_call.input, &sess.id, &spawned_subagent_ids, model, chat_req.delegated_model_override, chat_req.allowed_tools, chat_req.plans_required, chat_req.lite_mode);
                     } else if (std.mem.eql(u8, tool_call.name, "subagent_inspect")) blk: {
                         std.log.info("Special tool: subagent_inspect", .{});
                         break :blk self.handleSubagentInspect(tool_call.input, &sess.id);
@@ -2528,11 +2537,12 @@ pub const Engine = struct {
                 extended[prev.len + 1] = .{ .role = .user, .content = result_blocks.items };
 
                 // Compact older tool_result blocks to prevent unbounded growth.
-                // Keep last 3 rounds (6 messages) at full size.
+                // Lite mode keeps only the latest round at full size.
                 // Older results keep both the beginning and the end so paths and the
                 // actual trailing compiler/runtime errors remain visible to the model.
                 if (extended.len > 8) {
-                    const keep_full_from = if (extended.len > 6) extended.len - 6 else 0;
+                    const keep_full_messages: usize = if (lite_mode) 2 else 6;
+                    const keep_full_from = if (extended.len > keep_full_messages) extended.len - keep_full_messages else 0;
                     for (extended[0..keep_full_from]) |*msg| {
                         if (msg.role != .user) continue;
                         const blocks = @constCast(msg.content);
@@ -2542,9 +2552,12 @@ pub const Engine = struct {
                                     if (std.mem.startsWith(u8, tr.content, "[TOOL FINDINGS CAPSULE]")) {
                                         continue;
                                     }
-                                    if (tr.content.len > 2400) {
-                                        const head_len = @min(tr.content.len, 1200);
-                                        const tail_len = @min(tr.content.len - head_len, 800);
+                                    const result_limit: usize = if (lite_mode) 1200 else 2400;
+                                    if (tr.content.len > result_limit) {
+                                        const head_limit: usize = if (lite_mode) 600 else 1200;
+                                        const tail_limit: usize = if (lite_mode) 400 else 800;
+                                        const head_len = @min(tr.content.len, head_limit);
+                                        const tail_len = @min(tr.content.len - head_len, tail_limit);
                                         const omitted = tr.content.len - head_len - tail_len;
                                         const summary = std.fmt.allocPrint(
                                             self.allocator,
@@ -3395,6 +3408,7 @@ pub const Engine = struct {
         delegated_model_override: ?[]const u8,
         parent_allowed_tools: ?[]const u8,
         parent_plans_required: bool,
+        parent_lite_mode: bool,
     ) tools.ToolResult {
         const wp = self.worker_pool orelse return .{
             .content = "summon_subagent unavailable: no worker pool configured",
@@ -3847,6 +3861,7 @@ pub const Engine = struct {
             .is_subagent = true,
             .is_explore = is_explore,
             .plans_required = parent_plans_required,
+            .lite_mode = parent_lite_mode,
             .auto_chain = auto_chain_effective,
             .chain_allowed_tools = chain_allowed_dup,
             .cancelled = std.atomic.Value(bool).init(false),
@@ -4074,6 +4089,7 @@ pub const Engine = struct {
             .adapter_context = adapter_context,
             .is_subagent = req.is_subagent,
             .compact_tool_schemas = req.compact_tool_schemas,
+            .lite_mode = req.lite_mode,
             .plans_required = req.plans_required,
             .cancelled = std.atomic.Value(bool).init(false),
         });
@@ -4210,6 +4226,7 @@ pub const Engine = struct {
         is_subagent: bool,
         is_explore: bool,
         compact_tool_schemas: bool,
+        lite_mode: bool,
         plans_required: bool,
         confirm_ctx: ?*anyopaque,
         confirm_fn: ?*const fn (ctx: *anyopaque, tool_name: []const u8, tool_id: []const u8, input_preview: []const u8) bool,
@@ -4250,6 +4267,7 @@ pub const Engine = struct {
             .background = false,
             .is_subagent = is_subagent,
             .compact_tool_schemas = compact_tool_schemas,
+            .lite_mode = lite_mode,
             .plans_required = plans_required,
             .attachments = attachments,
         } }, null, confirmer);

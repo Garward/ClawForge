@@ -57,7 +57,7 @@ pub const SkillStore = struct {
         );
         defer stmt.deinit();
         try stmt.bindInt64(1, self.namespace_id);
-        try stmt.bindText(2, "clawforge,clawforged,clawforge-update,clawforge-active,workspace.db");
+        try stmt.bindText(2, "clawforge,clawforged,clawforge-update,clawforge-active,workspace.db,ollama,lite mode");
         try stmt.bindText(3,
             \\For ClawForge operational questions, first distinguish the Git source checkout from the active runtime. The recommended source workspace is ClawForge/repo for Git and builds plus ClawForge/runtime for active use. Release installs default to ${XDG_DATA_HOME:-$HOME/.local/share}/clawforge. Confirm actual paths from CLAWFORGE_ROOT, CLAWFORGE_DB, CLAWFORGE_DAEMON, the running process, or .env instead of assuming.
             \\
@@ -66,6 +66,8 @@ pub const SkillStore = struct {
             \\From source, use scripts/deploy.sh --build, then restart the active tree. A build failure must leave the active runtime unchanged. Release install.sh and clawforge-update use guided terminal prompts when run interactively; pass --yes for unattended operation and clawforge-update --check to check without installing. Updates verify the SHA-256 checksum, preserve runtime data/config, and restart only if already running. restart.sh clean deletes messages and sessions and requires explicit user intent.
             \\
             \\No Anthropic, Codex, or hosted-provider token is required to install or start ClawForge. Clean release installs default to token-free Ollama with qwen3:4b; hosted providers remain optional. The clawforged Zig daemon owns the model providers, agent loop, tools, workers, SQLite storage, web UI, and socket server. The clawforge binary is the CLI. The Discord adapter launches bridges/discord_bridge.py with the active .venv. For failures, check /tmp/clawforge.log, /tmp/clawforge_rebuild.log, the configured paths, and http://127.0.0.1:8081/api/status.
+            \\
+            \\The web config panel's Ollama Lite mode is for consumer hardware. It is remembered by the browser and applies only when the resolved provider is Ollama. It limits history to 24,000 characters with eight recent messages, uses three compact retrieval hits and message-selected tool schemas, caps model output at 2,048 tokens, retains one full tool-result round, and allows six agent rounds. Hosted providers ignore the toggle. Clean local-first installs enable it by default; existing installs are opt-in.
         );
         try stmt.bindInt64(4, now);
         try stmt.bindInt64(5, now);

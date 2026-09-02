@@ -1429,6 +1429,18 @@
         <div class="config-section">
             <h4>Context &amp; Compaction</h4>
             <div id="compaction-status" style="font-size: 12px; color: var(--text-dim);">Loading...</div>
+            <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border-subtle);">
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+                    <label style="font-size:12px;font-weight:700;color:var(--text-primary);cursor:pointer;display:flex;align-items:center;gap:7px;">
+                        <input type="checkbox" id="lite-mode-toggle" style="accent-color:var(--accent-primary);">
+                        Ollama Lite mode
+                    </label>
+                    <span id="lite-mode-status" style="font-size:11px;color:var(--text-dim);"></span>
+                </div>
+                <div style="font-size:11px;line-height:1.45;color:var(--text-dim);margin-top:6px;">
+                    Uses smaller history, retrieval, tool, output, and agent-loop budgets on consumer hardware. Applied only to Ollama models.
+                </div>
+            </div>
         </div>
 
         <div class="config-section">
@@ -1502,6 +1514,7 @@
             modelOverride: '',
             toolsEnabled: {},
             compactToolSchemas: null,
+            liteMode: null,
             plansRequired: null,
             pendingAttachments: [],  // [{path, mime, name, localUrl}]
             activeJobIds: new Set(),
@@ -2971,6 +2984,9 @@
             if (state.compactToolSchemas !== null) {
                 chatBody.compact_tool_schemas = !!state.compactToolSchemas;
             }
+            if (state.liteMode !== null) {
+                chatBody.lite_mode = !!state.liteMode;
+            }
             if (state.plansRequired !== null) {
                 chatBody.plans_required = !!state.plansRequired;
             }
@@ -3571,6 +3587,39 @@
                 state.compactToolSchemas = toggle.checked;
                 localStorage.setItem('clawforge.compactToolSchemas', toggle.checked ? 'true' : 'false');
                 statusEl.textContent = toggle.checked ? 'ON' : '';
+                statusEl.style.color = toggle.checked ? 'var(--success)' : 'var(--text-dim)';
+            });
+        })();
+
+        // Ollama Lite mode toggle. The engine applies it only when the
+        // resolved provider is Ollama, so hosted model behavior is unchanged.
+        (async function initLiteMode() {
+            const toggle = document.getElementById('lite-mode-toggle');
+            const statusEl = document.getElementById('lite-mode-status');
+            if (!toggle) return;
+
+            let enabled = false;
+            const stored = localStorage.getItem('clawforge.liteMode');
+            if (stored === 'true' || stored === 'false') {
+                enabled = stored === 'true';
+            } else {
+                try {
+                    const settings = await apiGet('/api/tools/settings');
+                    enabled = !!settings.lite_mode;
+                } catch (e) {
+                    enabled = false;
+                }
+            }
+
+            state.liteMode = enabled;
+            toggle.checked = enabled;
+            statusEl.textContent = enabled ? 'ON' : 'OFF';
+            statusEl.style.color = enabled ? 'var(--success)' : 'var(--text-dim)';
+
+            toggle.addEventListener('change', () => {
+                state.liteMode = toggle.checked;
+                localStorage.setItem('clawforge.liteMode', toggle.checked ? 'true' : 'false');
+                statusEl.textContent = toggle.checked ? 'ON' : 'OFF';
                 statusEl.style.color = toggle.checked ? 'var(--success)' : 'var(--text-dim)';
             });
         })();

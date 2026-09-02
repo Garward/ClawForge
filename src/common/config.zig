@@ -41,6 +41,8 @@ pub const WebConfig = struct {
     port: u16 = 8081,
     host: []const u8 = "127.0.0.1",
     compact_tool_schemas: bool = false,
+    /// Reduce prompt and loop budgets when the active provider is Ollama.
+    lite_mode: bool = false,
     plans_required: bool = true,
 };
 

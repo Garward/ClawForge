@@ -21,7 +21,7 @@ immediately benefit from the user's entire history, preferences, and project sta
 - **Token-efficient**: surgical context injection via hybrid search (FTS5 + vector + RRF),
   session compaction, rolling project context. ~500 tokens of context, not 200k stuffing.
 
-## Current State (v0.2.3)
+## Current State (v0.2.4)
 
 ### Distribution and installation
 
@@ -31,6 +31,8 @@ immediately benefit from the user's entire history, preferences, and project sta
 - [x] Provide a checksum-verified, data-preserving `clawforge-update` command.
 - [x] Seed a native operational skill for runtime, update, config, and data questions.
 - [x] Guide interactive installs and updates with safe unattended flags.
+- [x] Add an Ollama-only Lite mode for consumer hardware with bounded context,
+      retrieval, tool schemas, output, and agent rounds.
 - [ ] Test clean installs on Ubuntu/Debian, Fedora, Arch, and Windows WSL.
 - [ ] Add Linux ARM64 release archives and CI coverage.
 - [ ] Investigate a fully static musl/SQLite build for distributions older

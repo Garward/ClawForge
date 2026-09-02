@@ -55,6 +55,7 @@ pub const Request = union(enum) {
         stream: bool = true,
         no_tools: bool = false,
         compact_tool_schemas: bool = false,
+        lite_mode: bool = false,
         plans_required: bool = true,
         background: bool = false,
         callback_channel: ?[]const u8 = null,
@@ -143,6 +144,9 @@ pub const Request = union(enum) {
                 }
                 if (req.compact_tool_schemas) {
                     write(buf, &pos, ",\"compact_tool_schemas\":true");
+                }
+                if (req.lite_mode) {
+                    write(buf, &pos, ",\"lite_mode\":true");
                 }
                 if (!req.plans_required) {
                     write(buf, &pos, ",\"plans_required\":false");

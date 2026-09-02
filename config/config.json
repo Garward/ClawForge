@@ -17,6 +17,7 @@
     "port": 8081,
     "host": "127.0.0.1",
     "compact_tool_schemas": true,
+    "lite_mode": true,
     "plans_required": true
   },
   "routing": {
