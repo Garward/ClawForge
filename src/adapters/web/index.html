@@ -368,37 +368,128 @@
         .closed-sessions-header .arrow { transition: transform 0.15s; font-size: 9px; }
         .closed-sessions-header.expanded .arrow { transform: rotate(90deg); }
 
-        .skill-card {
+        .skills-summary {
+            margin: -2px 0 10px;
+            color: var(--text-dim);
+            font-size: 11px;
+            text-align: center;
+        }
+        .skill-group {
             border: 1px solid var(--border-subtle);
             border-radius: var(--radius);
-            padding: 8px 12px;
-            margin-bottom: 6px;
-            position: relative;
+            margin-bottom: 8px;
+            overflow: hidden;
+            background: color-mix(in srgb, var(--bg-secondary) 88%, var(--bg-hover));
         }
-        .skill-card-header {
-            display: flex;
+        .skill-group > summary, .skill-card > summary {
+            list-style: none;
+            cursor: pointer;
+            user-select: none;
+        }
+        .skill-group > summary::-webkit-details-marker,
+        .skill-card > summary::-webkit-details-marker { display: none; }
+        .skill-group-header {
+            display: grid;
+            grid-template-columns: 36px minmax(0, 1fr) 36px;
             align-items: center;
-            justify-content: space-between;
-            gap: 8px;
-        }
-        .skill-card-name { font-size: 13px; color: var(--text-primary); font-weight: 500; }
-        .skill-category {
-            font-size: 10px;
+            min-height: 34px;
+            padding: 0 8px;
             background: var(--bg-hover);
-            color: var(--text-muted);
-            padding: 1px 6px;
-            border-radius: 8px;
         }
-        .skill-trigger { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
-        .skill-instruction { font-size: 12px; color: var(--text-secondary); margin-top: 4px; line-height: 1.4; }
-        .skill-actions { display: flex; gap: 4px; align-items: center; }
+        .skill-group-title {
+            overflow: hidden;
+            color: var(--text-primary);
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            text-align: center;
+            text-overflow: ellipsis;
+            text-transform: uppercase;
+            white-space: nowrap;
+        }
+        .skill-group-count {
+            color: var(--text-muted);
+            font-size: 10px;
+            text-align: right;
+        }
+        .skill-chevron {
+            color: var(--text-muted);
+            font-size: 12px;
+            transition: transform 0.15s ease;
+        }
+        .skill-group[open] > .skill-group-header .skill-chevron,
+        .skill-card[open] > .skill-card-header .skill-chevron { transform: rotate(90deg); }
+        .skill-group-body { padding: 6px; }
+        .skill-card {
+            border: 1px solid transparent;
+            border-radius: var(--radius);
+            overflow: hidden;
+        }
+        .skill-card + .skill-card { margin-top: 5px; }
+        .skill-card[open] { border-color: var(--border-subtle); background: var(--bg-primary); }
+        .skill-card-header {
+            display: grid;
+            grid-template-columns: 64px minmax(0, 1fr) 64px;
+            align-items: center;
+            min-height: 34px;
+            padding: 0 6px;
+            background: var(--bg-secondary);
+        }
+        .skill-card-header:hover { background: var(--bg-hover); }
+        .skill-card-heading {
+            overflow: hidden;
+            color: var(--text-primary);
+            font-size: 12px;
+            font-weight: 700;
+            text-align: center;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .skill-card-body {
+            padding: 10px;
+            border-top: 1px solid var(--border-subtle);
+        }
+        .skill-meta {
+            display: grid;
+            grid-template-columns: auto minmax(0, 1fr);
+            gap: 5px 8px;
+            margin-bottom: 10px;
+            font-size: 11px;
+        }
+        .skill-meta-label { color: var(--text-muted); font-weight: 600; }
+        .skill-meta-value { min-width: 0; color: var(--text-secondary); overflow-wrap: anywhere; }
+        .skill-meta-value code { color: var(--accent-primary); font-family: var(--font-mono); }
+        .skill-section-title {
+            margin: 2px 0 7px;
+            color: var(--text-primary);
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            text-align: center;
+            text-transform: uppercase;
+        }
+        .skill-instruction {
+            max-height: 220px;
+            margin: 0;
+            overflow: auto;
+            color: var(--text-secondary);
+            font-family: var(--font-sans);
+            font-size: 12px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+        }
+        .skill-actions { display: flex; gap: 4px; align-items: center; justify-content: flex-end; }
         .skill-delete-btn {
             background: none; border: none; color: var(--text-muted); cursor: pointer;
-            font-size: 13px; padding: 2px 4px;
+            font-size: 15px; padding: 4px; line-height: 1;
         }
         .skill-delete-btn:hover { color: var(--error); }
 
-        .skill-form { border: 1px solid var(--accent-primary); border-radius: var(--radius); padding: 10px; margin-bottom: 8px; }
+        .skill-form { border: 1px solid var(--accent-primary); border-radius: var(--radius); padding: 10px; margin-bottom: 10px; }
+        .skill-form-title {
+            margin-bottom: 10px; color: var(--text-primary); font-size: 12px;
+            font-weight: 700; letter-spacing: 0.06em; text-align: center; text-transform: uppercase;
+        }
         .skill-form input, .skill-form select, .skill-form textarea {
             width: 100%; box-sizing: border-box; margin-top: 4px; margin-bottom: 8px;
             background: var(--bg-primary); border: 1px solid var(--border-subtle);
@@ -1370,6 +1461,7 @@
 
         <div class="config-section">
             <h4>Skills</h4>
+            <div class="skills-summary" id="skills-summary">Loading skill library...</div>
             <div id="skill-form-container"></div>
             <div id="skills-list">
                 <div style="font-size: 12px; color: var(--text-dim);">Loading...</div>
@@ -3518,49 +3610,114 @@
         /* ============================
            Skills Management
            ============================ */
+        function skillInvocationName(name) {
+            return name.toLowerCase()
+                .replace(/[^a-z0-9]+/g, '-')
+                .replace(/^-+|-+$/g, '');
+        }
+
+        function skillTriggerSummary(skill) {
+            if (skill.trigger_type === 'always') return 'Every request';
+            if (skill.trigger_type === 'tool') {
+                return 'Tool available: ' + (skill.trigger_value || 'not configured');
+            }
+            return 'Keywords: ' + (skill.trigger_value || 'not configured');
+        }
+
+        let skillsLoadSequence = 0;
+
         async function loadSkills() {
             const container = document.getElementById('skills-list');
-            container.innerHTML = '';
+            const summary = document.getElementById('skills-summary');
+            const loadSequence = ++skillsLoadSequence;
 
             try {
                 const skills = await apiGet('/api/skills');
+                if (loadSequence !== skillsLoadSequence) return;
+
+                container.innerHTML = '';
+                const enabledCount = skills.filter(skill => skill.enabled).length;
+                summary.textContent = skills.length + ' skill' + (skills.length === 1 ? '' : 's') +
+                    ' \u00b7 ' + enabledCount + ' enabled';
 
                 if (skills.length === 0) {
-                    container.innerHTML = '<div style="font-size:12px;color:var(--text-dim);">No skills yet</div>';
+                    container.innerHTML = '<div style="font-size:12px;color:var(--text-dim);text-align:center;padding:12px;">No skills configured</div>';
                     return;
                 }
 
+                const groups = new Map();
                 skills.forEach(skill => {
-                    const card = document.createElement('div');
-                    card.className = 'skill-card';
-                    const triggerInfo = skill.trigger_type === 'always' ? 'always active'
-                        : skill.trigger_type + ': ' + (skill.trigger_value || '');
+                    const category = (skill.category || 'general').trim() || 'general';
+                    if (!groups.has(category)) groups.set(category, []);
+                    groups.get(category).push(skill);
+                });
 
-                    card.innerHTML =
-                        '<div class="skill-card-header">' +
-                            '<span class="skill-card-name">' + escapeHtml(skill.name) + '</span>' +
-                            '<div class="skill-actions">' +
-                                '<span class="skill-category">' + escapeHtml(skill.category) + '</span>' +
-                                '<label class="toggle"><input type="checkbox" ' + (skill.enabled ? 'checked' : '') + '><span class="toggle-track"></span></label>' +
-                                '<button class="skill-delete-btn" title="Delete">&times;</button>' +
-                            '</div>' +
-                        '</div>' +
-                        '<div class="skill-trigger">' + escapeHtml(triggerInfo) + '</div>' +
-                        '<div class="skill-instruction">' + escapeHtml(skill.instruction) + '</div>';
+                Array.from(groups.entries()).forEach(([category, categorySkills], groupIndex) => {
+                    const group = document.createElement('details');
+                    group.className = 'skill-group';
+                    group.open = groupIndex === 0;
+                    const categoryLabel = category.replace(/[-_]+/g, ' ');
+                    group.innerHTML =
+                        '<summary class="skill-group-header">' +
+                            '<span class="skill-chevron" aria-hidden="true">&#9654;</span>' +
+                            '<span class="skill-group-title">' + escapeHtml(categoryLabel) + '</span>' +
+                            '<span class="skill-group-count">' + categorySkills.length + '</span>' +
+                        '</summary>' +
+                        '<div class="skill-group-body"></div>';
 
-                    card.querySelector('input[type=checkbox]').addEventListener('change', async (e) => {
-                        await apiPost('/api/skills', { action: 'toggle', id: skill.id, enabled: e.target.checked });
+                    const groupBody = group.querySelector('.skill-group-body');
+                    categorySkills.forEach(skill => {
+                        const card = document.createElement('details');
+                        card.className = 'skill-card';
+                        const invocation = skillInvocationName(skill.name);
+                        card.innerHTML =
+                            '<summary class="skill-card-header">' +
+                                '<span class="skill-chevron" aria-hidden="true">&#9654;</span>' +
+                                '<span class="skill-card-heading">' + escapeHtml(skill.name) + '</span>' +
+                                '<div class="skill-actions">' +
+                                    '<label class="toggle" title="Enable or disable this skill"><input type="checkbox" ' + (skill.enabled ? 'checked' : '') + '><span class="toggle-track"></span></label>' +
+                                    '<button class="skill-delete-btn" aria-label="Delete ' + escapeHtml(skill.name) + '" title="Delete skill">&times;</button>' +
+                                '</div>' +
+                            '</summary>' +
+                            '<div class="skill-card-body">' +
+                                '<div class="skill-meta">' +
+                                    '<span class="skill-meta-label">Invoke</span><span class="skill-meta-value"><code>$' + escapeHtml(invocation) + '</code> or <code>@' + escapeHtml(invocation) + '</code></span>' +
+                                    '<span class="skill-meta-label">Trigger</span><span class="skill-meta-value">' + escapeHtml(skillTriggerSummary(skill)) + '</span>' +
+                                    '<span class="skill-meta-label">Priority</span><span class="skill-meta-value">' + Number(skill.priority || 0) + '</span>' +
+                                '</div>' +
+                                '<div class="skill-section-title">Instructions</div>' +
+                                '<pre class="skill-instruction">' + escapeHtml(skill.instruction) + '</pre>' +
+                            '</div>';
+
+                        const toggle = card.querySelector('.toggle');
+                        toggle.addEventListener('click', e => e.stopPropagation());
+                        toggle.querySelector('input').addEventListener('change', async (e) => {
+                            try {
+                                await apiPost('/api/skills', { action: 'toggle', id: skill.id, enabled: e.target.checked });
+                                const newEnabledCount = skills.filter(item => item.id === skill.id ? e.target.checked : item.enabled).length;
+                                summary.textContent = skills.length + ' skill' + (skills.length === 1 ? '' : 's') +
+                                    ' \u00b7 ' + newEnabledCount + ' enabled';
+                            } catch (error) {
+                                e.target.checked = !e.target.checked;
+                            }
+                        });
+
+                        card.querySelector('.skill-delete-btn').addEventListener('click', async (e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            if (!confirm('Delete skill "' + skill.name + '"?')) return;
+                            await apiPost('/api/skills', { action: 'delete', id: skill.id });
+                            loadSkills();
+                        });
+
+                        groupBody.appendChild(card);
                     });
 
-                    card.querySelector('.skill-delete-btn').addEventListener('click', async () => {
-                        if (!confirm('Delete skill "' + skill.name + '"?')) return;
-                        await apiPost('/api/skills', { action: 'delete', id: skill.id });
-                        loadSkills();
-                    });
-
-                    container.appendChild(card);
+                    container.appendChild(group);
                 });
             } catch (e) {
+                if (loadSequence !== skillsLoadSequence) return;
+                summary.textContent = 'Skill library unavailable';
                 container.innerHTML = '<div style="font-size:12px;color:var(--error);">Failed to load skills</div>';
             }
         }
@@ -3572,9 +3729,10 @@
             const form = document.createElement('div');
             form.className = 'skill-form';
             form.innerHTML =
+                '<div class="skill-form-title">New Skill</div>' +
                 '<label>Name</label><input type="text" id="sf-name" placeholder="Shell path safety">' +
                 '<label>Category</label><input type="text" id="sf-category" value="general" placeholder="best_practices">' +
-                '<label>Trigger Type</label><select id="sf-trigger-type"><option value="always">Always</option><option value="tool">Tool</option><option value="keyword">Keyword</option></select>' +
+                '<label>Trigger Type</label><select id="sf-trigger-type"><option value="always">Every request</option><option value="tool">Tool available</option><option value="keyword">Keywords</option></select>' +
                 '<label>Trigger Value</label><input type="text" id="sf-trigger-value" placeholder="comma-separated tools or keywords">' +
                 '<label>Instruction</label><textarea id="sf-instruction" placeholder="Always use ~ instead of hardcoding paths..."></textarea>' +
                 '<label>Priority</label><input type="number" id="sf-priority" value="0">' +

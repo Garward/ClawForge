@@ -138,7 +138,8 @@ pub const SkillStore = struct {
     }
 
     /// Match skills against current request context.
-    /// Returns skills whose triggers fire, up to max_chars of instruction text.
+    /// Explicit $skill-name or @skill-name invocations always win. Implicit
+    /// matches respect max_chars and are selected in priority order.
     pub fn matchForContext(
         self: *SkillStore,
         enabled_tools: []const []const u8,
@@ -158,9 +159,11 @@ pub const SkillStore = struct {
 
         while (try stmt.step()) {
             const skill = try self.readSkill(&stmt);
+            const explicitly_invoked = containsSkillInvocation(user_message, skill.name);
 
             // Check trigger
             const matches = switch_trigger: {
+                if (explicitly_invoked) break :switch_trigger true;
                 if (std.mem.eql(u8, skill.trigger_type, "always")) break :switch_trigger true;
 
                 if (std.mem.eql(u8, skill.trigger_type, "tool")) {
@@ -178,24 +181,10 @@ pub const SkillStore = struct {
 
                 if (std.mem.eql(u8, skill.trigger_type, "keyword")) {
                     if (skill.trigger_value) |tv| {
-                        // Case-insensitive keyword check
-                        var msg_lower_buf: [4096]u8 = undefined;
-                        const msg_len = @min(user_message.len, msg_lower_buf.len);
-                        for (user_message[0..msg_len], 0..) |c, i| {
-                            msg_lower_buf[i] = std.ascii.toLower(c);
-                        }
-                        const msg_lower = msg_lower_buf[0..msg_len];
-
                         var it = std.mem.splitScalar(u8, tv, ',');
                         while (it.next()) |kw| {
                             const trimmed = std.mem.trim(u8, kw, " ");
-                            // Lowercase the keyword too
-                            var kw_lower_buf: [128]u8 = undefined;
-                            const kw_len = @min(trimmed.len, kw_lower_buf.len);
-                            for (trimmed[0..kw_len], 0..) |c, i| {
-                                kw_lower_buf[i] = std.ascii.toLower(c);
-                            }
-                            if (std.mem.indexOf(u8, msg_lower, kw_lower_buf[0..kw_len]) != null) {
+                            if (containsKeyword(user_message, trimmed)) {
                                 break :switch_trigger true;
                             }
                         }
@@ -208,8 +197,9 @@ pub const SkillStore = struct {
 
             if (!matches) continue;
 
-            // Budget check
-            if (total_chars + skill.instruction.len > max_chars and n > 0) break;
+            // Keep looking after an oversized implicit skill: a lower-priority
+            // explicit invocation may still appear later in the result set.
+            if (!explicitly_invoked and total_chars + skill.instruction.len > max_chars and n > 0) continue;
             total_chars += skill.instruction.len;
 
             if (n >= buf.len) break;
@@ -244,3 +234,72 @@ pub const SkillStore = struct {
         return @intCast(stmt.columnInt64(0));
     }
 };
+
+fn isWordChar(char: u8) bool {
+    return std.ascii.isAlphanumeric(char) or char == '_';
+}
+
+fn containsKeyword(message: []const u8, raw_keyword: []const u8) bool {
+    const keyword = std.mem.trim(u8, raw_keyword, &std.ascii.whitespace);
+    if (keyword.len == 0 or keyword.len > message.len) return false;
+
+    var start: usize = 0;
+    while (start + keyword.len <= message.len) : (start += 1) {
+        if (!std.ascii.eqlIgnoreCase(message[start .. start + keyword.len], keyword)) continue;
+
+        const before_ok = start == 0 or !isWordChar(keyword[0]) or !isWordChar(message[start - 1]);
+        const end = start + keyword.len;
+        const after_ok = end == message.len or !isWordChar(keyword[keyword.len - 1]) or !isWordChar(message[end]);
+        if (before_ok and after_ok) return true;
+    }
+    return false;
+}
+
+fn skillSlug(name: []const u8, output: []u8) []const u8 {
+    var len: usize = 0;
+    var pending_dash = false;
+    for (name) |char| {
+        if (std.ascii.isAlphanumeric(char)) {
+            if (pending_dash and len > 0 and len < output.len) {
+                output[len] = '-';
+                len += 1;
+            }
+            if (len >= output.len) break;
+            output[len] = std.ascii.toLower(char);
+            len += 1;
+            pending_dash = false;
+        } else if (len > 0) {
+            pending_dash = true;
+        }
+    }
+    return output[0..len];
+}
+
+fn containsSkillInvocation(message: []const u8, name: []const u8) bool {
+    var slug_buf: [128]u8 = undefined;
+    const slug = skillSlug(name, &slug_buf);
+    if (slug.len == 0) return false;
+
+    for (message, 0..) |char, index| {
+        if (char != '$' and char != '@') continue;
+        const start = index + 1;
+        if (start + slug.len > message.len) continue;
+        if (!std.ascii.eqlIgnoreCase(message[start .. start + slug.len], slug)) continue;
+        const end = start + slug.len;
+        if (end == message.len or (!isWordChar(message[end]) and message[end] != '-')) return true;
+    }
+    return false;
+}
+
+test "keyword matching is case insensitive and respects word boundaries" {
+    try std.testing.expect(containsKeyword("Please update ClawForge now", "clawforge"));
+    try std.testing.expect(containsKeyword("Use CC:Tweaked", "cc:tweaked"));
+    try std.testing.expect(!containsKeyword("Choose a model", "mod"));
+    try std.testing.expect(!containsKeyword("unrelated", ""));
+}
+
+test "skill invocation uses a stable slug and token boundary" {
+    try std.testing.expect(containsSkillInvocation("Use $clawforge-operations for this", "ClawForge operations"));
+    try std.testing.expect(containsSkillInvocation("@CLAWFORGE-OPERATIONS", "ClawForge operations"));
+    try std.testing.expect(!containsSkillInvocation("$clawforge-operations-extra", "ClawForge operations"));
+}

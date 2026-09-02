@@ -151,8 +151,8 @@ Archives land in `dist/`. A release can be installed without root access on
 most x86_64 Linux systems, including WSL:
 
 ```bash
-unzip clawforge-0.2.1-linux-x86_64.zip
-cd clawforge-0.2.1-linux-x86_64
+unzip clawforge-0.2.2-linux-x86_64.zip
+cd clawforge-0.2.2-linux-x86_64
 ./install.sh
 ```
 
