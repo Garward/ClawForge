@@ -134,7 +134,7 @@ pub const AnthropicClient = struct {
         arena_ptr.* = std.heap.ArenaAllocator.init(self.allocator);
         const arena = arena_ptr.allocator();
 
-        var client = http.Client{ .allocator = arena };
+        var client = http.Client{ .allocator = arena, .io = common.config.runtimeIo() };
 
         var url_buf: [256]u8 = undefined;
         const url = std.fmt.bufPrint(&url_buf, "{s}/v1/messages", .{self.base_url}) catch {
@@ -182,7 +182,7 @@ pub const AnthropicClient = struct {
                     err_body[0..@min(err_body.len, 200)],
                 },
             );
-            std.Thread.sleep(retry_delays_ns[attempt]);
+            common.sync.sleepNanoseconds(retry_delays_ns[attempt]);
             attempt += 1;
         };
 
@@ -286,7 +286,7 @@ pub const AnthropicClient = struct {
         arena_ptr.* = std.heap.ArenaAllocator.init(self.allocator);
         const arena = arena_ptr.allocator();
 
-        var client = http.Client{ .allocator = arena };
+        var client = http.Client{ .allocator = arena, .io = common.config.runtimeIo() };
 
         var url_buf: [256]u8 = undefined;
         const url = std.fmt.bufPrint(&url_buf, "{s}/v1/messages", .{self.base_url}) catch {
@@ -361,11 +361,11 @@ pub const AnthropicClient = struct {
         var sse_parser = sse.SSEParser.init(arena);
 
         // Accumulate text and tool_use across all events
-        var text_buf: std.ArrayList(u8) = .{};
-        var tool_uses: std.ArrayList(messages.ToolUseInfo) = .{};
+        var text_buf: std.ArrayList(u8) = .empty;
+        var tool_uses: std.ArrayList(messages.ToolUseInfo) = .empty;
 
         // Current tool input accumulator (for input_json_delta events)
-        var current_tool_input: std.ArrayList(u8) = .{};
+        var current_tool_input: std.ArrayList(u8) = .empty;
         var current_tool_id: []const u8 = "";
         var current_tool_name: []const u8 = "";
 
@@ -405,7 +405,7 @@ pub const AnthropicClient = struct {
                         if (sse.SSEParser.extractToolUse(event.data)) |tool_info| {
                             current_tool_id = arena.dupe(u8, tool_info.id) catch "";
                             current_tool_name = arena.dupe(u8, tool_info.name) catch "";
-                            current_tool_input = .{};
+                            current_tool_input = .empty;
                         }
                     },
                     .content_block_stop => {
@@ -416,7 +416,10 @@ pub const AnthropicClient = struct {
                                 "{}";
 
                             const parsed_input = json.parseFromSlice(
-                                json.Value, arena, input_str, .{},
+                                json.Value,
+                                arena,
+                                input_str,
+                                .{},
                             ) catch null;
 
                             tool_uses.append(arena, .{
@@ -428,7 +431,7 @@ pub const AnthropicClient = struct {
 
                             current_tool_id = "";
                             current_tool_name = "";
-                            current_tool_input = .{};
+                            current_tool_input = .empty;
                         }
                     },
                     else => {},
@@ -480,7 +483,7 @@ pub const AnthropicClient = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        var client = http.Client{ .allocator = arena };
+        var client = http.Client{ .allocator = arena, .io = common.config.runtimeIo() };
 
         var url_buf: [256]u8 = undefined;
         const url = std.fmt.bufPrint(&url_buf, "{s}/v1/messages", .{self.base_url}) catch {
@@ -499,7 +502,7 @@ pub const AnthropicClient = struct {
         //       { type: "image", source: { type: "base64", media_type, data } },
         //       { type: "text", text: "..." }
         //     ] } ] }
-        var body: std.ArrayList(u8) = .{};
+        var body: std.ArrayList(u8) = .empty;
         defer body.deinit(arena);
         try body.ensureTotalCapacity(arena, b64.len + 1024);
 

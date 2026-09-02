@@ -136,7 +136,7 @@ pub const Engine = struct {
     // Pending explore-cache entries keyed by job_id (36-char UUID). Consumed
     // by backgroundChatCallback on successful completion.
     pending_explore_cache: std.StringHashMap(PendingExploreCache) = undefined,
-    pending_explore_cache_mutex: std.Thread.Mutex = .{},
+    pending_explore_cache_mutex: common.sync.Mutex = .{},
     start_time: i64,
 
     pub const PendingExploreCache = struct {
@@ -180,7 +180,7 @@ pub const Engine = struct {
             .optimization_manager = null,
             .files_read_this_turn = std.StringHashMap(void).init(allocator),
             .pending_explore_cache = std.StringHashMap(PendingExploreCache).init(allocator),
-            .start_time = std.time.timestamp(),
+            .start_time = common.sync.timestamp(),
         };
     }
 
@@ -292,6 +292,31 @@ pub const Engine = struct {
             }
         }
         return .{ .provider = self.provider, .model = model };
+    }
+
+    fn modelAcceptsDirectImages(provider_name: []const u8, model: []const u8) bool {
+        if (std.mem.eql(u8, provider_name, "anthropic")) return true;
+
+        // OpenAI-compatible providers accept the JSON shape for image
+        // blocks, but text-only local models either ignore it or waste
+        // context on base64. Keep raw pixels for known multimodal model
+        // families only; every attachment still gets a text vision summary.
+        return std.mem.indexOf(u8, model, "llava") != null or
+            std.mem.indexOf(u8, model, "bakllava") != null or
+            std.mem.indexOf(u8, model, "qwen-vl") != null or
+            std.mem.indexOf(u8, model, "qwen2-vl") != null or
+            std.mem.indexOf(u8, model, "qwen2.5-vl") != null or
+            std.mem.indexOf(u8, model, "qwen3-vl") != null or
+            std.mem.indexOf(u8, model, "-vl") != null or
+            std.mem.indexOf(u8, model, "vl-") != null or
+            std.mem.indexOf(u8, model, "minicpm-v") != null;
+    }
+
+    fn isStrictImageMime(mime: []const u8) bool {
+        return std.mem.eql(u8, mime, "image/png") or
+            std.mem.eql(u8, mime, "image/jpeg") or
+            std.mem.eql(u8, mime, "image/gif") or
+            std.mem.eql(u8, mime, "image/webp");
     }
 
     /// Set the worker pool for async background processing.
@@ -439,7 +464,10 @@ pub const Engine = struct {
             }
         }
 
-        // Enforce read-before-write: file_diff and file_write (force=true on existing) require prior file_read
+        // Enforce read-before-write only when modifying existing file content.
+        // New file creation must not require a read: a missing file has no
+        // current contents to inspect, and forcing a failed read just teaches
+        // the model an impossible recovery loop.
         if (std.mem.eql(u8, name, "file_diff") or std.mem.eql(u8, name, "file_write")) {
             if (input == .object) {
                 if (input.object.get("path")) |p| {
@@ -450,13 +478,14 @@ pub const Engine = struct {
                         const needs_read = if (std.mem.eql(u8, name, "file_diff")) blk: {
                             const create = if (input.object.get("create_if_missing")) |c| (c == .bool and c.bool) else false;
                             if (create) {
-                                std.fs.accessAbsolute(file_path, .{}) catch break :blk false;
+                                std.Io.Dir.accessAbsolute(common.config.runtimeIo(), file_path, .{}) catch break :blk false;
                                 break :blk true;
                             }
                             break :blk true;
                         } else blk: {
                             const force = if (input.object.get("force")) |f| (f == .bool and f.bool) else false;
                             if (!force) break :blk false;
+                            std.Io.Dir.accessAbsolute(common.config.runtimeIo(), file_path, .{}) catch break :blk false;
                             break :blk true;
                         };
 
@@ -526,7 +555,7 @@ pub const Engine = struct {
     /// Expand ~ to $HOME so read-tracking matches regardless of which form the model uses.
     fn normalizeToolPath(self: *Engine, raw: []const u8) []const u8 {
         if (raw.len > 0 and raw[0] == '~') {
-            const home = std.posix.getenv("HOME") orelse return raw;
+            const home = common.config.getEnvVar("HOME") orelse return raw;
             return std.fmt.allocPrint(self.allocator, "{s}{s}", .{ home, raw[1..] }) catch raw;
         }
         return raw;
@@ -543,30 +572,31 @@ pub const Engine = struct {
         session_id: []const u8,
         message_id: i64,
         record: ToolCallRecord,
-    ) void {
+    ) ?i64 {
         var stmt = self.project_store.conn.prepare(
             "INSERT INTO tool_calls (message_id, session_id, sequence, tool_name, tool_input, tool_result, status, approved, created_at) " ++
                 "VALUES (?, ?, (SELECT COALESCE(MAX(sequence), -1) + 1 FROM tool_calls WHERE session_id = ?), ?, ?, ?, ?, ?, ?)",
-        ) catch return;
+        ) catch return null;
         defer stmt.deinit();
         if (message_id == 0) {
-            stmt.bindNull(1) catch return;
+            stmt.bindNull(1) catch return null;
         } else {
-            stmt.bindInt64(1, message_id) catch return;
+            stmt.bindInt64(1, message_id) catch return null;
         }
-        stmt.bindText(2, session_id) catch return;
-        stmt.bindText(3, session_id) catch return;
-        stmt.bindText(4, record.tool_name) catch return;
-        stmt.bindText(5, record.tool_input) catch return;
-        stmt.bindOptionalText(6, record.tool_result) catch return;
-        stmt.bindText(7, record.status) catch return;
+        stmt.bindText(2, session_id) catch return null;
+        stmt.bindText(3, session_id) catch return null;
+        stmt.bindText(4, record.tool_name) catch return null;
+        stmt.bindText(5, record.tool_input) catch return null;
+        stmt.bindOptionalText(6, record.tool_result) catch return null;
+        stmt.bindText(7, record.status) catch return null;
         if (record.approved) |a| {
-            stmt.bindInt(8, if (a) 1 else 0) catch return;
+            stmt.bindInt(8, if (a) 1 else 0) catch return null;
         } else {
-            stmt.bindNull(8) catch return;
+            stmt.bindNull(8) catch return null;
         }
-        stmt.bindInt64(9, std.time.timestamp()) catch return;
-        stmt.exec() catch return;
+        stmt.bindInt64(9, common.sync.timestamp()) catch return null;
+        stmt.exec() catch return null;
+        return self.project_store.conn.lastInsertRowId();
     }
 
     /// Build the full system prompt from all layers. Public API for adapters/automation.
@@ -584,6 +614,7 @@ pub const Engine = struct {
         user_message: ?[]const u8,
         retrieval_query: ?[]const u8,
         active_subagents_layer: ?[]const u8,
+        plans_required: bool,
     ) ![]const u8 {
         var layers = try prompt_mod.buildFromState(
             self.allocator,
@@ -592,7 +623,11 @@ pub const Engine = struct {
             session_system_prompt,
             adapter_context,
         );
+        const session_workdir = self.session_store.getWorkingDirectory(session_id) catch null;
+        defer if (session_workdir) |wd| self.allocator.free(wd);
+        layers.session_workdir = session_workdir;
         layers.active_subagents = active_subagents_layer;
+        layers.plans_required = plans_required;
 
         // Layer 3.5: Active plan — load from session DB and inject.
         // This survives compaction because it's rebuilt from the DB each turn.
@@ -684,7 +719,7 @@ pub const Engine = struct {
     /// AND, which is restrictive but safe — vector search picks up semantic
     /// hits the FTS path misses.
     fn sanitizeFtsQuery(allocator: std.mem.Allocator, raw: []const u8) ?[]const u8 {
-        var out: std.ArrayList(u8) = .{};
+        var out: std.ArrayList(u8) = .empty;
         out.ensureTotalCapacity(allocator, raw.len) catch return null;
         var in_word = false;
         for (raw) |c| {
@@ -704,6 +739,447 @@ pub const Engine = struct {
             return null;
         }
         return out.toOwnedSlice(allocator) catch null;
+    }
+
+    fn maybeUpdateSessionWorkingDirectory(self: *Engine, session_id: []const u8, message: []const u8) void {
+        const workdir = inferWorkingDirectory(self.allocator, message) orelse return;
+        defer self.allocator.free(workdir);
+        self.session_store.updateWorkingDirectory(session_id, workdir) catch |err| {
+            std.log.warn("Failed to update session working directory: {}", .{err});
+        };
+    }
+
+    fn inferWorkingDirectory(allocator: std.mem.Allocator, message: []const u8) ?[]const u8 {
+        var i: usize = 0;
+        while (i < message.len) : (i += 1) {
+            const starts_abs = message[i] == '/' and (i == 0 or message[i - 1] != ':');
+            const starts_home = message[i] == '~' and i + 1 < message.len and message[i + 1] == '/';
+            if (!starts_abs and !starts_home) continue;
+
+            const start = i;
+            var end = i;
+            while (end < message.len and !isPathTerminator(message[end])) : (end += 1) {}
+            while (end > start and isTrailingPathPunctuation(message[end - 1])) : (end -= 1) {}
+            if (end <= start) continue;
+
+            const raw = message[start..end];
+            const expanded = expandHomePath(allocator, raw) orelse continue;
+            defer allocator.free(expanded);
+
+            if (resolveExistingDirectory(allocator, expanded)) |dir| {
+                return dir;
+            }
+        }
+        return null;
+    }
+
+    fn expandHomePath(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, path, "~/")) {
+            return allocator.dupe(u8, path) catch null;
+        }
+        const home = common.config.getEnvVarOwned(allocator, "HOME") catch return null;
+        defer allocator.free(home);
+        return std.fs.path.join(allocator, &.{ home, path[2..] }) catch null;
+    }
+
+    fn resolveExistingDirectory(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
+        const clean = trimTrailingSlashes(path);
+        if (clean.len == 0) return null;
+
+        const io = common.config.runtimeIo();
+        const stat = std.Io.Dir.cwd().statFile(io, clean, .{}) catch return null;
+        if (stat.kind == .directory) {
+            return allocator.dupe(u8, clean) catch null;
+        }
+
+        const parent = std.fs.path.dirname(clean) orelse return null;
+        const parent_stat = std.Io.Dir.cwd().statFile(io, parent, .{}) catch return null;
+        if (parent_stat.kind != .directory) return null;
+        return allocator.dupe(u8, parent) catch null;
+    }
+
+    fn trimTrailingSlashes(path: []const u8) []const u8 {
+        var end = path.len;
+        while (end > 1 and path[end - 1] == '/') : (end -= 1) {}
+        return path[0..end];
+    }
+
+    fn isPathTerminator(c: u8) bool {
+        return std.ascii.isWhitespace(c) or switch (c) {
+            '"', '\'', '`', '<', '>', '|', ';', '&' => true,
+            else => false,
+        };
+    }
+
+    fn isTrailingPathPunctuation(c: u8) bool {
+        return switch (c) {
+            '.', ',', ':', ';', '!', '?', ')', ']', '}' => true,
+            else => false,
+        };
+    }
+
+    const ToolCompactionProfile = struct {
+        threshold: usize,
+        head_chars: usize,
+        tail_chars: usize,
+        max_key_lines: usize,
+    };
+
+    fn toolCompactionProfile(tool_name: []const u8, is_error: bool) ToolCompactionProfile {
+        if (is_error) {
+            return .{ .threshold = 9000, .head_chars = 5200, .tail_chars = 2600, .max_key_lines = 24 };
+        }
+        if (std.mem.eql(u8, tool_name, "file_read")) {
+            return .{ .threshold = 9000, .head_chars = 5200, .tail_chars = 2600, .max_key_lines = 24 };
+        }
+        if (std.mem.eql(u8, tool_name, "file_diff") or std.mem.eql(u8, tool_name, "file_write")) {
+            return .{ .threshold = 6000, .head_chars = 3400, .tail_chars = 1600, .max_key_lines = 18 };
+        }
+        if (std.mem.eql(u8, tool_name, "bash") or
+            std.mem.eql(u8, tool_name, "research_tool") or
+            std.mem.eql(u8, tool_name, "amazon_search"))
+        {
+            return .{ .threshold = 3600, .head_chars = 1400, .tail_chars = 900, .max_key_lines = 18 };
+        }
+        return .{ .threshold = 5000, .head_chars = 2400, .tail_chars = 1400, .max_key_lines = 16 };
+    }
+
+    fn compactToolResultForModel(
+        self: *Engine,
+        tool_name: []const u8,
+        input_json: []const u8,
+        content: []const u8,
+        raw_len: usize,
+        raw_tool_call_id: ?i64,
+        is_error: bool,
+    ) []const u8 {
+        if (std.mem.startsWith(u8, content, "[TOOL FINDINGS CAPSULE]")) return content;
+
+        const profile = toolCompactionProfile(tool_name, is_error);
+        if (content.len <= profile.threshold) return content;
+
+        var out: std.ArrayList(u8) = .empty;
+        out.ensureTotalCapacity(self.allocator, profile.threshold + 1400) catch return content;
+
+        out.appendSlice(self.allocator, "[TOOL FINDINGS CAPSULE]\n") catch {};
+        out.appendSlice(self.allocator, "tool: ") catch {};
+        out.appendSlice(self.allocator, tool_name) catch {};
+        out.appendSlice(self.allocator, "\nstatus: ") catch {};
+        out.appendSlice(self.allocator, if (is_error) "error" else "success") catch {};
+        out.appendSlice(self.allocator, "\nraw_output_chars: ") catch {};
+        appendInt(&out, self.allocator, raw_len);
+        out.appendSlice(self.allocator, "\nmodel_output_chars_before_capsule: ") catch {};
+        appendInt(&out, self.allocator, content.len);
+        if (raw_tool_call_id) |id| {
+            out.appendSlice(self.allocator, "\nraw_tool_call_id: ") catch {};
+            appendInt(&out, self.allocator, id);
+        }
+        out.appendSlice(self.allocator, "\ninput_preview: ") catch {};
+        appendBoundedSingleLine(&out, self.allocator, input_json, 700);
+        out.appendSlice(
+            self.allocator,
+            "\nrecovery: Full raw output is retained in daemon tool_calls. " ++
+                "If this capsule lacks a necessary detail, use introspect mode=tool_result " ++
+                "with query/raw_tool_call_id before rerunning work.\n",
+        ) catch {};
+
+        appendKeyLines(&out, self.allocator, content, profile.max_key_lines);
+
+        const head_len = @min(profile.head_chars, content.len);
+        const tail_len = @min(profile.tail_chars, content.len - head_len);
+        const omitted = content.len - head_len - tail_len;
+
+        out.appendSlice(self.allocator, "\n--- evidence head ---\n") catch {};
+        out.appendSlice(self.allocator, content[0..head_len]) catch {};
+        out.appendSlice(self.allocator, "\n--- omitted_chars: ") catch {};
+        appendInt(&out, self.allocator, omitted);
+        out.appendSlice(self.allocator, " ---\n") catch {};
+        if (tail_len > 0) {
+            out.appendSlice(self.allocator, "--- evidence tail ---\n") catch {};
+            out.appendSlice(self.allocator, content[content.len - tail_len ..]) catch {};
+            out.appendSlice(self.allocator, "\n") catch {};
+        }
+        out.appendSlice(self.allocator, "[END TOOL FINDINGS CAPSULE]") catch {};
+        return out.toOwnedSlice(self.allocator) catch content;
+    }
+
+    fn compactOlderToolRoundsForLiveRequest(self: *Engine, messages: []const api.messages.Message) []const api.messages.Message {
+        // Keep the recent active chain intact. Older tool_use/tool_result
+        // pairs are collapsed into one rolling ledger so a long job does not
+        // replay dozens of stale tool messages every round.
+        if (messages.len <= 16) return messages;
+        const keep_full_from = messages.len - 8;
+        const plan_reset_from = findLatestPlanBoundaryIndex(messages);
+
+        var compacted: std.ArrayList(api.messages.Message) = .empty;
+        compacted.ensureTotalCapacity(self.allocator, messages.len) catch return messages;
+
+        var start_idx: usize = 0;
+        if (plan_reset_from) |idx| {
+            start_idx = idx;
+            var preplan: std.ArrayList(u8) = .empty;
+            var preplan_started = false;
+            for (messages[0..idx]) |msg| {
+                if (messageHasToolUse(msg) or messageHasToolResult(msg)) {
+                    if (!preplan_started) {
+                        preplan.appendSlice(
+                            self.allocator,
+                            "[PREVIOUS PLAN PHASE OMITTED]\n" ++
+                                "Older tool calls before the current plan were omitted from the live prompt. " ++
+                                "Key result snippets follow; full raw outputs remain in daemon tool_calls.\n",
+                        ) catch {};
+                        preplan_started = true;
+                    }
+                    appendMessageToLiveToolLedger(&preplan, self.allocator, msg, false, 420);
+                } else {
+                    compacted.append(self.allocator, msg) catch return messages;
+                }
+            }
+            if (preplan_started) {
+                preplan.appendSlice(self.allocator, "[END PREVIOUS PLAN PHASE]") catch {};
+                const preplan_text = preplan.toOwnedSlice(self.allocator) catch return messages;
+                const preplan_blocks = self.singleTextBlock(preplan_text) orelse return messages;
+                compacted.append(self.allocator, .{ .role = .user, .content = preplan_blocks }) catch return messages;
+            }
+        }
+
+        var ledger: std.ArrayList(u8) = .empty;
+        var ledger_started = false;
+        const ledger_end = if (keep_full_from > start_idx) keep_full_from else start_idx;
+        for (messages[start_idx..ledger_end]) |msg| {
+            if (isLiveToolLedger(msg)) {
+                if (!ledger_started) {
+                    appendLiveToolLedgerHeader(&ledger, self.allocator);
+                    ledger_started = true;
+                }
+                ledger.appendSlice(self.allocator, msg.content[0].text.text) catch {};
+                ledger.appendSlice(self.allocator, "\n") catch {};
+            } else if (messageHasToolUse(msg) or messageHasToolResult(msg)) {
+                if (!ledger_started) {
+                    appendLiveToolLedgerHeader(&ledger, self.allocator);
+                    ledger_started = true;
+                }
+                appendMessageToLiveToolLedger(&ledger, self.allocator, msg, true, 700);
+            } else {
+                compacted.append(self.allocator, msg) catch return messages;
+            }
+        }
+
+        if (ledger_started) {
+            ledger.appendSlice(self.allocator, "[END OLDER TOOL ROUNDS LEDGER]") catch {};
+            const ledger_text = ledger.toOwnedSlice(self.allocator) catch return messages;
+            const ledger_blocks = self.singleTextBlock(ledger_text) orelse return messages;
+            compacted.append(self.allocator, .{ .role = .user, .content = ledger_blocks }) catch return messages;
+        }
+        compacted.appendSlice(self.allocator, messages[ledger_end..]) catch return messages;
+        return compacted.toOwnedSlice(self.allocator) catch messages;
+    }
+
+    fn singleTextBlock(self: *Engine, text: []const u8) ?[]const api.messages.ContentBlock {
+        const blocks = self.allocator.alloc(api.messages.ContentBlock, 1) catch return null;
+        blocks[0] = .{ .text = .{ .text = text } };
+        return blocks;
+    }
+
+    fn injectBackgroundSteering(self: *Engine, request: *api.MessageRequest, note: []const u8) bool {
+        const steering_prefix = std.fmt.allocPrint(
+            self.allocator,
+            "!!! URGENT USER STEERING FOR THE ACTIVE BACKGROUND TASK !!!\n" ++
+                "THIS NEW USER NOTE HAS HIGHEST PRIORITY. APPLY IT BEFORE CONTINUING. " ++
+                "IF IT CONFLICTS WITH EARLIER TASK CONTEXT, FOLLOW THIS NEWER NOTE. " ++
+                "DO NOT RESTART FROM SCRATCH UNLESS THE NOTE EXPLICITLY ASKS FOR THAT.\n\n" ++
+                "USER NOTE:\n{s}\n\n" ++
+                "!!! END URGENT USER STEERING !!!\n\n{s}",
+            .{ note, request.system orelse "" },
+        ) catch return false;
+        request.system = steering_prefix;
+
+        const user_note = std.fmt.allocPrint(
+            self.allocator,
+            "!!! URGENT USER STEERING FOR THE CURRENT RUNNING TASK !!!\n{s}\n!!! END USER STEERING !!!",
+            .{note},
+        ) catch return false;
+        const text_block = self.singleTextBlock(user_note) orelse return false;
+        const prev = request.messages;
+        const extended = self.allocator.alloc(api.messages.Message, prev.len + 1) catch return false;
+        @memcpy(extended[0..prev.len], prev);
+        extended[prev.len] = .{ .role = .user, .content = text_block };
+        request.messages = extended;
+        return true;
+    }
+
+    fn isLiveToolLedger(msg: api.messages.Message) bool {
+        if (msg.content.len != 1) return false;
+        if (msg.content[0] != .text) return false;
+        const text = msg.content[0].text.text;
+        return std.mem.startsWith(u8, text, "[OLDER TOOL ROUNDS LEDGER]");
+    }
+
+    fn messageHasToolUse(msg: api.messages.Message) bool {
+        for (msg.content) |block| {
+            if (block == .tool_use) return true;
+        }
+        return false;
+    }
+
+    fn messageHasToolResult(msg: api.messages.Message) bool {
+        for (msg.content) |block| {
+            if (block == .tool_result) return true;
+        }
+        return false;
+    }
+
+    fn appendLiveToolLedgerHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator) void {
+        out.appendSlice(
+            allocator,
+            "[OLDER TOOL ROUNDS LEDGER]\n" ++
+                "Older tool rounds are summarized here; recent rounds remain verbatim below. " ++
+                "Raw outputs were recorded in daemon tool_calls before compaction. " ++
+                "Use introspect mode=tool_result if a missing detail is required.\n",
+        ) catch {};
+    }
+
+    fn findLatestPlanBoundaryIndex(messages: []const api.messages.Message) ?usize {
+        var found: ?usize = null;
+        for (messages, 0..) |msg, idx| {
+            if (msg.role != .assistant) continue;
+            for (msg.content) |block| {
+                if (block != .tool_use) continue;
+                const tu = block.tool_use;
+                if (!std.mem.eql(u8, tu.name, "plan")) continue;
+                if (tu.input != .object) continue;
+                const op = tu.input.object.get("operation") orelse continue;
+                if (op == .string and
+                    (std.mem.eql(u8, op.string, "create") or std.mem.eql(u8, op.string, "update")))
+                {
+                    found = idx;
+                }
+            }
+        }
+        return found;
+    }
+
+    fn appendMessageToLiveToolLedger(
+        out: *std.ArrayList(u8),
+        allocator: std.mem.Allocator,
+        msg: api.messages.Message,
+        include_calls: bool,
+        result_limit: usize,
+    ) void {
+        for (msg.content) |block| {
+            switch (block) {
+                .tool_use => |tu| {
+                    if (!include_calls) continue;
+                    out.appendSlice(allocator, "- call ") catch {};
+                    out.appendSlice(allocator, tu.name) catch {};
+                    out.appendSlice(allocator, " id=") catch {};
+                    appendBoundedSingleLine(out, allocator, tu.id, 80);
+                    const input_json = std.json.Stringify.valueAlloc(allocator, tu.input, .{}) catch null;
+                    if (input_json) |json_text| {
+                        defer allocator.free(json_text);
+                        out.appendSlice(allocator, " input=") catch {};
+                        appendBoundedSingleLine(out, allocator, json_text, 220);
+                    }
+                    out.append(allocator, '\n') catch {};
+                },
+                .tool_result => |tr| {
+                    out.appendSlice(allocator, "- result_for=") catch {};
+                    appendBoundedSingleLine(out, allocator, tr.tool_use_id, 80);
+                    out.appendSlice(allocator, if (tr.is_error) " status=error\n" else " status=success\n") catch {};
+                    appendToolResultCapsuleExcerpt(out, allocator, tr.content, result_limit);
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn appendToolResultCapsuleExcerpt(out: *std.ArrayList(u8), allocator: std.mem.Allocator, content: []const u8, limit: usize) void {
+        if (content.len <= limit) {
+            out.appendSlice(allocator, content) catch {};
+            out.append(allocator, '\n') catch {};
+            return;
+        }
+        const head_len = @min(content.len, limit * 2 / 3);
+        const tail_len = @min(content.len - head_len, limit - head_len);
+        const omitted = content.len - head_len - tail_len;
+        out.appendSlice(allocator, content[0..head_len]) catch {};
+        out.appendSlice(allocator, "\n[older result excerpt omitted_chars=") catch {};
+        appendInt(out, allocator, omitted);
+        out.appendSlice(allocator, "]\n") catch {};
+        if (tail_len > 0) {
+            out.appendSlice(allocator, content[content.len - tail_len ..]) catch {};
+            out.append(allocator, '\n') catch {};
+        }
+    }
+
+    fn appendKeyLines(out: *std.ArrayList(u8), allocator: std.mem.Allocator, content: []const u8, max_lines: usize) void {
+        var emitted: usize = 0;
+        var iter = std.mem.splitScalar(u8, content, '\n');
+        while (iter.next()) |raw_line| {
+            if (emitted >= max_lines) break;
+            const line = std.mem.trim(u8, raw_line, " \t\r");
+            if (line.len == 0) continue;
+            if (!isHighSignalToolLine(line)) continue;
+            if (emitted == 0) out.appendSlice(allocator, "\nkey_lines:\n") catch {};
+            out.appendSlice(allocator, "- ") catch {};
+            appendBoundedSingleLine(out, allocator, line, 240);
+            out.append(allocator, '\n') catch {};
+            emitted += 1;
+        }
+        if (emitted == 0) {
+            out.appendSlice(allocator, "\nkey_lines: none extracted deterministically\n") catch {};
+        }
+    }
+
+    fn isHighSignalToolLine(line: []const u8) bool {
+        return std.mem.indexOf(u8, line, "/home/") != null or
+            std.mem.indexOf(u8, line, "src/") != null or
+            std.mem.indexOf(u8, line, ".zig") != null or
+            std.mem.indexOf(u8, line, ".py") != null or
+            std.mem.indexOf(u8, line, ".cs") != null or
+            std.mem.indexOf(u8, line, ".cpp") != null or
+            containsAsciiIgnoreCase(line, "error") or
+            containsAsciiIgnoreCase(line, "warning") or
+            containsAsciiIgnoreCase(line, "failed") or
+            containsAsciiIgnoreCase(line, "missing") or
+            containsAsciiIgnoreCase(line, "exists") or
+            containsAsciiIgnoreCase(line, "created") or
+            containsAsciiIgnoreCase(line, "success") or
+            containsAsciiIgnoreCase(line, "OpenVR") or
+            containsAsciiIgnoreCase(line, "Overlay") or
+            containsAsciiIgnoreCase(line, "SetOverlay") or
+            containsAsciiIgnoreCase(line, "CreateOverlay");
+    }
+
+    fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+        if (needle.len == 0) return true;
+        if (needle.len > haystack.len) return false;
+        var i: usize = 0;
+        while (i + needle.len <= haystack.len) : (i += 1) {
+            var j: usize = 0;
+            while (j < needle.len) : (j += 1) {
+                if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) break;
+            }
+            if (j == needle.len) return true;
+        }
+        return false;
+    }
+
+    fn appendBoundedSingleLine(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8, max_chars: usize) void {
+        const n = @min(text.len, max_chars);
+        for (text[0..n]) |c| {
+            switch (c) {
+                '\n', '\r', '\t' => out.append(allocator, ' ') catch {},
+                else => out.append(allocator, c) catch {},
+            }
+        }
+        if (text.len > n) out.appendSlice(allocator, "...") catch {};
+    }
+
+    fn appendInt(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: anytype) void {
+        var num_buf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&num_buf, "{d}", .{value}) catch "0";
+        out.appendSlice(allocator, s) catch {};
     }
 
     /// Build prompt layers manually for custom assembly. Public API.
@@ -951,6 +1427,10 @@ pub const Engine = struct {
             };
         };
 
+        if (!chat_req.is_subagent) {
+            self.maybeUpdateSessionWorkingDirectory(&sess.id, chat_req.message);
+        }
+
         // Add user message to DB. Skipped for subagents — their wrapped
         // task is a machine-generated instruction from the dispatcher, not
         // a real user turn, and persisting it pollutes the dispatcher's
@@ -981,6 +1461,20 @@ pub const Engine = struct {
             std.log.info("Router: {s} -> {s} ({s})", .{ route.tier.label(), route.model, route.reason });
             break :blk route.model;
         } else sess.model;
+
+        // Resolve the model string to a concrete provider + bare model name.
+        // Strings like `ollama:qwen3:8b` or `openai:gpt-4o` switch providers
+        // per-turn; bare names (`claude-sonnet-4-6`) stay on the default
+        // provider for backwards compat.
+        const resolved = self.resolveProviderForModel(model);
+        const active_provider = resolved.provider;
+        if (!std.mem.eql(u8, active_provider.getName(), self.provider.getName())) {
+            std.log.info("Provider switch: {s} → {s} (model={s})", .{
+                self.provider.getName(),
+                active_provider.getName(),
+                resolved.model,
+            });
+        }
 
         // Build API messages. Subagents get a FRESH one-message context
         // containing only their wrapped task directive — no session history
@@ -1036,7 +1530,8 @@ pub const Engine = struct {
         defer vision_arena_state.deinit();
         const vision_arena = vision_arena_state.allocator();
 
-        var user_turn_images: std.ArrayList(api.messages.ContentBlock) = .{};
+        var user_turn_images: std.ArrayList(api.messages.ContentBlock) = .empty;
+        var user_turn_suffix_blocks: std.ArrayList(api.messages.ContentBlock) = .empty;
 
         const effective_adapter_context: ?[]const u8 = blk: {
             const attachments = chat_req.attachments orelse break :blk chat_req.adapter_context;
@@ -1051,18 +1546,28 @@ pub const Engine = struct {
             // Subagents run with a synthetic 1-message context and don't
             // carry the user's attachments, so skip the main-model image
             // injection on that path.
-            const attach_to_main_turn = !chat_req.is_subagent;
+            const attach_to_main_turn = !chat_req.is_subagent and
+                modelAcceptsDirectImages(active_provider.getName(), resolved.model);
+            if (!attach_to_main_turn and !chat_req.is_subagent) {
+                std.log.info(
+                    "Skipping raw image blocks for text-only provider/model {s}/{s}; using vision text only",
+                    .{ active_provider.getName(), resolved.model },
+                );
+            }
 
-            var overlay: std.ArrayList(u8) = .{};
+            var overlay: std.ArrayList(u8) = .empty;
+            var user_image_text: std.ArrayList(u8) = .empty;
             if (chat_req.adapter_context) |ctx| {
                 overlay.appendSlice(vision_arena, ctx) catch {};
                 overlay.appendSlice(vision_arena, "\n\n") catch {};
             }
             overlay.appendSlice(vision_arena, "--- Attached images (auto-described via vision model) ---\n") catch {};
+            user_image_text.appendSlice(vision_arena, "[Attached image descriptions]\n") catch {};
 
             var i: usize = 0;
             while (i < limit) : (i += 1) {
                 const att = attachments[i];
+                if (!isStrictImageMime(att.mime)) continue;
 
                 // Read the image bytes and base64-encode them for the main
                 // model's user turn. Bounded by max_image_bytes. On any
@@ -1070,12 +1575,14 @@ pub const Engine = struct {
                 // the model still sees *something*.
                 img_read: {
                     if (!attach_to_main_turn) break :img_read;
-                    const file = std.fs.openFileAbsolute(att.path, .{}) catch |err| {
+                    const io = common.config.runtimeIo();
+                    const file = std.Io.Dir.openFileAbsolute(io, att.path, .{}) catch |err| {
                         std.log.warn("Main-turn image read failed for {s}: {s}", .{ att.name, @errorName(err) });
                         break :img_read;
                     };
-                    defer file.close();
-                    const bytes = file.readToEndAlloc(vision_arena, vision_cfg.max_image_bytes + 1) catch |err| {
+                    defer file.close(io);
+                    var file_reader = file.reader(io, &.{});
+                    const bytes = file_reader.interface.allocRemaining(vision_arena, .limited(vision_cfg.max_image_bytes + 1)) catch |err| {
                         std.log.warn("Main-turn image unreadable for {s}: {s}", .{ att.name, @errorName(err) });
                         break :img_read;
                     };
@@ -1097,6 +1604,11 @@ pub const Engine = struct {
                     overlay.appendSlice(vision_arena, "\n") catch {};
                     overlay.appendSlice(vision_arena, msg) catch {};
                     overlay.appendSlice(vision_arena, "\n") catch {};
+                    user_image_text.appendSlice(vision_arena, "\nImage: ") catch {};
+                    user_image_text.appendSlice(vision_arena, att.name) catch {};
+                    user_image_text.appendSlice(vision_arena, "\n") catch {};
+                    user_image_text.appendSlice(vision_arena, msg) catch {};
+                    user_image_text.appendSlice(vision_arena, "\n") catch {};
                     continue;
                 };
                 defer result.deinit(self.allocator);
@@ -1111,6 +1623,17 @@ pub const Engine = struct {
                 overlay.appendSlice(vision_arena, "]\n") catch {};
                 overlay.appendSlice(vision_arena, result.description) catch {};
                 overlay.appendSlice(vision_arena, "\n") catch {};
+
+                user_image_text.appendSlice(vision_arena, "\nImage: ") catch {};
+                user_image_text.appendSlice(vision_arena, att.name) catch {};
+                user_image_text.appendSlice(vision_arena, " [") catch {};
+                user_image_text.appendSlice(vision_arena, att.mime) catch {};
+                user_image_text.appendSlice(vision_arena, if (result.from_cache) ", cached" else ", fresh") catch {};
+                user_image_text.appendSlice(vision_arena, ", model=") catch {};
+                user_image_text.appendSlice(vision_arena, result.model_used) catch {};
+                user_image_text.appendSlice(vision_arena, "]\n") catch {};
+                user_image_text.appendSlice(vision_arena, result.description) catch {};
+                user_image_text.appendSlice(vision_arena, "\n") catch {};
             }
 
             if (attachments.len > limit) {
@@ -1120,26 +1643,67 @@ pub const Engine = struct {
                     limit,
                 }) catch "\n[additional attachments omitted]\n";
                 overlay.appendSlice(vision_arena, msg) catch {};
+                user_image_text.appendSlice(vision_arena, msg) catch {};
             }
             overlay.appendSlice(vision_arena, "--- End images ---") catch {};
+            user_image_text.appendSlice(vision_arena, "[End attached image descriptions]") catch {};
+
+            if (!attach_to_main_turn and !chat_req.is_subagent and user_image_text.items.len > 0) {
+                user_turn_images.append(vision_arena, .{
+                    .text = .{ .text = user_image_text.items },
+                }) catch {};
+                std.log.info("Attached image description text to user turn", .{});
+            }
 
             break :blk overlay.items;
         };
 
-        // Inject the collected image blocks into the current user turn so
-        // the main model sees the pixels. The vision description stays in
-        // adapter_context as a supplement.
-        if (user_turn_images.items.len > 0 and msgs.len > 0) {
+        if (!chat_req.is_subagent and std.mem.eql(u8, active_provider.getName(), "ollama")) {
+            const persona_text = if (sess.system_prompt) |name|
+                prompt_mod.loadPersona(vision_arena, name) orelse prompt_mod.DEFAULT_PERSONA
+            else
+                prompt_mod.DEFAULT_PERSONA;
+            const max_persona_tail: usize = 2400;
+            const persona_tail = persona_text[0..@min(persona_text.len, max_persona_tail)];
+            const reminder = std.fmt.allocPrint(
+                vision_arena,
+                "\n\n[Local Ollama instruction: answer the user's message above in the active persona voice. " ++
+                    "This is style/context only; do not mention this instruction. Active persona excerpt follows.]\n{s}\n" ++
+                    "[End local Ollama persona reminder]",
+                .{persona_tail},
+            ) catch null;
+            if (reminder) |text| {
+                user_turn_suffix_blocks.append(vision_arena, .{
+                    .text = .{ .text = text },
+                }) catch {};
+                std.log.info("Attached {d}b Ollama persona reminder to user turn tail", .{text.len});
+            }
+        }
+
+        // Inject collected image/text blocks into the current user turn.
+        // Multimodal models get raw image blocks; text-only local models
+        // get vision/OCR text here so it is not buried in the system prompt.
+        // Ollama also gets a compact persona reminder after the user's text,
+        // because its OpenAI-compatible endpoint is effectively preserving
+        // only ~4k prompt tokens in current testing.
+        if ((user_turn_images.items.len > 0 or user_turn_suffix_blocks.items.len > 0) and msgs.len > 0) {
             const last_idx = msgs.len - 1;
             if (msgs[last_idx].role == .user) {
                 const orig_content = msgs[last_idx].content;
-                const new_len = user_turn_images.items.len + orig_content.len;
+                const new_len = user_turn_images.items.len + orig_content.len + user_turn_suffix_blocks.items.len;
                 if (vision_arena.alloc(api.messages.ContentBlock, new_len)) |new_content| {
+                    var content_pos: usize = 0;
                     @memcpy(new_content[0..user_turn_images.items.len], user_turn_images.items);
-                    @memcpy(new_content[user_turn_images.items.len..], orig_content);
+                    content_pos += user_turn_images.items.len;
+                    @memcpy(new_content[content_pos..][0..orig_content.len], orig_content);
+                    content_pos += orig_content.len;
+                    @memcpy(new_content[content_pos..][0..user_turn_suffix_blocks.items.len], user_turn_suffix_blocks.items);
                     const msgs_mut = @constCast(msgs);
                     msgs_mut[last_idx] = .{ .role = .user, .content = new_content };
-                    std.log.info("Attached {d} image block(s) to user turn", .{user_turn_images.items.len});
+                    std.log.info(
+                        "Attached {d} prefix block(s) and {d} suffix block(s) to user turn",
+                        .{ user_turn_images.items.len, user_turn_suffix_blocks.items.len },
+                    );
                 } else |_| {}
             }
         }
@@ -1168,39 +1732,29 @@ pub const Engine = struct {
             chat_req.message,
             retrieval_query,
             active_subagents_layer,
+            chat_req.plans_required,
         ) catch sess.system_prompt;
 
-        var owned_tool_defs: std.ArrayList([]const api.messages.ToolDefinition) = .{};
+        var owned_tool_defs: std.ArrayList([]const api.messages.ToolDefinition) = .empty;
         defer {
             for (owned_tool_defs.items) |defs| self.allocator.free(defs);
             owned_tool_defs.deinit(self.allocator);
         }
 
-        // Subagents (confirmer != null) must not recursively summon more
-        // subagents or manage other subagents — nested job IDs aren't tracked
-        // by adapters and stop/redirect from a child would race with the
-        // dispatcher. Strip the entire subagent-control set from their tools.
-        const is_subagent = confirmer != null;
+        // Subagents must not recursively summon more subagents or manage
+        // other subagents — nested job IDs aren't tracked by adapters and
+        // stop/redirect from a child would race with the dispatcher. This
+        // must be the request flag, not "confirmer != null": normal
+        // background jobs also use a confirmer for adapter approval prompts.
+        const is_subagent = chat_req.is_subagent;
 
         // Tool selection: allowed_tools filter > all enabled tools
-        const initial_tools = if (chat_req.allowed_tools) |at| blk: {
-            var names: [32][]const u8 = undefined;
-            var count: usize = 0;
-            var iter = std.mem.splitScalar(u8, at, ',');
-            outer: while (iter.next()) |name| {
-                const trimmed = std.mem.trim(u8, name, " ");
-                if (trimmed.len == 0 or count >= 32) continue;
-                if (is_subagent) {
-                    for (tools.ToolRegistry.SUBAGENT_HIDDEN_TOOLS) |hidden| {
-                        if (std.mem.eql(u8, trimmed, hidden)) continue :outer;
-                    }
-                }
-                names[count] = trimmed;
-                count += 1;
-            }
-            break :blk if (count > 0) self.tool_registry.getToolDefinitionsFiltered(names[0..count]) else null;
-        } else if (is_subagent)
+        const initial_tools = if (chat_req.allowed_tools) |at|
+            self.selectAllowedToolDefinitions(at, is_subagent)
+        else if (is_subagent)
             self.tool_registry.getToolDefinitionsExcludingMany(&tools.ToolRegistry.SUBAGENT_HIDDEN_TOOLS)
+        else if (chat_req.compact_tool_schemas)
+            self.selectToolDefinitionsForMessage(chat_req.message)
         else
             self.tool_registry.getToolDefinitions();
 
@@ -1208,24 +1762,50 @@ pub const Engine = struct {
             owned_tool_defs.append(self.allocator, defs) catch {};
         }
 
-        // Resolve the model string to a concrete provider + bare model name.
-        // Strings like `ollama:qwen3:8b` or `openai:gpt-4o` switch providers
-        // per-turn; bare names (`claude-sonnet-4-6`) stay on the default
-        // provider for backwards compat.
-        const resolved = self.resolveProviderForModel(model);
-        const active_provider = resolved.provider;
-        if (!std.mem.eql(u8, active_provider.getName(), self.provider.getName())) {
-            std.log.info("Provider switch: {s} → {s} (model={s})", .{
-                self.provider.getName(),
-                active_provider.getName(),
-                resolved.model,
-            });
+        if (!chat_req.is_subagent and isToolManifestQuestion(self.allocator, chat_req.message)) {
+            if (initial_tools) |defs| {
+                var manifest: std.ArrayList(u8) = .empty;
+                manifest.appendSlice(vision_arena, "\n\n[Active tool manifest]\ncount: ") catch {};
+                var num_buf: [32]u8 = undefined;
+                manifest.appendSlice(vision_arena, std.fmt.bufPrint(&num_buf, "{d}", .{defs.len}) catch "0") catch {};
+                manifest.appendSlice(vision_arena, "\nnames: ") catch {};
+                for (defs, 0..) |def, i| {
+                    if (i > 0) manifest.appendSlice(vision_arena, ", ") catch {};
+                    manifest.appendSlice(vision_arena, def.name) catch {};
+                }
+                manifest.appendSlice(vision_arena, "\nInstruction: If the user asks how many tools are available, answer from this manifest. Do not estimate.\n[End active tool manifest]") catch {};
+                user_turn_suffix_blocks.append(vision_arena, .{
+                    .text = .{ .text = manifest.items },
+                }) catch {};
+                if (msgs.len > 0) {
+                    const last_idx = msgs.len - 1;
+                    if (msgs[last_idx].role == .user) {
+                        const orig_content = msgs[last_idx].content;
+                        if (vision_arena.alloc(api.messages.ContentBlock, orig_content.len + 1)) |new_content| {
+                            @memcpy(new_content[0..orig_content.len], orig_content);
+                            new_content[orig_content.len] = .{ .text = .{ .text = manifest.items } };
+                            const msgs_mut = @constCast(msgs);
+                            msgs_mut[last_idx] = .{ .role = .user, .content = new_content };
+                        } else |_| {}
+                    }
+                }
+                std.log.info("Attached active tool manifest for {d} selected tool(s)", .{defs.len});
+            }
         }
 
         // Append the voice-calibration style guide to the system prompt
         // when targeting a non-Anthropic provider. The goal is to pin
         // small local models (qwen3, llama3.x, mistral) to the persona
         // voice instead of defaulting to generic-assistant cadence.
+        const active_persona_anchor: ?[]const u8 = blk_persona_anchor: {
+            if (std.mem.eql(u8, active_provider.getName(), "anthropic")) break :blk_persona_anchor null;
+            const persona_text = if (sess.system_prompt) |name|
+                prompt_mod.loadPersona(vision_arena, name) orelse prompt_mod.DEFAULT_PERSONA
+            else
+                prompt_mod.DEFAULT_PERSONA;
+            const max_persona_anchor: usize = 3200;
+            break :blk_persona_anchor persona_text[0..@min(persona_text.len, max_persona_anchor)];
+        };
         const effective_system: ?[]const u8 = blk_sys: {
             const base = system_prompt orelse break :blk_sys null;
             if (std.mem.eql(u8, active_provider.getName(), "anthropic")) {
@@ -1233,13 +1813,24 @@ pub const Engine = struct {
             }
             // Concatenate onto the vision_arena so lifetime matches the
             // rest of the request (the arena deinits at function exit).
-            const combined_len = base.len + SMALL_MODEL_STYLE_GUIDE.len;
+            const persona_anchor_header =
+                "\n\n## Active persona reminder (local model recency anchor)\n" ++
+                "The selected persona is still active for this reply. Render that voice directly:\n\n";
+            const persona_anchor = active_persona_anchor orelse "";
+            const combined_len = base.len + SMALL_MODEL_STYLE_GUIDE.len +
+                persona_anchor_header.len + persona_anchor.len;
             const combined = vision_arena.alloc(u8, combined_len) catch break :blk_sys base;
-            @memcpy(combined[0..base.len], base);
-            @memcpy(combined[base.len..], SMALL_MODEL_STYLE_GUIDE);
+            var combined_pos: usize = 0;
+            @memcpy(combined[combined_pos..][0..base.len], base);
+            combined_pos += base.len;
+            @memcpy(combined[combined_pos..][0..SMALL_MODEL_STYLE_GUIDE.len], SMALL_MODEL_STYLE_GUIDE);
+            combined_pos += SMALL_MODEL_STYLE_GUIDE.len;
+            @memcpy(combined[combined_pos..][0..persona_anchor_header.len], persona_anchor_header);
+            combined_pos += persona_anchor_header.len;
+            @memcpy(combined[combined_pos..][0..persona_anchor.len], persona_anchor);
             std.log.info(
-                "Appended {d}b style guide for non-Anthropic provider ({s})",
-                .{ SMALL_MODEL_STYLE_GUIDE.len, active_provider.getName() },
+                "Appended {d}b style guide + {d}b persona anchor for non-Anthropic provider ({s})",
+                .{ SMALL_MODEL_STYLE_GUIDE.len, persona_anchor.len, active_provider.getName() },
             );
             break :blk_sys combined;
         };
@@ -1272,22 +1863,22 @@ pub const Engine = struct {
         var current_request = api_request;
 
         // Accumulate text across tool rounds (API may send text preamble + tool_use)
-        var text_parts: std.ArrayList(u8) = .{};
+        var text_parts: std.ArrayList(u8) = .empty;
         defer text_parts.deinit(self.allocator);
 
         // Track tool calls for persistence in message history
-        var tool_log: std.ArrayList(u8) = .{};
+        var tool_log: std.ArrayList(u8) = .empty;
         defer tool_log.deinit(self.allocator);
 
         // Background job IDs spawned via summon_subagent during this chat turn.
         // Each entry is exactly 36 chars (a UUID).
-        var spawned_subagent_ids: std.ArrayList([36]u8) = .{};
+        var spawned_subagent_ids: std.ArrayList([36]u8) = .empty;
         defer spawned_subagent_ids.deinit(self.allocator);
 
         // Collect response arenas — freed after the tool loop is done.
         // Each API call returns a response with an arena; we can't free it
         // until the next round has consumed the tool_use data from it.
-        var response_arenas: std.ArrayList(*std.heap.ArenaAllocator) = .{};
+        var response_arenas: std.ArrayList(*std.heap.ArenaAllocator) = .empty;
         defer {
             for (response_arenas.items) |arena| {
                 arena.deinit();
@@ -1332,6 +1923,9 @@ pub const Engine = struct {
         }
 
         var cancelled = false;
+        var permission_denied = false;
+        var denied_tool_buf: [64]u8 = undefined;
+        var denied_tool_len: usize = 0;
         var stopped_by_dispatcher = false;
         var stop_reason_buf: [80]u8 = undefined;
         var stop_reason_len: usize = 0;
@@ -1346,12 +1940,35 @@ pub const Engine = struct {
                 }
             }
 
-            // Subagent cooperative stop: dispatcher invoked subagent_stop.
-            // Polled at the round boundary so the subagent emits accumulated
-            // state instead of being killed mid-API-call.
-            if (is_subagent) {
-                if (self.worker_pool) |wp| {
-                    if (wp.active_job_id) |jid_val| {
+            // Background jobs are daemon-owned. Browser/Discord adapters may
+            // cancel or steer a task while it is running; apply those controls
+            // at round boundaries so we never corrupt an in-flight tool call.
+            if (self.worker_pool) |wp| {
+                if (wp.active_job_id) |jid_val| {
+                    if (wp.isBackgroundJobCancelled(&jid_val)) {
+                        std.log.info("Background job cancellation requested at tool round {d}", .{tool_round});
+                        cancelled = true;
+                        break;
+                    }
+
+                    var steering_buf: [4096]u8 = undefined;
+                    const steering_len = wp.consumeBackgroundSteering(&jid_val, &steering_buf);
+                    if (steering_len > 0) {
+                        if (self.injectBackgroundSteering(&current_request, steering_buf[0..steering_len])) {
+                            wp.pushToolEvent(.{
+                                .event_type = .control,
+                                .tool_name = "steer",
+                                .content = "User steering note injected before the next model request.",
+                                .timestamp = common.sync.timestamp(),
+                            });
+                            std.log.info("Background steering injected at tool round {d}: {d} chars", .{ tool_round, steering_len });
+                        }
+                    }
+
+                    // Subagent cooperative stop: dispatcher invoked subagent_stop.
+                    // Polled at the round boundary so the subagent emits accumulated
+                    // state instead of being killed mid-API-call.
+                    if (is_subagent) {
                         if (wp.isSubagentStopRequested(&jid_val)) {
                             std.log.info("Subagent stop requested by dispatcher at tool round {d} — halting", .{tool_round});
                             cancelled = true;
@@ -1413,6 +2030,13 @@ pub const Engine = struct {
 
             // Make API call — stream ALL rounds if emitter present
             const is_stream_round = emitter != null and current_request.stream;
+            self.emitModelWaitEvent(
+                tool_round,
+                active_provider.getName(),
+                current_request.model,
+                current_request.messages.len,
+                current_request,
+            );
             if (is_stream_round) self.beginStreaming();
             const api_response = blk: {
                 if (emitter) |em| {
@@ -1465,6 +2089,34 @@ pub const Engine = struct {
             total_cache_creation += api_response.usage.cache_creation_tokens;
             context_tokens = @max(context_tokens, api_response.usage.input_tokens);
 
+            if (self.worker_pool) |wp| {
+                if (wp.active_job_id) |jid_val| {
+                    if (wp.isBackgroundJobCancelled(&jid_val)) {
+                        std.log.info("Background job cancellation requested after model round {d}", .{tool_round});
+                        cancelled = true;
+                        break;
+                    }
+
+                    var steering_buf: [4096]u8 = undefined;
+                    const steering_len = wp.consumeBackgroundSteering(&jid_val, &steering_buf);
+                    if (steering_len > 0) {
+                        if (self.injectBackgroundSteering(&current_request, steering_buf[0..steering_len])) {
+                            wp.pushToolEvent(.{
+                                .event_type = .control,
+                                .tool_name = "steer",
+                                .content = "User steering note arrived during a model call; stale tool calls were skipped and the note will lead the next request.",
+                                .timestamp = common.sync.timestamp(),
+                            });
+                            std.log.info(
+                                "Background steering injected after model round {d}; skipping stale response tool calls",
+                                .{tool_round},
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // Always capture text from this round (API sends text preamble even with tool_use)
             if (api_response.text_content.len > 0) {
                 if (text_parts.items.len > 0) {
@@ -1492,6 +2144,22 @@ pub const Engine = struct {
                 break;
             }
 
+            if (api_response.text_content.len > 0) {
+                if (self.worker_pool) |wp| {
+                    const max_model_text_event = 1200;
+                    const event_content = if (api_response.text_content.len > max_model_text_event)
+                        api_response.text_content[0..max_model_text_event]
+                    else
+                        api_response.text_content;
+                    wp.pushToolEvent(.{
+                        .event_type = .model_text,
+                        .tool_name = "assistant",
+                        .content = event_content,
+                        .timestamp = common.sync.timestamp(),
+                    });
+                }
+            }
+
             // Build messages for next API round: assistant(tool_use) → user(tool_results)
             // Execute each tool, emit events, record in DB, and build result messages.
             {
@@ -1499,7 +2167,7 @@ pub const Engine = struct {
                 // Reasoning items are codex-only encrypted blobs; replaying them in
                 // the next request preserves chain-of-thought across tool rounds.
                 // Other providers' serializers skip the .reasoning variant.
-                var assistant_blocks: std.ArrayList(api.messages.ContentBlock) = .{};
+                var assistant_blocks: std.ArrayList(api.messages.ContentBlock) = .empty;
                 if (api_response.text_content.len > 0) {
                     assistant_blocks.append(self.allocator, .{ .text = .{ .text = api_response.text_content } }) catch {};
                 }
@@ -1518,7 +2186,7 @@ pub const Engine = struct {
                 }
 
                 // User message: tool_result for each tool call
-                var result_blocks: std.ArrayList(api.messages.ContentBlock) = .{};
+                var result_blocks: std.ArrayList(api.messages.ContentBlock) = .empty;
 
                 // Dedup identical tool_uses within a single round. The model
                 // sometimes emits two or more parallel calls with the same
@@ -1542,6 +2210,15 @@ pub const Engine = struct {
                             std.log.info("Stream cancelled before executing tool {s}", .{tool_call.name});
                             cancelled = true;
                             break;
+                        }
+                    }
+                    if (self.worker_pool) |wp| {
+                        if (wp.active_job_id) |jid_val| {
+                            if (wp.isBackgroundJobCancelled(&jid_val)) {
+                                std.log.info("Background job cancelled before executing tool {s}", .{tool_call.name});
+                                cancelled = true;
+                                break;
+                            }
                         }
                     }
 
@@ -1588,15 +2265,18 @@ pub const Engine = struct {
                         }
                     }
 
-                    // Push tool_use event for subagent live transparency
-                    if (is_subagent) {
-                        if (self.worker_pool) |wp| {
-                            wp.pushToolEvent(.{
-                                .event_type = .tool_use,
-                                .tool_name = tool_call.name,
-                                .content = tool_call.input_json,
-                                .timestamp = std.time.timestamp(),
-                            });
+                    // Push tool_use event for background job transparency.
+                    // Normal background jobs have a confirmation callback too,
+                    // but they are not subagents; the web/Discord adapters
+                    // still need their tool cards.
+                    if (self.worker_pool) |wp| {
+                        wp.pushToolEvent(.{
+                            .event_type = .tool_use,
+                            .tool_name = tool_call.name,
+                            .content = tool_call.input_json,
+                            .timestamp = common.sync.timestamp(),
+                        });
+                        if (is_subagent) {
                             if (wp.active_job_id) |jid_val| {
                                 wp.markSubagentLastTool(&jid_val, tool_call.name);
                             }
@@ -1608,10 +2288,36 @@ pub const Engine = struct {
                     if (self.tool_registry.requiresConfirmation(tool_call.name)) {
                         if (confirmer) |c| {
                             if (!c.confirm(tool_call.name, tool_call.id, tool_call.input_json)) {
+                                if (self.worker_pool) |wp| {
+                                    if (wp.active_job_id) |jid_val| {
+                                        if (wp.isBackgroundJobCancelled(&jid_val)) {
+                                            std.log.info("Background job cancelled while waiting for approval of {s}", .{tool_call.name});
+                                            cancelled = true;
+                                            break;
+                                        }
+                                    }
+                                }
                                 declined = true;
                             }
                         }
                         // No confirmer → auto-approve
+                    }
+
+                    if (declined) {
+                        std.log.info("Tool {s} denied by user; stopping task", .{tool_call.name});
+                        permission_denied = true;
+                        denied_tool_len = @min(tool_call.name.len, denied_tool_buf.len);
+                        @memcpy(denied_tool_buf[0..denied_tool_len], tool_call.name[0..denied_tool_len]);
+                        if (self.worker_pool) |wp| {
+                            wp.pushToolEvent(.{
+                                .event_type = .control,
+                                .tool_name = "permission_denied",
+                                .content = "User denied a required tool permission. Task stopped before running the tool.",
+                                .is_error = true,
+                                .timestamp = common.sync.timestamp(),
+                            });
+                        }
+                        break;
                     }
 
                     // Plan enforcement gate: block heavyweight tool calls when
@@ -1624,17 +2330,15 @@ pub const Engine = struct {
                     // Explore-mode summon_subagent is read-only recon; bypass plan gate.
                     const is_explore_summon = std.mem.eql(u8, tool_call.name, "summon_subagent") and
                         isExploreSummon(tool_call.input);
-                    const plan_gate_active = !has_active_plan and !is_plan_tool and !is_subagent and
+                    const plan_gate_active = chat_req.plans_required and !has_active_plan and !is_plan_tool and !is_subagent and
                         !is_lightweight and !is_explore_summon;
-                    const tool_res = if (declined) blk: {
-                        std.log.info("Tool {s} declined by user", .{tool_call.name});
-                        break :blk tools.ToolResult{ .content = TOOL_DECLINED_MSG, .is_error = true };
-                    } else if (plan_gate_active) blk: {
+                    const tool_res = if (plan_gate_active) blk: {
                         std.log.info("Plan gate: blocked {s} — no active plan", .{tool_call.name});
                         break :blk tools.ToolResult{
                             .content = "BLOCKED: This tool requires an active execution plan. Call the `plan` " ++
                                 "tool with operation \"create\" first. Inline tools that work without a plan: " ++
-                                "file_read, introspect, calc, research, meme_tool, amazon_search, file_diff " ++
+                                "file_find, file_read, introspect, calc, research_tool, meme_tool, amazon_search, " ++
+                                "visual_audit, playwright_mcp, vision_read, file_diff " ++
                                 "(single-file edits), and safe bash (ls, tree, git log/status/diff, head, tail, " ++
                                 "cat, find, pwd). For multi-step/multi-file work, create a plan and delegate " ++
                                 "via summon_subagent.",
@@ -1660,7 +2364,7 @@ pub const Engine = struct {
                         break :blk res;
                     } else if (std.mem.eql(u8, tool_call.name, "summon_subagent")) blk: {
                         std.log.info("Special tool: summon_subagent", .{});
-                        break :blk self.handleSummonSubagent(tool_call.input, &sess.id, &spawned_subagent_ids, model, chat_req.allowed_tools);
+                        break :blk self.handleSummonSubagent(tool_call.input, &sess.id, &spawned_subagent_ids, model, chat_req.delegated_model_override, chat_req.allowed_tools, chat_req.plans_required);
                     } else if (std.mem.eql(u8, tool_call.name, "subagent_inspect")) blk: {
                         std.log.info("Special tool: subagent_inspect", .{});
                         break :blk self.handleSubagentInspect(tool_call.input, &sess.id);
@@ -1670,9 +2374,12 @@ pub const Engine = struct {
                     } else if (std.mem.eql(u8, tool_call.name, "subagent_redirect")) blk: {
                         std.log.info("Special tool: subagent_redirect", .{});
                         break :blk self.handleSubagentRedirect(tool_call.input, &sess.id);
+                    } else if (std.mem.eql(u8, tool_call.name, "vision_read")) blk: {
+                        std.log.info("Special tool: vision_read", .{});
+                        break :blk self.handleVisionRead(tool_call.input, &sess.id);
                     } else if (std.mem.eql(u8, tool_call.name, "file_diff") and
-                        !fileDiffHasBeenRead(tool_call.input, &read_paths)) blk:
-                    {
+                        !fileDiffHasBeenRead(tool_call.input, &read_paths))
+                    blk: {
                         const gated_path = if (tool_call.input == .object)
                             (if (tool_call.input.object.get("path")) |p|
                                 (if (p == .string) p.string else "<unknown>")
@@ -1681,7 +2388,8 @@ pub const Engine = struct {
                         else
                             "<unknown>";
                         std.log.info("file_diff gate: blocked — path '{s}' not read yet", .{gated_path});
-                        const msg = std.fmt.allocPrint(self.allocator,
+                        const msg = std.fmt.allocPrint(
+                            self.allocator,
                             "BLOCKED: file_diff requires you to file_read the target file first so " ++
                                 "you can see its actual contents before proposing a change. Call file_read " ++
                                 "on '{s}', then retry the diff. " ++
@@ -1709,23 +2417,21 @@ pub const Engine = struct {
                         } });
                     }
 
-                    // Push tool_result event for subagent live transparency
-                    if (is_subagent) {
-                        if (self.worker_pool) |wp| {
-                            // Truncate content for the event log (keep it reasonable)
-                            const max_event_content = 1000;
-                            const event_content = if (tool_res.content.len > max_event_content)
-                                tool_res.content[0..max_event_content]
-                            else
-                                tool_res.content;
-                            wp.pushToolEvent(.{
-                                .event_type = .tool_result,
-                                .tool_name = tool_call.name,
-                                .content = event_content,
-                                .is_error = tool_res.is_error,
-                                .timestamp = std.time.timestamp(),
-                            });
-                        }
+                    // Push tool_result event for background job transparency.
+                    if (self.worker_pool) |wp| {
+                        // Truncate content for the event log (keep it reasonable)
+                        const max_event_content = 1000;
+                        const event_content = if (tool_res.content.len > max_event_content)
+                            tool_res.content[0..max_event_content]
+                        else
+                            tool_res.content;
+                        wp.pushToolEvent(.{
+                            .event_type = .tool_result,
+                            .tool_name = tool_call.name,
+                            .content = event_content,
+                            .is_error = tool_res.is_error,
+                            .timestamp = common.sync.timestamp(),
+                        });
                     }
 
                     // Log tool call for message history persistence
@@ -1753,8 +2459,8 @@ pub const Engine = struct {
                         tool_log.appendSlice(self.allocator, "</output>\n</tool_call>") catch {};
                     }
 
-                    // Record in DB
-                    self.recordToolCall(&sess.id, 0, .{
+                    // Record raw output in DB before any model-facing compaction.
+                    const raw_tool_call_id = self.recordToolCall(&sess.id, 0, .{
                         .tool_id = tool_call.id,
                         .tool_name = tool_call.name,
                         .tool_input = tool_call.input_json,
@@ -1764,9 +2470,16 @@ pub const Engine = struct {
                     });
 
                     // For failed tool calls, augment the error with recovery guidance
-                    const model_content = tool_res.modelContent();
+                    const model_content = self.compactToolResultForModel(
+                        tool_call.name,
+                        tool_call.input_json,
+                        tool_res.modelContent(),
+                        tool_res.content.len,
+                        raw_tool_call_id,
+                        tool_res.is_error,
+                    );
                     const result_content = if (tool_res.is_error and !declined) blk: {
-                        var err_msg: std.ArrayList(u8) = .{};
+                        var err_msg: std.ArrayList(u8) = .empty;
                         err_msg.appendSlice(self.allocator, model_content) catch break :blk model_content;
                         err_msg.appendSlice(
                             self.allocator,
@@ -1805,7 +2518,7 @@ pub const Engine = struct {
                     } }) catch {};
                 }
 
-                if (cancelled) break;
+                if (cancelled or permission_denied) break;
 
                 // Extend messages for next API round
                 const prev = current_request.messages;
@@ -1826,13 +2539,16 @@ pub const Engine = struct {
                         for (blocks) |*block| {
                             switch (block.*) {
                                 .tool_result => |tr| {
-                                    if (tr.content.len > 600) {
-                                        const head_len = @min(tr.content.len, 320);
-                                        const tail_len = @min(tr.content.len - head_len, 220);
+                                    if (std.mem.startsWith(u8, tr.content, "[TOOL FINDINGS CAPSULE]")) {
+                                        continue;
+                                    }
+                                    if (tr.content.len > 2400) {
+                                        const head_len = @min(tr.content.len, 1200);
+                                        const tail_len = @min(tr.content.len - head_len, 800);
                                         const omitted = tr.content.len - head_len - tail_len;
                                         const summary = std.fmt.allocPrint(
                                             self.allocator,
-                                            "{s}\n\n[...truncated {d} chars...]\n\n{s}",
+                                            "{s}\n\n[older raw tool_result compacted: {d} chars omitted; exact raw output is in daemon tool_calls]\n\n{s}",
                                             .{
                                                 tr.content[0..head_len],
                                                 omitted,
@@ -1851,21 +2567,40 @@ pub const Engine = struct {
                         }
                     }
                 }
-
-                current_request.messages = extended;
-                current_request.tools = self.selectFollowupToolDefinitions(chat_req.message, api_response.tool_use, is_subagent);
+                current_request.messages = self.compactOlderToolRoundsForLiveRequest(extended);
+                current_request.tools = self.selectNextRoundToolDefinitions(chat_req, api_response.tool_use, is_subagent);
                 if (current_request.tools) |defs| {
                     owned_tool_defs.append(self.allocator, defs) catch {};
                 }
-                // Keep persona/system flavor on the initial user-facing round only.
-                // Intermediate tool-work rounds should focus on the task state, not chat style.
+                // Keep persona/system flavor available for local providers.
+                // Small OpenAI-compatible models drift hard after tool
+                // results if the follow-up answer round has no system
+                // prompt, so keep the recency-anchored effective prompt.
+                // Anthropic already follows the conversation voice well and
+                // benefits more from lean tool-work rounds.
                 // Exception: codex (OpenAI Responses API) requires `instructions` on every
                 // request — dropping it returns 400 "Instructions are required".
-                if (!std.mem.eql(u8, active_provider.getName(), "codex")) {
+                if (std.mem.eql(u8, active_provider.getName(), "anthropic")) {
                     current_request.system = null;
+                } else if (std.mem.eql(u8, active_provider.getName(), "codex")) {
+                    current_request.system = effective_system;
+                } else {
+                    current_request.system = effective_system;
                 }
                 // Keep streaming enabled so tool use progress is visible to the user.
                 // current_request.stream stays as-is (true if emitter present).
+            }
+        }
+
+        if (permission_denied) {
+            final_stop_reason = "permission_denied";
+            const denied_tool = denied_tool_buf[0..denied_tool_len];
+            if (denied_tool.len > 0) {
+                text_parts.appendSlice(self.allocator, "[Tool permission denied: ") catch {};
+                text_parts.appendSlice(self.allocator, denied_tool) catch {};
+                text_parts.appendSlice(self.allocator, ". Task stopped before running the tool.]") catch {};
+            } else {
+                text_parts.appendSlice(self.allocator, "[Tool permission denied. Task stopped before running the tool.]") catch {};
             }
         }
 
@@ -1901,14 +2636,14 @@ pub const Engine = struct {
         // like `qwen3:30b` returns 404 and the whole chat dies with no
         // response. `final_req.model` already holds the bare name from the
         // earlier resolve, so `active_provider` is the right target.
-        if (!cancelled and text_parts.items.len == 0 and tool_log.items.len > 0) {
+        if (!cancelled and !permission_denied and text_parts.items.len == 0 and tool_log.items.len > 0) {
             std.log.info(
                 "Tool loop exhausted without text — forcing final summary call via {s}",
                 .{active_provider.getName()},
             );
             var final_req = current_request;
             final_req.tools = null; // No tools → model must respond with text
-            final_req.system = system_prompt; // Reapply persona/system prompt for the final user-facing response.
+            final_req.system = effective_system; // Reapply persona/system prompt for the final user-facing response.
             if (active_provider.createMessage(&final_req)) |final_resp| {
                 if (final_resp.arena) |a| {
                     response_arenas.append(self.allocator, a) catch {};
@@ -1933,7 +2668,7 @@ pub const Engine = struct {
         // Build stored message: tool log (if any) + final text.
         // This ensures the model can see its own tool calls in conversation history.
         const stored_text = if (tool_log.items.len > 0) blk: {
-            var stored: std.ArrayList(u8) = .{};
+            var stored: std.ArrayList(u8) = .empty;
             stored.appendSlice(self.allocator, "<tool_calls>") catch {};
             stored.appendSlice(self.allocator, tool_log.items) catch {};
             stored.appendSlice(self.allocator, "\n</tool_calls>\n\n") catch {};
@@ -1965,7 +2700,7 @@ pub const Engine = struct {
         // Serialize spawned subagent IDs as a comma-joined string for the response payload.
         const spawned_jobs_str: ?[]const u8 = if (spawned_subagent_ids.items.len > 0) blk: {
             const total_len = spawned_subagent_ids.items.len * 37; // 36 + comma
-            var out: std.ArrayList(u8) = .{};
+            var out: std.ArrayList(u8) = .empty;
             out.ensureTotalCapacity(self.allocator, total_len) catch break :blk null;
             for (spawned_subagent_ids.items, 0..) |id, i| {
                 if (i > 0) out.append(self.allocator, ',') catch {};
@@ -2050,6 +2785,7 @@ pub const Engine = struct {
                 .content = "Failed to serialize plan",
                 .is_error = true,
             };
+            defer self.allocator.free(plan_json);
 
             self.session_store.setPlan(session_id, plan_json) catch |err| {
                 const msg = std.fmt.allocPrint(self.allocator, "Failed to save plan: {s}", .{@errorName(err)}) catch return .{
@@ -2075,12 +2811,15 @@ pub const Engine = struct {
                 .content = "No active plan to update. Use 'create' first.",
                 .is_error = true,
             };
+            defer self.allocator.free(existing.?);
 
             // Parse existing plan
-            const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, existing.?, .{}) catch return .{
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, existing.?, .{}) catch return .{
                 .content = "Failed to parse existing plan. Consider re-creating it.",
                 .is_error = true,
             };
+            defer parsed.deinit();
+            const plan_allocator = parsed.arena.allocator();
             var plan_obj = parsed.value;
 
             if (plan_obj != .object) return .{
@@ -2091,7 +2830,7 @@ pub const Engine = struct {
             // Update goal if provided
             if (input.object.get("goal")) |new_goal| {
                 if (new_goal == .string) {
-                    _ = plan_obj.object.fetchPut("goal", new_goal) catch {};
+                    _ = plan_obj.object.fetchPut(plan_allocator, "goal", new_goal) catch {};
                 }
             }
 
@@ -2121,15 +2860,15 @@ pub const Engine = struct {
                                     if (es_id != null and es_id.? == nid) {
                                         // Update fields
                                         if (new_step.object.get("status")) |s| {
-                                            _ = es.*.object.fetchPut("status", s) catch {};
+                                            _ = es.*.object.fetchPut(plan_allocator, "status", s) catch {};
                                         }
                                         if (new_step.object.get("description")) |d| {
-                                            _ = es.*.object.fetchPut("description", d) catch {};
+                                            _ = es.*.object.fetchPut(plan_allocator, "description", d) catch {};
                                         }
                                         // notes: subagents attach findings, discoveries,
                                         // warnings here so the next subagent inherits context.
                                         if (new_step.object.get("notes")) |n| {
-                                            _ = es.*.object.fetchPut("notes", n) catch {};
+                                            _ = es.*.object.fetchPut(plan_allocator, "notes", n) catch {};
                                         }
                                         found = true;
                                         break;
@@ -2141,9 +2880,13 @@ pub const Engine = struct {
                                 }
                             }
                         }
+                        // ArrayList is stored by value in std.json.Value. If
+                        // append reallocated it, persist the updated slice and
+                        // capacity back into the plan object before stringify.
+                        plan_obj.object.getPtr("steps").?.array = existing_steps;
                     } else {
                         // No existing steps — set them
-                        _ = plan_obj.object.fetchPut("steps", new_steps_val) catch {};
+                        _ = plan_obj.object.fetchPut(plan_allocator, "steps", new_steps_val) catch {};
                     }
                 }
             }
@@ -2174,6 +2917,93 @@ pub const Engine = struct {
         return .{ .content = msg, .is_error = true };
     }
 
+    fn handleVisionRead(self: *Engine, input: std.json.Value, session_id: *const [36]u8) tools.ToolResult {
+        if (input != .object) return .{
+            .content = "vision_read requires an object input with a 'path' field",
+            .is_error = true,
+        };
+
+        const raw_path = if (input.object.get("path")) |v| (if (v == .string) v.string else null) else null;
+        if (raw_path == null or std.mem.trim(u8, raw_path.?, " \t\r\n").len == 0) return .{
+            .content = "vision_read requires a non-empty 'path' string",
+            .is_error = true,
+        };
+
+        const vp = self.vision_pipeline orelse return .{
+            .content = "vision_read is unavailable because no vision pipeline is configured",
+            .is_error = true,
+        };
+
+        const path = self.resolveVisionImagePath(raw_path.?, session_id[0..]) catch |err| {
+            const msg = std.fmt.allocPrint(self.allocator, "Failed to resolve image path: {s}", .{@errorName(err)}) catch
+                "Failed to resolve image path";
+            return .{ .content = msg, .is_error = true };
+        };
+        defer self.allocator.free(path);
+
+        const mime = if (input.object.get("mime")) |v|
+            (if (v == .string and v.string.len > 0) v.string else inferImageMime(path))
+        else
+            inferImageMime(path);
+        const name = if (input.object.get("name")) |v|
+            (if (v == .string and v.string.len > 0) v.string else std.fs.path.basename(path))
+        else
+            std.fs.path.basename(path);
+
+        const result = vp.describePath(session_id[0..], name, mime, path) catch |err| {
+            const msg = std.fmt.allocPrint(self.allocator, "vision_read failed: {s}", .{@errorName(err)}) catch
+                "vision_read failed";
+            return .{ .content = msg, .is_error = true };
+        };
+        defer self.allocator.free(result.description);
+        defer self.allocator.free(result.model_used);
+
+        const content = std.fmt.allocPrint(
+            self.allocator,
+            "VISION READ\nPath: {s}\nName: {s}\nMIME: {s}\nModel: {s}\nCache: {s}\n\n{s}",
+            .{
+                path,
+                name,
+                mime,
+                if (result.model_used.len > 0) result.model_used else "(none)",
+                if (result.from_cache) "hit" else "miss",
+                result.description,
+            },
+        ) catch "vision_read completed, but failed to format the result";
+        return .{ .content = content, .is_error = false };
+    }
+
+    fn resolveVisionImagePath(self: *Engine, raw_path: []const u8, session_id: []const u8) ![]u8 {
+        const trimmed = std.mem.trim(u8, raw_path, " \t\r\n");
+        if (std.fs.path.isAbsolute(trimmed)) {
+            return try self.allocator.dupe(u8, trimmed);
+        }
+        if (trimmed.len > 0 and trimmed[0] == '~') {
+            const home = common.config.getEnvVar("HOME") orelse return error.HomeNotSet;
+            return try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ home, trimmed[1..] });
+        }
+
+        if (self.session_store.getWorkingDirectory(session_id) catch null) |workdir| {
+            defer self.allocator.free(workdir);
+            if (std.fs.path.isAbsolute(workdir)) {
+                return try std.fs.path.join(self.allocator, &.{ workdir, trimmed });
+            }
+        }
+
+        const root = try common.config.getProjectRoot(self.allocator);
+        defer self.allocator.free(root);
+        return try std.fs.path.join(self.allocator, &.{ root, trimmed });
+    }
+
+    fn inferImageMime(path: []const u8) []const u8 {
+        const ext = std.fs.path.extension(path);
+        if (std.ascii.eqlIgnoreCase(ext, ".png")) return "image/png";
+        if (std.ascii.eqlIgnoreCase(ext, ".jpg") or std.ascii.eqlIgnoreCase(ext, ".jpeg")) return "image/jpeg";
+        if (std.ascii.eqlIgnoreCase(ext, ".webp")) return "image/webp";
+        if (std.ascii.eqlIgnoreCase(ext, ".gif")) return "image/gif";
+        return "image/png";
+    }
+
     /// Compute sha256 hex cache key for an explore subagent call.
     /// Returns null if target_files is empty (caching that would over-match across
     /// unrelated codebases). Caller owns the returned bytes.
@@ -2186,7 +3016,7 @@ pub const Engine = struct {
         if (arr.items.len == 0) return null;
 
         // Collect & sort paths for stable key ordering.
-        var paths = std.ArrayList([]const u8){};
+        var paths: std.ArrayList([]const u8) = .empty;
         defer paths.deinit(self.allocator);
         for (arr.items) |item| {
             if (item == .string and item.string.len > 0) {
@@ -2252,7 +3082,7 @@ pub const Engine = struct {
             "UPDATE explore_cache SET hits = hits + 1, last_hit_at = ? WHERE cache_key = ?",
         ) catch return dup;
         defer upd.deinit();
-        upd.bindInt64(1, std.time.timestamp()) catch return dup;
+        upd.bindInt64(1, common.sync.timestamp()) catch return dup;
         upd.bindText(2, cache_key) catch return dup;
         _ = upd.step() catch return dup;
         return dup;
@@ -2272,7 +3102,7 @@ pub const Engine = struct {
             \\VALUES (?, ?, ?, ?, ?, ?, 0)
         ) catch return;
         defer stmt.deinit();
-        const now = std.time.timestamp();
+        const now = common.sync.timestamp();
         stmt.bindText(1, cache_key) catch return;
         stmt.bindText(2, task) catch return;
         stmt.bindText(3, target_files_json) catch return;
@@ -2368,7 +3198,11 @@ pub const Engine = struct {
                 return .{ .content = out };
             }
             // Still running — surface current state.
-            const events = wp.getToolEvents(&job_id, 0);
+            const events = wp.getToolEvents(&job_id, 0) catch return .{
+                .content = "subagent_inspect: failed to copy tool events",
+                .is_error = true,
+            };
+            defer events.deinit();
             const summary = wp.formatSubagentSummary(self.allocator, &job_id) orelse "(no summary)";
             defer if (!std.mem.eql(u8, summary, "(no summary)")) self.allocator.free(summary);
             const out = std.fmt.allocPrint(
@@ -2380,10 +3214,14 @@ pub const Engine = struct {
         }
 
         if (std.mem.eql(u8, depth, "tools")) {
-            const events = wp.getToolEvents(&job_id, 0);
-            var buf: std.ArrayList(u8) = .{};
+            const events = wp.getToolEvents(&job_id, 0) catch return .{
+                .content = "subagent_inspect: failed to copy tool events",
+                .is_error = true,
+            };
+            defer events.deinit();
+            var buf: std.ArrayList(u8) = .empty;
             defer buf.deinit(self.allocator);
-            const w = buf.writer(self.allocator);
+            const w = common.list_writer.init(&buf, self.allocator);
             w.print("Subagent {s} tool history ({d} events):\n", .{ job_id[0..8], events.events.len }) catch {};
             const max_events: usize = 64;
             const max_content_per_event: usize = 400;
@@ -2396,6 +3234,9 @@ pub const Engine = struct {
                 const kind: []const u8 = switch (ev.event_type) {
                     .tool_use => "→ tool_use",
                     .tool_result => "← tool_result",
+                    .model_wait => "… model_wait",
+                    .model_text => "note model_text",
+                    .control => "* control",
                 };
                 const err_tag: []const u8 = if (ev.is_error) " [error]" else "";
                 const content = if (ev.content.len > max_content_per_event)
@@ -2551,7 +3392,9 @@ pub const Engine = struct {
         parent_session_id: *const [36]u8,
         spawned_ids: *std.ArrayList([36]u8),
         parent_model: []const u8,
+        delegated_model_override: ?[]const u8,
         parent_allowed_tools: ?[]const u8,
+        parent_plans_required: bool,
     ) tools.ToolResult {
         const wp = self.worker_pool orelse return .{
             .content = "summon_subagent unavailable: no worker pool configured",
@@ -2574,14 +3417,15 @@ pub const Engine = struct {
             .is_error = true,
         };
 
-        // wait: true → block until subagent completes and return result as tool_result.
-        // Default: false for both modes now that auto-chain is the preferred flow
-        // for explore (dispatcher stays snappy, continuation runs async on the
-        // worker thread). Dispatcher can still pass wait=true for in-turn chaining.
-        const wait_sync: bool = if (input.object.get("wait")) |w|
+        // wait: true may block a foreground caller while the background worker
+        // services the child. It is forcibly converted to async when this call
+        // already runs on that worker; otherwise it would wait on its own queue.
+        const wait_requested: bool = if (input.object.get("wait")) |w|
             (if (w == .bool) w.bool else false)
         else
             false;
+        const wait_sync = wait_requested and wp.canSynchronouslyWaitForBackgroundJob();
+        const wait_forced_async = wait_requested and !wait_sync;
 
         // chain: when true (explore only), the worker automatically runs a
         // dispatcher continuation turn once the subagent returns, feeding the
@@ -2660,7 +3504,7 @@ pub const Engine = struct {
             (if (m == .string and m.string.len > 0) m.string else null)
         else
             null;
-        const model_val: ?[]const u8 = explicit_model orelse
+        const model_val: ?[]const u8 = explicit_model orelse delegated_model_override orelse
             (if (parent_model.len > 0) parent_model else null);
 
         // Load the current plan so the subagent sees what step it's working on.
@@ -2670,18 +3514,19 @@ pub const Engine = struct {
         // conversation context, so every useful fact must be spelled out here.
         const has_targets = if (target_files_val) |tf| tf.items.len > 0 else false;
 
-        var brief_buf: std.ArrayList(u8) = .{};
+        var brief_buf: std.ArrayList(u8) = .empty;
         defer brief_buf.deinit(self.allocator);
-        const w = brief_buf.writer(self.allocator);
+        const w = common.list_writer.init(&brief_buf, self.allocator);
 
         if (is_explore) {
             w.writeAll(
                 \\[EXPLORE SUBAGENT — READ-ONLY RESEARCH MODE]
                 \\
                 \\You are a research agent. Your ONLY job is to investigate the question below
-                \\and return a structured 3-layer brief. You have READ-ONLY tools: file_read,
-                \\bash (for grep/find/cat/ls/head/tail only — do NOT use destructive commands),
-                \\and introspect. You do NOT have file_write, file_diff, or summon_subagent.
+                \\and return a structured 3-layer brief. You have READ-ONLY tools: file_find, file_read,
+                \\vision_read, visual_audit, playwright_mcp, bash (for grep/find/cat/ls/head/tail only —
+                \\do NOT use destructive commands), and introspect. You do NOT have file_write, file_diff,
+                \\or summon_subagent.
                 \\
                 \\
             ) catch {};
@@ -2747,7 +3592,7 @@ pub const Engine = struct {
                 w.writeAll("--- HINT PATHS (caller's starting guesses; pivot if they're wrong) ---\n") catch {};
                 for (target_files_val.?.items) |item| {
                     if (item == .string) {
-                            w.print("- {s}\n", .{item.string}) catch {};
+                        w.print("- {s}\n", .{item.string}) catch {};
                     }
                 }
                 w.writeAll("\n") catch {};
@@ -2803,7 +3648,7 @@ pub const Engine = struct {
                 \\
                 \\TOOL PRIORITY:
                 \\- Use the best tool for the immediate need, not the loudest one.
-                \\- Read/inspect first: file_read, introspect, safe bash.
+                \\- Find/read/inspect first: file_find, file_read, introspect, safe bash.
                 \\- Mutate only after you've seen the real file contents.
                 \\- Prefer the minimum number of tool calls needed to finish well.
                 \\- When acceptance mentions build/test behavior, verify it with the
@@ -2823,7 +3668,7 @@ pub const Engine = struct {
             } else {
                 w.writeAll(
                     \\RECON GUIDANCE:
-                    \\target_files is empty — this is a discovery task. Use bash (grep, find),
+                    \\target_files is empty — this is a discovery task. Use file_find, bash (grep, find),
                     \\introspect, and file_read to locate what you need before acting.
                     \\
                     \\
@@ -2940,7 +3785,7 @@ pub const Engine = struct {
         // Explore subagents get a read-only toolset. Execute subagents inherit
         // whatever tools are enabled on the registry.
         const allowed_dup: ?[]const u8 = if (is_explore)
-            (self.allocator.dupe(u8, "file_read,bash,introspect,plan") catch null)
+            (self.allocator.dupe(u8, "file_find,file_read,vision_read,visual_audit,playwright_mcp,bash,introspect,plan") catch null)
         else
             null;
 
@@ -2956,9 +3801,9 @@ pub const Engine = struct {
         // and eventual write-back (stored on the Engine's pending_explore_cache
         // map keyed by job_id).
         if (cache_key_opt) |ck| {
-            var tf_buf: std.ArrayList(u8) = .{};
+            var tf_buf: std.ArrayList(u8) = .empty;
             defer tf_buf.deinit(self.allocator);
-            const tfw = tf_buf.writer(self.allocator);
+            const tfw = common.list_writer.init(&tf_buf, self.allocator);
             tfw.writeAll("[") catch {};
             if (target_files_val) |arr| {
                 for (arr.items, 0..) |item, i| {
@@ -3001,6 +3846,7 @@ pub const Engine = struct {
             .allowed_tools = allowed_dup,
             .is_subagent = true,
             .is_explore = is_explore,
+            .plans_required = parent_plans_required,
             .auto_chain = auto_chain_effective,
             .chain_allowed_tools = chain_allowed_dup,
             .cancelled = std.atomic.Value(bool).init(false),
@@ -3008,7 +3854,7 @@ pub const Engine = struct {
 
         spawned_ids.append(self.allocator, job_id) catch {};
 
-        std.log.info("Spawned subagent job {s} (wait={})", .{ job_id, wait_sync });
+        std.log.info("Spawned subagent job {s} (wait_requested={}, wait_effective={})", .{ job_id, wait_requested, wait_sync });
 
         if (wait_sync) {
             // Block until the job completes, up to a generous ceiling. Explore
@@ -3033,7 +3879,7 @@ pub const Engine = struct {
                     ) catch "Subagent completed.";
                     return .{ .content = msg, .is_error = is_err };
                 }
-                std.Thread.sleep(poll_interval_ms * std.time.ns_per_ms);
+                common.sync.sleepNanoseconds(poll_interval_ms * std.time.ns_per_ms);
                 waited_ms += poll_interval_ms;
             }
             const msg = std.fmt.allocPrint(
@@ -3044,11 +3890,18 @@ pub const Engine = struct {
             return .{ .content = msg, .is_error = true };
         }
 
-        const result_text = std.fmt.allocPrint(
-            self.allocator,
-            "Subagent dispatched (mode={s}, async). Job ID: {s}. The user will receive the result automatically when it completes. (To block this tool call until the subagent finishes, pass wait=true.)",
-            .{ mode_str, job_id },
-        ) catch "Subagent dispatched.";
+        const result_text = if (wait_forced_async)
+            std.fmt.allocPrint(
+                self.allocator,
+                "Subagent dispatched (mode={s}, async). Job ID: {s}. wait=true was converted to async because this dispatcher is already running on the background worker; blocking here would deadlock its own queue. Continue without waiting. The user will receive the result automatically.",
+                .{ mode_str, job_id },
+            ) catch "Subagent dispatched asynchronously to avoid a worker self-deadlock."
+        else
+            std.fmt.allocPrint(
+                self.allocator,
+                "Subagent dispatched (mode={s}, async). Job ID: {s}. The user will receive the result automatically when it completes. (A foreground caller may pass wait=true for in-turn chaining.)",
+                .{ mode_str, job_id },
+            ) catch "Subagent dispatched.";
 
         return .{ .content = result_text, .is_error = false };
     }
@@ -3124,6 +3977,35 @@ pub const Engine = struct {
     // BACKGROUND CHAT — enqueue to worker pool for async processing
     // ================================================================
 
+    fn cloneRequestAttachments(
+        self: *Engine,
+        attachments_opt: ?[]const common.Request.Attachment,
+    ) !?[]common.Request.Attachment {
+        const attachments = attachments_opt orelse return null;
+        if (attachments.len == 0) return null;
+
+        const cloned = try self.allocator.alloc(common.Request.Attachment, attachments.len);
+        errdefer self.allocator.free(cloned);
+        for (attachments, 0..) |att, i| {
+            cloned[i] = .{
+                .path = try self.allocator.dupe(u8, att.path),
+                .mime = try self.allocator.dupe(u8, att.mime),
+                .name = try self.allocator.dupe(u8, att.name),
+            };
+        }
+        return cloned;
+    }
+
+    fn freeRequestAttachments(self: *Engine, attachments_opt: ?[]common.Request.Attachment) void {
+        const attachments = attachments_opt orelse return;
+        for (attachments) |att| {
+            self.allocator.free(att.path);
+            self.allocator.free(att.mime);
+            self.allocator.free(att.name);
+        }
+        self.allocator.free(attachments);
+    }
+
     fn enqueueBackgroundChat(self: *Engine, req: common.Request.ChatRequest) Result {
         const wp = self.worker_pool orelse {
             return .{ .response = .{ .error_resp = .{
@@ -3154,9 +4036,22 @@ pub const Engine = struct {
         var job_id: [36]u8 = undefined;
         generateUUID(&job_id);
 
+        const attachments = self.cloneRequestAttachments(req.attachments) catch {
+            return .{ .response = .{ .error_resp = .{
+                .code = "OOM",
+                .message = "Failed to allocate background attachments",
+            } } };
+        };
+        const adapter_context = if (req.adapter_context) |ac|
+            (self.allocator.dupe(u8, ac) catch null)
+        else
+            null;
+
         wp.enqueueBackgroundChat(.{
             .job_id = job_id,
             .message = self.allocator.dupe(u8, req.message) catch {
+                self.freeRequestAttachments(attachments);
+                if (adapter_context) |ac| self.allocator.free(ac);
                 return .{ .response = .{ .error_resp = .{
                     .code = "OOM",
                     .message = "Failed to allocate background job",
@@ -3175,19 +4070,23 @@ pub const Engine = struct {
                 (self.allocator.dupe(u8, at) catch null)
             else
                 null,
+            .attachments = attachments,
+            .adapter_context = adapter_context,
             .is_subagent = req.is_subagent,
+            .compact_tool_schemas = req.compact_tool_schemas,
+            .plans_required = req.plans_required,
             .cancelled = std.atomic.Value(bool).init(false),
         });
 
         return .{ .response = .{ .background_queued = .{
-            .job_id = &job_id,
-            .session_id = &session_id,
+            .job_id = job_id,
+            .session_id = session_id,
         } } };
     }
 
     fn generateUUID(buf: *[36]u8) void {
         var random_bytes: [16]u8 = undefined;
-        std.crypto.random.bytes(&random_bytes);
+        std.Io.random(common.config.runtimeIo(), &random_bytes);
         random_bytes[6] = (random_bytes[6] & 0x0f) | 0x40;
         random_bytes[8] = (random_bytes[8] & 0x3f) | 0x80;
         const hex = "0123456789abcdef";
@@ -3306,8 +4205,12 @@ pub const Engine = struct {
         session_id: ?[]const u8,
         model_override: ?[]const u8,
         allowed_tools: ?[]const u8,
+        attachments: ?[]const common.Request.Attachment,
+        adapter_context_override: ?[]const u8,
         is_subagent: bool,
         is_explore: bool,
+        compact_tool_schemas: bool,
+        plans_required: bool,
         confirm_ctx: ?*anyopaque,
         confirm_fn: ?*const fn (ctx: *anyopaque, tool_name: []const u8, tool_id: []const u8, input_preview: []const u8) bool,
     ) workers.BackgroundChatOutput {
@@ -3318,19 +4221,24 @@ pub const Engine = struct {
             null;
         const adapter_ctx: []const u8 = if (is_subagent)
             "You are a SUBAGENT WORKER, not a chat assistant. The user who " ++
-            "sent you this task expects tools to be used, files to be read, " ++
-            "commands to be run, and factual results. You MUST begin by " ++
-            "calling a tool. Never reply with only text on your first turn. " ++
-            "Ignore any conversational patterns from the session history — " ++
-            "they are from the dispatcher, not from you. Keep all output " ++
-            "terse and factual; no emojis, no greetings, no 'let me...'."
+                "sent you this task expects tools to be used, files to be read, " ++
+                "commands to be run, and factual results. You MUST begin by " ++
+                "calling a tool. Never reply with only text on your first turn. " ++
+                "Ignore any conversational patterns from the session history — " ++
+                "they are from the dispatcher, not from you. Keep all output " ++
+                "terse and factual; no emojis, no greetings, no 'let me...'. " ++
+                "After the first tool call, when it helps user steering, include at most " ++
+                "one short visible progress sentence before additional tool calls. Do not " ++
+                "include private reasoning."
         else
-            "You are running as a background agent. " ++
-            "Investigate thoroughly using file_read before making changes. " ++
-            "When you are ready to modify files or run commands, clearly state your plan first, " ++
-            "then proceed. The user will be prompted to approve the first mutation — " ++
-            "after approval, you have full autonomy to iterate (edit, build, test, fix) " ++
-            "until the task is complete.";
+            adapter_context_override orelse "You are running as a background agent. " ++
+                "Investigate thoroughly using file_read before making changes. " ++
+                "When you are ready to modify files or run commands, clearly state your plan first, " ++
+                "then proceed. The user will be prompted to approve the first mutation — " ++
+                "after approval, you have full autonomy to iterate (edit, build, test, fix) " ++
+                "until the task is complete. When useful before tool calls, include at most " ++
+                "one short user-visible progress sentence so the user can steer you. Do not " ++
+                "include private reasoning.";
         const result = self.process(.{ .chat = .{
             .message = message,
             .session_id = session_id,
@@ -3341,6 +4249,9 @@ pub const Engine = struct {
             .no_tools = false,
             .background = false,
             .is_subagent = is_subagent,
+            .compact_tool_schemas = compact_tool_schemas,
+            .plans_required = plans_required,
+            .attachments = attachments,
         } }, null, confirmer);
 
         return switch (result) {
@@ -3470,6 +4381,10 @@ pub const Engine = struct {
             "codex:gpt-5.1-codex          (ChatGPT subscription, coding)",
             "codex:gpt-5.1-codex-mini     (ChatGPT subscription, fast)",
             "codex:gpt-5.3-codex          (ChatGPT subscription, latest)",
+            "codex:gpt-5.5                (ChatGPT subscription)",
+            "codex:gpt-5.6-sol            (ChatGPT subscription, frontier)",
+            "codex:gpt-5.6-terra          (ChatGPT subscription, balanced)",
+            "codex:gpt-5.6-luna           (ChatGPT subscription, cost-focused)",
         };
         return .{ .response = .{ .model_list = models } };
     }
@@ -3493,7 +4408,7 @@ pub const Engine = struct {
     // ================================================================
 
     fn processStatus(self: *Engine) Result {
-        const now = std.time.timestamp();
+        const now = common.sync.timestamp();
         const uptime: u64 = @intCast(now - self.start_time);
         const count = self.session_store.sessionCount() catch 0;
 
@@ -3746,9 +4661,38 @@ pub const Engine = struct {
         );
     }
 
+    fn emitModelWaitEvent(
+        self: *Engine,
+        round: usize,
+        provider_name: []const u8,
+        model: []const u8,
+        message_count: usize,
+        request: api.MessageRequest,
+    ) void {
+        const wp = self.worker_pool orelse return;
+        const system_chars = if (request.system) |sys| sys.len else 0;
+        const message_chars = estimateMessageChars(request.messages);
+        const tool_chars = estimateToolChars(request.tools);
+        const total_chars = system_chars + message_chars + tool_chars;
+        const tool_count = if (request.tools) |defs| defs.len else 0;
+
+        const content = std.fmt.allocPrint(
+            self.allocator,
+            "provider={s} model={s} round={d} messages={d} tools={d} system_chars={d} message_chars={d} tool_chars={d} total_chars={d}",
+            .{ provider_name, model, round, message_count, tool_count, system_chars, message_chars, tool_chars, total_chars },
+        ) catch return;
+
+        wp.pushToolEvent(.{
+            .event_type = .model_wait,
+            .tool_name = "model",
+            .content = content,
+            .timestamp = common.sync.timestamp(),
+        });
+    }
+
     /// Heuristic tool selection keeps the schema budget small on the first request.
     fn selectToolDefinitionsForMessage(self: *Engine, user_message: []const u8) ?[]const api.messages.ToolDefinition {
-        var names: [12][]const u8 = undefined;
+        var names: [24][]const u8 = undefined;
         var count: usize = 0;
 
         addToolName(&names, &count, "calc");
@@ -3758,13 +4702,22 @@ pub const Engine = struct {
         defer self.allocator.free(lower);
 
         const coding = containsAny(lower, &.{
-            "code", "file", "bug", "fix", "build", "compile", "test", "zig", "refactor", "implement", "patch",
+            "code", "file", "read",  "open",    "inspect", "path", "/home/",   ".md",       ".zig",  ".py", ".json",
+            "bug",  "fix",  "build", "compile", "test",    "zig",  "refactor", "implement", "patch",
         });
         const research = containsAny(lower, &.{ "research", "search", "look up", "investigate", "compare", "find sources" });
+        const visual = containsAny(lower, &.{
+            "visual",   "frontend", "front-end", "ui",         "screenshot", "browser",       "playwright", "website",
+            "web page", "page",     "dom",       "responsive", "layout",     "accessibility", "a11y",       "clipped",
+            "overlap",  "contrast", "image",     ".png",       ".jpg",       ".jpeg",         ".webp",
+        });
         const shopping = containsAny(lower, &.{ "buy", "price", "amazon", "shopping", "product" });
         const memes = containsAny(lower, &.{ "meme", "joke", "shitpost" });
+        const planning = containsAny(lower, &.{ "make a plan", "create a plan", "start a plan", "replace the plan", "new plan", "checklist", "check list" });
 
+        if (planning) addToolName(&names, &count, "plan");
         if (coding) {
+            addToolName(&names, &count, "file_find");
             addToolName(&names, &count, "file_read");
             addToolName(&names, &count, "file_write");
             addToolName(&names, &count, "file_diff");
@@ -3773,20 +4726,61 @@ pub const Engine = struct {
             addToolName(&names, &count, "rebuild");
         }
         if (research) addToolName(&names, &count, "research_tool");
+        if (visual) {
+            addToolName(&names, &count, "visual_audit");
+            addToolName(&names, &count, "playwright_mcp");
+            addToolName(&names, &count, "vision_read");
+        }
         if (shopping) addToolName(&names, &count, "amazon_search");
         if (memes) addToolName(&names, &count, "meme_tool");
 
         return self.tool_registry.getToolDefinitionsFiltered(names[0..count]) orelse self.tool_registry.getToolDefinitions();
     }
 
-    /// Follow-up rounds keep only the active tool chain and close companions instead of every schema.
+    fn selectNextRoundToolDefinitions(
+        self: *Engine,
+        chat_req: common.Request.ChatRequest,
+        tool_uses: []const api.messages.ToolUseInfo,
+        is_subagent: bool,
+    ) ?[]const api.messages.ToolDefinition {
+        if (chat_req.allowed_tools) |at| {
+            return self.selectAllowedToolDefinitions(at, is_subagent);
+        }
+        if (!chat_req.compact_tool_schemas) {
+            return if (is_subagent)
+                self.tool_registry.getToolDefinitionsExcludingMany(&tools.ToolRegistry.SUBAGENT_HIDDEN_TOOLS)
+            else
+                self.tool_registry.getToolDefinitions();
+        }
+        return self.selectFollowupToolDefinitions(chat_req.message, tool_uses, is_subagent);
+    }
+
+    fn selectAllowedToolDefinitions(self: *Engine, allowed_tools: []const u8, is_subagent: bool) ?[]const api.messages.ToolDefinition {
+        var names: [32][]const u8 = undefined;
+        var count: usize = 0;
+        var iter = std.mem.splitScalar(u8, allowed_tools, ',');
+        outer: while (iter.next()) |name| {
+            const trimmed = std.mem.trim(u8, name, " ");
+            if (trimmed.len == 0 or count >= 32) continue;
+            if (is_subagent) {
+                for (tools.ToolRegistry.SUBAGENT_HIDDEN_TOOLS) |hidden| {
+                    if (std.mem.eql(u8, trimmed, hidden)) continue :outer;
+                }
+            }
+            names[count] = trimmed;
+            count += 1;
+        }
+        return if (count > 0) self.tool_registry.getToolDefinitionsFiltered(names[0..count]) else null;
+    }
+
+    /// Compact follow-up rounds keep only the active tool chain and close companions instead of every schema.
     fn selectFollowupToolDefinitions(
         self: *Engine,
         user_message: []const u8,
         tool_uses: []const api.messages.ToolUseInfo,
         is_subagent: bool,
     ) ?[]const api.messages.ToolDefinition {
-        var names: [12][]const u8 = undefined;
+        var names: [24][]const u8 = undefined;
         var count: usize = 0;
 
         addToolName(&names, &count, "calc");
@@ -3794,7 +4788,11 @@ pub const Engine = struct {
 
         for (tool_uses) |tool_use| {
             addToolName(&names, &count, tool_use.name);
-            if (std.mem.eql(u8, tool_use.name, "file_read")) {
+            if (std.mem.eql(u8, tool_use.name, "file_find")) {
+                addToolName(&names, &count, "file_read");
+                addToolName(&names, &count, "bash");
+            } else if (std.mem.eql(u8, tool_use.name, "file_read")) {
+                addToolName(&names, &count, "file_find");
                 addToolName(&names, &count, "file_diff");
                 addToolName(&names, &count, "file_write");
                 addToolName(&names, &count, "bash");
@@ -3805,7 +4803,10 @@ pub const Engine = struct {
                 addToolName(&names, &count, "file_read");
                 addToolName(&names, &count, "file_write");
             } else if (std.mem.eql(u8, tool_use.name, "bash")) {
+                addToolName(&names, &count, "file_find");
                 addToolName(&names, &count, "file_read");
+                addToolName(&names, &count, "file_write");
+                addToolName(&names, &count, "file_diff");
                 addToolName(&names, &count, "rebuild");
                 addToolName(&names, &count, "zig_test");
             } else if (std.mem.eql(u8, tool_use.name, "rebuild")) {
@@ -3815,6 +4816,20 @@ pub const Engine = struct {
                 addToolName(&names, &count, "bash");
                 addToolName(&names, &count, "file_read");
                 addToolName(&names, &count, "file_diff");
+            } else if (std.mem.eql(u8, tool_use.name, "playwright_mcp")) {
+                addToolName(&names, &count, "visual_audit");
+                addToolName(&names, &count, "vision_read");
+                addToolName(&names, &count, "file_find");
+                addToolName(&names, &count, "file_read");
+            } else if (std.mem.eql(u8, tool_use.name, "visual_audit")) {
+                addToolName(&names, &count, "playwright_mcp");
+                addToolName(&names, &count, "vision_read");
+                addToolName(&names, &count, "file_read");
+            } else if (std.mem.eql(u8, tool_use.name, "vision_read")) {
+                addToolName(&names, &count, "playwright_mcp");
+                addToolName(&names, &count, "visual_audit");
+                addToolName(&names, &count, "file_find");
+                addToolName(&names, &count, "file_read");
             } else if (std.mem.eql(u8, tool_use.name, "plan")) {
                 // After planning, the dispatcher's natural next moves are to
                 // delegate the work (summon_subagent) or do quick verification
@@ -3823,7 +4838,10 @@ pub const Engine = struct {
                 // "doesn't have summon_subagent" — even though the schema was
                 // present in round 0.
                 if (!is_subagent) addToolName(&names, &count, "summon_subagent");
+                addToolName(&names, &count, "file_find");
                 addToolName(&names, &count, "file_read");
+                addToolName(&names, &count, "file_write");
+                addToolName(&names, &count, "file_diff");
                 addToolName(&names, &count, "bash");
             }
         }
@@ -3922,9 +4940,14 @@ fn recordReadPath(allocator: std.mem.Allocator, read_paths: *std.StringHashMap(v
 fn isLightweightTool(name: []const u8) bool {
     const lightweight = [_][]const u8{
         "file_read",
+        "file_find",
         "introspect",
         "calc",
         "research",
+        "research_tool",
+        "visual_audit",
+        "playwright_mcp",
+        "vision_read",
         "meme_tool",
         "amazon_search",
         // Single-file edits are allowed inline — the dispatcher needs this for
@@ -3964,7 +4987,7 @@ fn estimateToolChars(tools_list: ?[]const api.messages.ToolDefinition) usize {
     return total;
 }
 
-fn addToolName(buffer: *[12][]const u8, count: *usize, name: []const u8) void {
+fn addToolName(buffer: anytype, count: *usize, name: []const u8) void {
     for (buffer[0..count.*]) |existing| {
         if (std.mem.eql(u8, existing, name)) return;
     }
@@ -3981,12 +5004,36 @@ fn containsAny(haystack: []const u8, needles: []const []const u8) bool {
     return false;
 }
 
+fn isToolManifestQuestion(allocator: std.mem.Allocator, user_message: []const u8) bool {
+    const lower = std.ascii.allocLowerString(allocator, user_message) catch return false;
+    defer allocator.free(lower);
+
+    const asks_tool = containsAny(lower, &.{
+        "tool", "tools", "schema", "schemas", "function", "functions", "available to you",
+    });
+    if (!asks_tool) return false;
+
+    return containsAny(lower, &.{
+        "how many",
+        "count",
+        "list",
+        "what tools",
+        "which tools",
+        "available",
+        "do you see",
+        "can you use",
+        "you have",
+    });
+}
+
 /// Read a file (≤2MB) for explore-cache content hashing. Path must be absolute.
 fn readFileForHash(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
     if (path.len == 0 or path[0] != '/') return null;
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
-    defer file.close();
-    const size = try file.getEndPos();
+    const io = common.config.runtimeIo();
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+    defer file.close(io);
+    const size = (try file.stat(io)).size;
     if (size > 2 * 1024 * 1024) return null;
-    return try file.readToEndAlloc(allocator, @intCast(size + 1));
+    var file_reader = file.reader(io, &.{});
+    return try file_reader.interface.allocRemaining(allocator, .limited(@intCast(size + 1)));
 }

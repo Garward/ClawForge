@@ -112,7 +112,61 @@ Then:
 - Web UI:  `http://127.0.0.1:8081`
 - Discord: runs automatically if `discord.enabled=true` in the config
   and `DISCORD_TOKEN` is set in `.env`.
-- CLI:     `./zig-out/bin/clawforge-cli "your prompt"` (if built)
+- CLI:     `./zig-out/bin/clawforge "your prompt"` (if built)
+
+## Keep development separate from active use
+
+The Git checkout is the development tree. Deploy a tested build to a separate
+active directory so source updates and build experiments cannot disturb the
+running instance:
+
+```bash
+./scripts/deploy.sh --build
+../ClawForge-active/restart.sh
+```
+
+The default active directory is `../ClawForge-active`. Set
+`CLAWFORGE_RUNTIME_ROOT` to put it elsewhere. Deployments update application
+files while preserving `.env`, `data/`, custom personas, and runtime config.
+The deployed rebuild helper builds in the source checkout and only replaces
+the active application after a successful build.
+
+## Release archives
+
+Build a versioned Linux x86_64 archive and checksum with:
+
+```bash
+./scripts/build-release.sh
+```
+
+Archives land in `dist/`. A release can be installed without root access on
+most x86_64 Linux systems, including WSL:
+
+```bash
+unzip clawforge-0.2.0-linux-x86_64.zip
+cd clawforge-0.2.0-linux-x86_64
+./install.sh
+```
+
+The installer uses `${XDG_DATA_HOME:-$HOME/.local/share}/clawforge`, preserves
+existing configuration and data during upgrades, creates a Python virtual
+environment, and adds launchers under `~/.local/bin`. Pushing a `v*` tag runs
+the same packaging script and attaches the zip and SHA-256 checksum to a
+GitHub release.
+
+Future upgrades are one command:
+
+```bash
+clawforge-update
+```
+
+The updater verifies the release checksum, preserves all runtime state, and
+restarts ClawForge only when it was already running.
+
+On startup, ClawForge also seeds a native `ClawForge operations` skill into the
+workspace database. It answers questions about runtime architecture, safe
+updates, configuration, data locations, backups, and troubleshooting. Existing
+user-created skills are preserved.
 
 ## Repository layout
 
@@ -133,6 +187,7 @@ bridges/
 tools/                 # Python tool scripts invoked by Zig tool wrappers
 config/                # config.json + personas/
 docs/                  # architecture.md, schema docs, design notes
+scripts/               # deployment, release packaging, and installation
 ```
 
 ## Documentation

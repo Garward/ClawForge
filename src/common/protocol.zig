@@ -48,8 +48,14 @@ pub const Request = union(enum) {
         message: []const u8,
         session_id: ?[]const u8 = null,
         model_override: ?[]const u8 = null,
+        /// Model inherited by work spawned through summon_subagent. This lets
+        /// a lightweight dispatcher delegate to the regular model without
+        /// relying on the dispatcher to populate the tool's model argument.
+        delegated_model_override: ?[]const u8 = null,
         stream: bool = true,
         no_tools: bool = false,
+        compact_tool_schemas: bool = false,
+        plans_required: bool = true,
         background: bool = false,
         callback_channel: ?[]const u8 = null,
         /// Comma-separated tool names to allow. If set, only these tools are
@@ -134,6 +140,12 @@ pub const Request = union(enum) {
                 write(buf, &pos, if (req.stream) "true" else "false");
                 if (req.no_tools) {
                     write(buf, &pos, ",\"no_tools\":true");
+                }
+                if (req.compact_tool_schemas) {
+                    write(buf, &pos, ",\"compact_tool_schemas\":true");
+                }
+                if (!req.plans_required) {
+                    write(buf, &pos, ",\"plans_required\":false");
                 }
                 if (req.background) {
                     write(buf, &pos, ",\"background\":true");
@@ -389,8 +401,8 @@ pub const Response = union(enum) {
     };
 
     pub const BackgroundQueued = struct {
-        job_id: []const u8,
-        session_id: []const u8,
+        job_id: [36]u8,
+        session_id: [36]u8,
     };
 
     pub const BackgroundResultResp = struct {
@@ -655,9 +667,9 @@ pub const Response = union(enum) {
             },
             .background_queued => |bg| {
                 write(buf, &pos, "{\"background_queued\":{\"job_id\":\"");
-                write(buf, &pos, bg.job_id);
+                write(buf, &pos, &bg.job_id);
                 write(buf, &pos, "\",\"session_id\":\"");
-                write(buf, &pos, bg.session_id);
+                write(buf, &pos, &bg.session_id);
                 write(buf, &pos, "\"}}");
             },
             .background_result => |bg| {

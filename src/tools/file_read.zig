@@ -1,5 +1,6 @@
 const std = @import("std");
 const json = std.json;
+const common = @import("common");
 const registry = @import("registry.zig");
 
 pub const definition = registry.ToolDefinition{
@@ -32,7 +33,7 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
     defer if (owned_path) |p| allocator.free(p);
 
     const path = if (raw_path.len > 0 and raw_path[0] == '~') blk: {
-        const home = std.posix.getenv("HOME") orelse "/tmp";
+        const home = common.config.getEnvVar("HOME") orelse "/tmp";
         const expanded = std.fmt.allocPrint(allocator, "{s}{s}", .{ home, raw_path[1..] }) catch
             return .{ .content = "Path expansion failed", .is_error = true };
         owned_path = expanded;
@@ -77,12 +78,14 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
     };
 
     // Open and read file
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
+    const io = common.config.runtimeIo();
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "Error opening file: {s}", .{@errorName(err)}) catch
             return .{ .content = "Error opening file", .is_error = true };
         return .{ .content = msg, .is_error = true };
     };
-    defer file.close();
+    defer file.close(io);
+    var file_reader = file.reader(io, &.{});
 
     // Allocate output buffer
     var output = allocator.alloc(u8, 256 * 1024) catch
@@ -97,7 +100,7 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
     var remaining: usize = 0;
 
     while (true) {
-        const n = file.read(buf[remaining..]) catch break;
+        const n = file_reader.interface.readSliceShort(buf[remaining..]) catch break;
         if (n == 0) break;
 
         const data = buf[0 .. remaining + n];

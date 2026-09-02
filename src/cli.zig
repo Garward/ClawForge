@@ -2,8 +2,9 @@ const std = @import("std");
 const common = @import("common");
 const client = @import("client");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    common.config.setProcessRuntime(init.environ_map, init.io);
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -12,11 +13,15 @@ pub fn main() !void {
     defer config.deinit();
 
     // Initialize display
-    var display = client.Display.init(&config);
+    var display = client.Display.init(&config, init.io);
 
     // Parse arguments
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer args_iter.deinit();
+    var args_list: std.ArrayList([]const u8) = .empty;
+    defer args_list.deinit(allocator);
+    while (args_iter.next()) |arg| try args_list.append(allocator, arg);
+    const args = args_list.items;
 
     if (args.len < 2) {
         try display.printHelp();

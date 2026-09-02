@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("common");
 const db_mod = @import("db.zig");
 const simd = @import("common").simd;
 
@@ -28,7 +29,7 @@ pub const EmbeddingStore = struct {
         const binary = try simd.toBinary(self.allocator, vector);
         defer self.allocator.free(binary);
 
-        const now = std.time.timestamp();
+        const now = common.sync.timestamp();
         var stmt = try self.conn.prepare(
             "INSERT OR REPLACE INTO embeddings (source_type, source_id, namespace_id, " ++
                 "chunk_text, context_header, model, dimensions, " ++
@@ -68,17 +69,50 @@ pub const EmbeddingStore = struct {
         broad_limit: usize,
         final_limit: usize,
     ) ![]const SearchResult {
+        return self.vectorSearchInternal(query_vector, broad_limit, final_limit, null);
+    }
+
+    /// Vector search restricted to one source type.
+    pub fn vectorSearchBySourceType(
+        self: *EmbeddingStore,
+        source_type: []const u8,
+        query_vector: []const f32,
+        broad_limit: usize,
+        final_limit: usize,
+    ) ![]const SearchResult {
+        return self.vectorSearchInternal(
+            query_vector,
+            broad_limit,
+            final_limit,
+            source_type,
+        );
+    }
+
+    fn vectorSearchInternal(
+        self: *EmbeddingStore,
+        query_vector: []const f32,
+        broad_limit: usize,
+        final_limit: usize,
+        source_type_filter: ?[]const u8,
+    ) ![]const SearchResult {
         // Convert query to binary
         const query_binary = try simd.toBinary(self.allocator, query_vector);
         defer self.allocator.free(query_binary);
 
         // Pass 1: Broad search via binary hamming distance
-        var stmt = try self.conn.prepare(
-            "SELECT id, source_type, source_id, chunk_text, vector_fp32, vector_binary " ++
-                "FROM embeddings WHERE namespace_id = ?",
-        );
+        var stmt = if (source_type_filter != null)
+            try self.conn.prepare(
+                "SELECT id, source_type, source_id, chunk_text, vector_fp32, vector_binary " ++
+                    "FROM embeddings WHERE namespace_id = ? AND source_type = ?",
+            )
+        else
+            try self.conn.prepare(
+                "SELECT id, source_type, source_id, chunk_text, vector_fp32, vector_binary " ++
+                    "FROM embeddings WHERE namespace_id = ?",
+            );
         defer stmt.deinit();
         try stmt.bindInt64(1, self.namespace_id);
+        if (source_type_filter) |source_type| try stmt.bindText(2, source_type);
 
         // Collect candidates with hamming scores
         const Candidate = struct {

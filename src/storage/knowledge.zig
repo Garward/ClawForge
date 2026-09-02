@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("common");
 const db_mod = @import("db.zig");
 
 /// Knowledge CRUD with confidence management, FTS search, and dedup.
@@ -17,7 +18,7 @@ pub const KnowledgeStore = struct {
 
     /// Insert a new knowledge entry. Returns the id.
     pub fn createEntry(self: *KnowledgeStore, params: CreateParams) !i64 {
-        const now = std.time.timestamp();
+        const now = common.sync.timestamp();
         var stmt = try self.conn.prepare(
             "INSERT INTO knowledge (namespace_id, category, subcategory, title, content, " ++
                 "confidence, mention_count, source_sessions, first_seen, last_reinforced, " ++
@@ -49,7 +50,7 @@ pub const KnowledgeStore = struct {
     /// Reinforce an existing entry — bump mention_count and confidence.
     /// Called when the same insight is observed again.
     pub fn reinforce(self: *KnowledgeStore, id: i64, session_id: ?[]const u8) !void {
-        const now = std.time.timestamp();
+        const now = common.sync.timestamp();
 
         // Bump count and confidence (cap at 1.0)
         var stmt = try self.conn.prepare(
@@ -84,7 +85,7 @@ pub const KnowledgeStore = struct {
 
     /// Contradict an entry — lower confidence and record the contradiction.
     pub fn contradict(self: *KnowledgeStore, id: i64, reason: []const u8) !void {
-        const now = std.time.timestamp();
+        const now = common.sync.timestamp();
         var stmt = try self.conn.prepare(
             "UPDATE knowledge SET " ++
                 "confidence = MAX(0.0, confidence - 0.3), " ++
@@ -178,7 +179,7 @@ pub const KnowledgeStore = struct {
     /// Apply confidence decay to stale entries.
     /// Entries not reinforced in `days_threshold` days get confidence * decay_factor.
     pub fn applyDecay(self: *KnowledgeStore, days_threshold: i64, decay_factor: f64) !usize {
-        const cutoff = std.time.timestamp() - (days_threshold * 86400);
+        const cutoff = common.sync.timestamp() - (days_threshold * 86400);
         var conf_buf: [32]u8 = undefined;
         const factor_str = std.fmt.bufPrint(&conf_buf, "{d:.2}", .{decay_factor}) catch "0.90";
 
@@ -190,7 +191,7 @@ pub const KnowledgeStore = struct {
                 "WHERE namespace_id = ? AND last_reinforced < ? AND confidence > 0.1",
         );
         defer stmt.deinit();
-        try stmt.bindInt64(1, std.time.timestamp());
+        try stmt.bindInt64(1, common.sync.timestamp());
         try stmt.bindInt64(2, self.namespace_id);
         try stmt.bindInt64(3, cutoff);
         try stmt.exec();

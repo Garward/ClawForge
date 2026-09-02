@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("common");
 const db_mod = @import("db.zig");
 
 /// Namespace tree operations. Creates/resolves hierarchical path nodes.
@@ -18,7 +19,7 @@ pub const Namespaces = struct {
         }
 
         // Create new
-        const now = std.time.timestamp();
+        const now = common.sync.timestamp();
         var stmt = try self.conn.prepare(
             "INSERT INTO namespaces (parent_id, name, node_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
         );

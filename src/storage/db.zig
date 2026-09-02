@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("common");
 const c = @cImport({
     @cInclude("sqlite3.h");
 });
@@ -209,10 +210,7 @@ pub const Database = struct {
     extra_conns: std.ArrayList(Connection),
 
     pub fn init(allocator: std.mem.Allocator, dir_path: []const u8) !Database {
-        std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
+        try std.Io.Dir.cwd().createDirPath(common.config.runtimeIo(), dir_path);
 
         const db_path = try std.fs.path.joinZ(allocator, &.{ dir_path, "workspace.db" });
 
@@ -225,7 +223,7 @@ pub const Database = struct {
             .conn = conn,
             .allocator = allocator,
             .path = db_path,
-            .extra_conns = .{},
+            .extra_conns = .empty,
         };
     }
 

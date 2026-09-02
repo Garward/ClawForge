@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("common");
 
 /// Sandbox for executing generated tools safely.
 ///
@@ -61,7 +62,7 @@ pub const Sandbox = struct {
             argc += 1;
         }
 
-        const result = std.process.Child.run(.{
+        const result = common.process.run(.{
             .allocator = self.allocator,
             .argv = argv_buf[0..argc],
             .max_output_bytes = self.max_output,
@@ -100,7 +101,7 @@ pub const Sandbox = struct {
             try file.writeAll(script);
         }
 
-        const result = std.process.Child.run(.{
+        const result = common.process.run(.{
             .allocator = self.allocator,
             .argv = &.{ "python3", script_path },
             .max_output_bytes = self.max_output,

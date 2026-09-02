@@ -68,7 +68,7 @@ pub const OptimizationManager = struct {
     // -- Stats --
 
     pub fn getStats(self: *OptimizationManager, allocator: std.mem.Allocator) ![]u8 {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
 
         try buf.appendSlice(allocator, "=== Optimization Stats ===\n");

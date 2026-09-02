@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("common");
 const http = std.http;
 const json = std.json;
 const provider_mod = @import("provider.zig");
@@ -47,7 +48,7 @@ pub const OpenAIClient = struct {
         errdefer arena_ptr.deinit();
         const arena = arena_ptr.allocator();
 
-        var client = http.Client{ .allocator = arena };
+        var client = http.Client{ .allocator = arena, .io = common.config.runtimeIo() };
 
         const effective_model = if (request.model.len > 0) request.model else self.default_model;
 
@@ -112,7 +113,7 @@ pub const OpenAIClient = struct {
         errdefer arena_ptr.deinit();
         const arena = arena_ptr.allocator();
 
-        var client = http.Client{ .allocator = arena };
+        var client = http.Client{ .allocator = arena, .io = common.config.runtimeIo() };
 
         const effective_model = if (request.model.len > 0) request.model else self.default_model;
 
@@ -172,8 +173,8 @@ pub const OpenAIClient = struct {
         var transfer_buf: [65536]u8 = undefined;
         const reader = response.reader(&transfer_buf);
 
-        var text_buf: std.ArrayList(u8) = .{};
-        var tool_uses: std.ArrayList(messages.ToolUseInfo) = .{};
+        var text_buf: std.ArrayList(u8) = .empty;
+        var tool_uses: std.ArrayList(messages.ToolUseInfo) = .empty;
 
         // Tool call accumulation by index — OpenAI streams tool calls in
         // multiple chunks: first chunk has id+name, subsequent chunks
@@ -184,9 +185,9 @@ pub const OpenAIClient = struct {
         var tc_args: [MaxToolCalls]std.ArrayList(u8) = undefined;
         var tc_count: usize = 0;
         for (0..MaxToolCalls) |i| {
-            tc_ids[i] = .{};
-            tc_names[i] = .{};
-            tc_args[i] = .{};
+            tc_ids[i] = .empty;
+            tc_names[i] = .empty;
+            tc_args[i] = .empty;
         }
 
         var stop_reason: ?[]const u8 = null;
@@ -360,8 +361,11 @@ pub const OpenAIClient = struct {
                 "{}";
 
             const parsed_args = json.parseFromSliceLeaky(
-                json.Value, arena, args_str, .{ .allocate = .alloc_always },
-            ) catch json.Value{ .object = json.ObjectMap.init(arena) };
+                json.Value,
+                arena,
+                args_str,
+                .{ .allocate = .alloc_always },
+            ) catch json.Value{ .object = .empty };
 
             tool_uses.append(arena, .{
                 .id = id_str,
@@ -406,7 +410,7 @@ pub const OpenAIClient = struct {
 };
 
 fn buildChatCompletionsUrl(buf: []u8, base_url: []const u8) ![]const u8 {
-    const trimmed = std.mem.trimRight(u8, base_url, "/");
+    const trimmed = std.mem.trimEnd(u8, base_url, "/");
     if (std.mem.endsWith(u8, trimmed, "/v1")) {
         return std.fmt.bufPrint(buf, "{s}/chat/completions", .{trimmed});
     }
@@ -485,7 +489,7 @@ pub fn buildChatCompletionsBodyEx(
     extra_fields: ?[]const u8,
     stream: bool,
 ) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     try out.ensureTotalCapacity(arena, 16 * 1024);
 
     try out.appendSlice(arena, "{\"model\":\"");
@@ -512,10 +516,10 @@ pub fn buildChatCompletionsBodyEx(
     // each. Mixed text + image content goes in the array-form `content`.
     for (request.messages) |msg| {
         // Split blocks into categories.
-        var text_blocks: std.ArrayList(messages.ContentBlock.TextBlock) = .{};
-        var image_blocks: std.ArrayList(messages.ContentBlock.ImageBlock) = .{};
-        var tool_use_blocks: std.ArrayList(messages.ContentBlock.ToolUseBlock) = .{};
-        var tool_result_blocks: std.ArrayList(messages.ContentBlock.ToolResultBlock) = .{};
+        var text_blocks: std.ArrayList(messages.ContentBlock.TextBlock) = .empty;
+        var image_blocks: std.ArrayList(messages.ContentBlock.ImageBlock) = .empty;
+        var tool_use_blocks: std.ArrayList(messages.ContentBlock.ToolUseBlock) = .empty;
+        var tool_result_blocks: std.ArrayList(messages.ContentBlock.ToolResultBlock) = .empty;
 
         for (msg.content) |block| {
             switch (block) {
@@ -708,7 +712,7 @@ pub fn parseChatCompletionsResponse(
     // choices[0].message
     var text_out: []const u8 = "";
     var stop_reason: ?[]const u8 = null;
-    var tool_use_list: std.ArrayList(messages.ToolUseInfo) = .{};
+    var tool_use_list: std.ArrayList(messages.ToolUseInfo) = .empty;
 
     if (obj.get("choices")) |choices| {
         if (choices == .array and choices.array.items.len > 0) {
@@ -739,7 +743,7 @@ pub fn parseChatCompletionsResponse(
                                     var call_id: []const u8 = "";
                                     var fn_name: []const u8 = "";
                                     var args_str: []const u8 = "{}";
-                                    var args_val: json.Value = .{ .object = json.ObjectMap.init(arena) };
+                                    var args_val: json.Value = .{ .object = .empty };
                                     if (co.get("id")) |idv| {
                                         if (idv == .string) call_id = idv.string;
                                     }
@@ -758,7 +762,7 @@ pub fn parseChatCompletionsResponse(
                                                         arena,
                                                         av.string,
                                                         .{ .allocate = .alloc_always },
-                                                    ) catch json.Value{ .object = json.ObjectMap.init(arena) };
+                                                    ) catch json.Value{ .object = .empty };
                                                     args_val = parsed_args;
                                                 }
                                             }

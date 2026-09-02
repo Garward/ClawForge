@@ -1,8 +1,15 @@
 const std = @import("std");
+const common = @import("common");
 const storage = @import("storage");
 const summarizer_mod = @import("summarizer.zig");
 const extractor_mod = @import("extractor.zig");
 const embedder_mod = @import("embedder.zig");
+
+// The background chat engine is intentionally single-threaded because its
+// stores and per-turn state are not safe to share across concurrent calls.
+// This thread-local marker lets the engine reject waits that would depend on
+// work queued behind the currently-running job.
+threadlocal var is_background_chat_worker_thread = false;
 
 /// Unified worker pool. Manages background threads for async processing.
 ///
@@ -22,7 +29,15 @@ pub const WorkerPool = struct {
     summarize_queue: Queue(SummarizeJob),
     extract_queue: Queue(ExtractJob),
     embed_queue: Queue(EmbedJob),
+    /// User/dispatcher jobs. These always take priority over queued subagents
+    /// so a batch of long research jobs cannot starve new adapter requests.
     background_chat_queue: Queue(BackgroundChatJob),
+    /// Subagents have their own scheduling lane. They currently share the
+    /// isolated background Engine, so they execute one at a time, but they can
+    /// all be enqueued without blocking the dispatcher that spawned them.
+    subagent_chat_queue: Queue(BackgroundChatJob),
+    background_wake_mutex: common.sync.Mutex = .{},
+    background_wake_cond: common.sync.Condition = .{},
 
     // Threads
     summarize_thread: ?std.Thread = null,
@@ -38,8 +53,12 @@ pub const WorkerPool = struct {
         session_id: ?[]const u8,
         model_override: ?[]const u8,
         allowed_tools: ?[]const u8,
+        attachments: ?[]const common.Request.Attachment,
+        adapter_context: ?[]const u8,
         is_subagent: bool,
         is_explore: bool,
+        compact_tool_schemas: bool,
+        plans_required: bool,
         confirm_ctx: ?*anyopaque,
         confirm_fn: ?*const fn (ctx: *anyopaque, tool_name: []const u8, tool_id: []const u8, input_preview: []const u8) bool,
     ) BackgroundChatOutput = null,
@@ -53,13 +72,17 @@ pub const WorkerPool = struct {
     // The job_id currently being processed by the background chat thread.
     // Safe because there is exactly one background chat worker thread.
     active_job_id: ?[36]u8 = null,
+    active_job_session_id: ?[36]u8 = null,
+    active_job_cancel_flag: ?*std.atomic.Value(bool) = null,
+    active_job_mutex: common.sync.Mutex = .{},
+    steering_store: SteeringStore = .{},
 
     // Per-session index of subagent jobs (active + recently completed).
     subagent_registry: SubagentRegistry = .{},
 
     // Tool confirmation gate (one at a time — single background thread)
-    confirmation_mutex: std.Thread.Mutex = .{},
-    confirmation_cond: std.Thread.Condition = .{},
+    confirmation_mutex: common.sync.Mutex = .{},
+    confirmation_cond: common.sync.Condition = .{},
     current_confirmation: ?PendingConfirmation = null,
 
     running: bool = false,
@@ -79,6 +102,7 @@ pub const WorkerPool = struct {
             .extract_queue = Queue(ExtractJob).init(),
             .embed_queue = Queue(EmbedJob).init(),
             .background_chat_queue = Queue(BackgroundChatJob).init(),
+            .subagent_chat_queue = Queue(BackgroundChatJob).init(),
         };
     }
 
@@ -134,6 +158,16 @@ pub const WorkerPool = struct {
         self.extract_queue.signal();
         self.embed_queue.signal();
         self.background_chat_queue.signal();
+        self.subagent_chat_queue.signal();
+        self.background_wake_mutex.lock();
+        self.background_wake_cond.signal();
+        self.background_wake_mutex.unlock();
+        self.confirmation_mutex.lock();
+        if (self.current_confirmation) |*c| {
+            if (c.approved == null) c.approved = false;
+        }
+        self.confirmation_cond.signal();
+        self.confirmation_mutex.unlock();
 
         if (self.summarize_thread) |t| {
             t.join();
@@ -151,6 +185,8 @@ pub const WorkerPool = struct {
             t.join();
             self.background_chat_thread = null;
         }
+
+        self.tool_event_log.deinit(self.allocator);
 
         std.log.info("Worker pool stopped", .{});
     }
@@ -206,13 +242,73 @@ pub const WorkerPool = struct {
             .summarize = self.summarize_queue.len(),
             .extract = self.extract_queue.len(),
             .embed = self.embed_queue.len(),
-            .background_chat = self.background_chat_queue.len(),
+            .background_chat = self.background_chat_queue.len() + self.subagent_chat_queue.len(),
         };
     }
 
-    /// Queue a background chat job (runs full tool loop on dedicated thread).
+    /// Queue a background chat job. Subagents use a separate scheduling lane;
+    /// the worker always services user/dispatcher jobs first.
     pub fn enqueueBackgroundChat(self: *WorkerPool, job: BackgroundChatJob) void {
-        self.background_chat_queue.push(job);
+        if (job.is_subagent) {
+            self.subagent_chat_queue.push(job);
+        } else {
+            self.background_chat_queue.push(job);
+        }
+        self.background_wake_mutex.lock();
+        self.background_wake_cond.signal();
+        self.background_wake_mutex.unlock();
+    }
+
+    /// A background worker must never synchronously wait for another job from
+    /// this pool: the isolated Engine has one owning thread, so such a wait is
+    /// a self-deadlock. Foreground callers may still wait while this worker
+    /// services the child job.
+    pub fn canSynchronouslyWaitForBackgroundJob(_: *WorkerPool) bool {
+        return !is_background_chat_worker_thread;
+    }
+
+    fn popNextBackgroundChatJob(self: *WorkerPool) ?BackgroundChatJob {
+        return self.background_chat_queue.pop() orelse self.subagent_chat_queue.pop();
+    }
+
+    fn waitForBackgroundChatJob(self: *WorkerPool) void {
+        self.background_wake_mutex.lock();
+        defer self.background_wake_mutex.unlock();
+        while (self.running and
+            self.background_chat_queue.len() == 0 and
+            self.subagent_chat_queue.len() == 0)
+        {
+            self.background_wake_cond.wait(&self.background_wake_mutex);
+        }
+    }
+
+    fn cancelQueuedJob(queue: *Queue(BackgroundChatJob), job_id: *const [36]u8) bool {
+        queue.mutex.lock();
+        defer queue.mutex.unlock();
+
+        var idx = queue.head;
+        var checked: usize = 0;
+        while (checked < queue.count) : (checked += 1) {
+            if (std.mem.eql(u8, &queue.items[idx].job_id, job_id)) {
+                queue.items[idx].cancelled.store(true, .release);
+                return true;
+            }
+            idx = (idx + 1) % Queue(BackgroundChatJob).CAPACITY;
+        }
+        return false;
+    }
+
+    fn queueContainsJob(queue: *Queue(BackgroundChatJob), job_id: *const [36]u8) bool {
+        queue.mutex.lock();
+        defer queue.mutex.unlock();
+
+        var idx = queue.head;
+        var checked: usize = 0;
+        while (checked < queue.count) : (checked += 1) {
+            if (std.mem.eql(u8, &queue.items[idx].job_id, job_id)) return true;
+            idx = (idx + 1) % Queue(BackgroundChatJob).CAPACITY;
+        }
+        return false;
     }
 
     /// Get result for a background job by ID.
@@ -220,21 +316,111 @@ pub const WorkerPool = struct {
         return self.result_store.get(job_id);
     }
 
-    /// Cancel a background job by setting its cancelled flag.
+    /// Whether a background job is still owned by this daemon process.
+    /// A browser can retain a job ID across a daemon restart, while queues,
+    /// result slots, and live event streams are intentionally process-local.
+    pub fn hasBackgroundJob(self: *WorkerPool, job_id: *const [36]u8) bool {
+        self.active_job_mutex.lock();
+        const is_active = if (self.active_job_id) |active_id|
+            std.mem.eql(u8, &active_id, job_id)
+        else
+            false;
+        self.active_job_mutex.unlock();
+        if (is_active) return true;
+
+        return queueContainsJob(&self.background_chat_queue, job_id) or
+            queueContainsJob(&self.subagent_chat_queue, job_id);
+    }
+
+    /// Cancel a background job and every active subagent descended from it.
+    /// A user-facing task is a tree: stopping only the dispatcher would leave
+    /// its already-queued research jobs running without an owner.
     pub fn cancelBackgroundJob(self: *WorkerPool, job_id: *const [36]u8) bool {
-        // Check the queue for pending jobs
-        self.background_chat_queue.mutex.lock();
-        defer self.background_chat_queue.mutex.unlock();
-        var idx = self.background_chat_queue.head;
-        var checked: usize = 0;
-        while (checked < self.background_chat_queue.count) : (checked += 1) {
-            if (std.mem.eql(u8, &self.background_chat_queue.items[idx].job_id, job_id)) {
-                self.background_chat_queue.items[idx].cancelled.store(true, .release);
-                return true;
+        return self.cancelBackgroundJobTree(job_id, 0);
+    }
+
+    fn cancelBackgroundJobTree(self: *WorkerPool, job_id: *const [36]u8, depth: usize) bool {
+        if (depth > SubagentRegistry.MAX_PER_SESSION) return false;
+
+        var found = self.cancelSingleBackgroundJob(job_id);
+        var child_ids: [SubagentRegistry.MAX_PER_SESSION][36]u8 = undefined;
+        const child_count = self.subagent_registry.activeChildrenOf(job_id, &child_ids);
+        for (child_ids[0..child_count]) |*child_id| {
+            found = self.cancelBackgroundJobTree(child_id, depth + 1) or found;
+        }
+        return found;
+    }
+
+    fn cancelSingleBackgroundJob(self: *WorkerPool, job_id: *const [36]u8) bool {
+        var found = false;
+
+        // Check both scheduling lanes for pending jobs.
+        found = cancelQueuedJob(&self.background_chat_queue, job_id) or
+            cancelQueuedJob(&self.subagent_chat_queue, job_id);
+
+        if (!found) {
+            self.active_job_mutex.lock();
+            if (self.active_job_id) |jid| {
+                if (std.mem.eql(u8, &jid, job_id)) {
+                    if (self.active_job_cancel_flag) |flag| {
+                        flag.store(true, .release);
+                        found = true;
+                    }
+                }
             }
-            idx = (idx + 1) % Queue(BackgroundChatJob).CAPACITY;
+            self.active_job_mutex.unlock();
+        }
+
+        if (found) {
+            self.confirmation_mutex.lock();
+            if (self.current_confirmation) |*c| {
+                if (std.mem.eql(u8, &c.job_id, job_id) and c.approved == null) {
+                    c.approved = false;
+                    self.confirmation_cond.signal();
+                }
+            }
+            self.confirmation_mutex.unlock();
+            self.tool_event_log.push(self.allocator, job_id, .{
+                .event_type = .control,
+                .tool_name = "cancel",
+                .content = "Cancellation requested. The active model/tool loop will stop at the next safe boundary.",
+                .timestamp = common.sync.timestamp(),
+            });
+        }
+        return found;
+    }
+
+    pub fn isBackgroundJobCancelled(self: *WorkerPool, job_id: *const [36]u8) bool {
+        self.active_job_mutex.lock();
+        defer self.active_job_mutex.unlock();
+        if (self.active_job_id) |jid| {
+            if (std.mem.eql(u8, &jid, job_id)) {
+                if (self.active_job_cancel_flag) |flag| {
+                    return flag.load(.acquire);
+                }
+            }
         }
         return false;
+    }
+
+    pub fn queueBackgroundSteering(self: *WorkerPool, job_id: *const [36]u8, note: []const u8) bool {
+        self.active_job_mutex.lock();
+        const is_active = if (self.active_job_id) |jid| std.mem.eql(u8, &jid, job_id) else false;
+        self.active_job_mutex.unlock();
+        if (!is_active) return false;
+
+        self.steering_store.queue(job_id, note);
+        self.tool_event_log.push(self.allocator, job_id, .{
+            .event_type = .control,
+            .tool_name = "steer",
+            .content = "User steering note queued. It will be injected before the next model request.",
+            .timestamp = common.sync.timestamp(),
+        });
+        return true;
+    }
+
+    pub fn consumeBackgroundSteering(self: *WorkerPool, job_id: *const [36]u8, out: []u8) usize {
+        return self.steering_store.consume(job_id, out);
     }
 
     /// Wire background chat context. Called from main.zig after engine init.
@@ -248,8 +434,12 @@ pub const WorkerPool = struct {
             session_id: ?[]const u8,
             model_override: ?[]const u8,
             allowed_tools: ?[]const u8,
+            attachments: ?[]const common.Request.Attachment,
+            adapter_context: ?[]const u8,
             is_subagent: bool,
             is_explore: bool,
+            compact_tool_schemas: bool,
+            plans_required: bool,
             confirm_ctx: ?*anyopaque,
             confirm_fn: ?*const fn (ctx: *anyopaque, tool_name: []const u8, tool_id: []const u8, input_preview: []const u8) bool,
         ) BackgroundChatOutput,
@@ -258,7 +448,9 @@ pub const WorkerPool = struct {
         self.bg_process_fn = process_fn;
     }
 
-    /// Block until user approves/denies a tool, or 60s timeout (auto-deny).
+    /// Block until user approves/denies a tool, the job is cancelled, or the
+    /// worker pool stops. Approval prompts are hard gates; silence must not
+    /// turn into a model-visible denial that invites workaround attempts.
     pub fn waitForConfirmation(self: *WorkerPool, job_id: *const [36]u8, tool_name: []const u8, tool_id: []const u8, input_preview: []const u8) bool {
         self.confirmation_mutex.lock();
         defer self.confirmation_mutex.unlock();
@@ -271,13 +463,11 @@ pub const WorkerPool = struct {
             .approved = null,
         };
 
-        var waited: u64 = 0;
-        const max_wait: u64 = 60;
-        while (waited < max_wait) : (waited += 1) {
+        while (self.running) {
             if (self.current_confirmation) |c| {
                 if (c.approved != null) break;
             } else break;
-            self.confirmation_cond.timedWait(&self.confirmation_mutex, std.time.ns_per_s) catch {};
+            self.confirmation_cond.wait(&self.confirmation_mutex);
         }
 
         const approved = if (self.current_confirmation) |c| c.approved orelse false else false;
@@ -304,13 +494,67 @@ pub const WorkerPool = struct {
     /// No-op if no job is active (i.e. not running on the bg chat thread).
     pub fn pushToolEvent(self: *WorkerPool, event: ToolEvent) void {
         if (self.active_job_id) |*jid| {
-            self.tool_event_log.push(jid, event);
+            self.tool_event_log.push(self.allocator, jid, event);
         }
     }
 
     /// Get tool events for a job starting from cursor (for polling).
-    pub fn getToolEvents(self: *WorkerPool, job_id: *const [36]u8, cursor: usize) ToolEventLog.EventSlice {
-        return self.tool_event_log.getEvents(job_id, cursor);
+    pub fn getToolEvents(self: *WorkerPool, job_id: *const [36]u8, cursor: usize) !ToolEventLog.EventSnapshot {
+        return self.tool_event_log.getEvents(self.allocator, job_id, cursor);
+    }
+
+    pub const ActiveBackgroundJob = struct {
+        job_id: [36]u8,
+        session_id: [36]u8,
+        status: enum { queued, running },
+    };
+
+    pub fn getActiveBackgroundJobs(
+        self: *WorkerPool,
+        allocator: std.mem.Allocator,
+        session_filter: ?*const [36]u8,
+    ) []ActiveBackgroundJob {
+        var out: std.ArrayList(ActiveBackgroundJob) = .empty;
+
+        self.active_job_mutex.lock();
+        if (self.active_job_id) |jid| {
+            if (self.active_job_session_id) |sid| {
+                if (session_filter == null or std.mem.eql(u8, &sid, session_filter.?)) {
+                    out.append(allocator, .{ .job_id = jid, .session_id = sid, .status = .running }) catch {};
+                }
+            }
+        }
+        self.active_job_mutex.unlock();
+
+        self.background_chat_queue.mutex.lock();
+        var idx = self.background_chat_queue.head;
+        var checked: usize = 0;
+        while (checked < self.background_chat_queue.count) : (checked += 1) {
+            const job = self.background_chat_queue.items[idx];
+            if (!job.cancelled.load(.acquire)) {
+                if (session_filter == null or std.mem.eql(u8, &job.session_id, session_filter.?)) {
+                    out.append(allocator, .{ .job_id = job.job_id, .session_id = job.session_id, .status = .queued }) catch {};
+                }
+            }
+            idx = (idx + 1) % Queue(BackgroundChatJob).CAPACITY;
+        }
+        self.background_chat_queue.mutex.unlock();
+
+        self.subagent_chat_queue.mutex.lock();
+        idx = self.subagent_chat_queue.head;
+        checked = 0;
+        while (checked < self.subagent_chat_queue.count) : (checked += 1) {
+            const job = self.subagent_chat_queue.items[idx];
+            if (!job.cancelled.load(.acquire)) {
+                if (session_filter == null or std.mem.eql(u8, &job.session_id, session_filter.?)) {
+                    out.append(allocator, .{ .job_id = job.job_id, .session_id = job.session_id, .status = .queued }) catch {};
+                }
+            }
+            idx = (idx + 1) % Queue(BackgroundChatJob).CAPACITY;
+        }
+        self.subagent_chat_queue.mutex.unlock();
+
+        return out.toOwnedSlice(allocator) catch &.{};
     }
 
     /// Register a subagent job in the per-session index. Called by the engine
@@ -322,7 +566,13 @@ pub const WorkerPool = struct {
         is_explore: bool,
         brief: []const u8,
     ) void {
-        self.subagent_registry.register(job_id, parent_session_id, is_explore, brief);
+        const parent_job_id: ?[36]u8 = blk: {
+            if (!is_background_chat_worker_thread) break :blk null;
+            self.active_job_mutex.lock();
+            defer self.active_job_mutex.unlock();
+            break :blk self.active_job_id;
+        };
+        self.subagent_registry.register(job_id, parent_session_id, if (parent_job_id) |*id| id else null, is_explore, brief);
     }
 
     /// Update a subagent's lifecycle status. Called from the bg chat worker.
@@ -389,7 +639,7 @@ pub const WorkerPool = struct {
         const n = self.subagent_registry.forSession(parent_session_id, &records);
         if (n == 0) return null;
 
-        const now = std.time.timestamp();
+        const now = common.sync.timestamp();
 
         // Partition into active vs eligible-completed; sort completed newest-first.
         var active_idx: [SubagentRegistry.MAX_PER_SESSION]usize = undefined;
@@ -424,9 +674,9 @@ pub const WorkerPool = struct {
         }.lt);
         const done_show = @min(done_n, MAX_COMPLETED_SHOWN);
 
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
-        const w = buf.writer(allocator);
+        const w = common.list_writer.init(&buf, allocator);
 
         w.writeAll("Active Subagents (auto-injected; use subagent_inspect/stop to manage):\n") catch {};
 
@@ -459,10 +709,10 @@ pub const WorkerPool = struct {
         job_id: *const [36]u8,
     ) ?[]u8 {
         const rec = self.subagent_registry.getById(job_id) orelse return null;
-        const now = std.time.timestamp();
-        var buf: std.ArrayList(u8) = .{};
+        const now = common.sync.timestamp();
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
-        self.appendSubagentLine(allocator, &rec, now, buf.writer(allocator)) catch return null;
+        self.appendSubagentLine(allocator, &rec, now, common.list_writer.init(&buf, allocator)) catch return null;
         return buf.toOwnedSlice(allocator) catch null;
     }
 
@@ -566,8 +816,7 @@ pub const WorkerPool = struct {
                 if (job.text_a) |t| self.allocator.free(t);
                 if (job.text_b) |t| self.allocator.free(t);
             } else {
-                // No work — wait for signal or timeout
-                self.summarize_queue.waitOrTimeout(100_000_000); // 100ms
+                self.summarize_queue.wait();
             }
         }
         // Drain remaining items
@@ -602,7 +851,7 @@ pub const WorkerPool = struct {
                 if (job.text_a) |t| self.allocator.free(t);
                 if (job.text_b) |t| self.allocator.free(t);
             } else {
-                self.extract_queue.waitOrTimeout(100_000_000);
+                self.extract_queue.wait();
             }
         }
         while (self.extract_queue.pop()) |job| {
@@ -626,7 +875,7 @@ pub const WorkerPool = struct {
                 self.allocator.free(job.text);
                 if (job.context_header) |h| self.allocator.free(h);
             } else {
-                self.embed_queue.waitOrTimeout(100_000_000);
+                self.embed_queue.wait();
             }
         }
         while (self.embed_queue.pop()) |job| {
@@ -656,6 +905,8 @@ pub const WorkerPool = struct {
 
     fn runBackgroundChatWorker(self: *WorkerPool) void {
         std.log.info("Background chat worker started", .{});
+        is_background_chat_worker_thread = true;
+        defer is_background_chat_worker_thread = false;
 
         const process_fn = self.bg_process_fn orelse {
             std.log.err("Background chat: no process function configured", .{});
@@ -664,8 +915,20 @@ pub const WorkerPool = struct {
         const process_ctx = self.bg_process_ctx orelse return;
 
         while (self.running) {
-            if (self.background_chat_queue.pop()) |job| {
+            if (self.popNextBackgroundChatJob()) |popped_job| {
+                var job = popped_job;
                 if (job.cancelled.load(.acquire)) {
+                    self.result_store.put(.{
+                        .job_id = job.job_id,
+                        .status = .cancelled,
+                        .text = "Job cancelled before it started.",
+                        .model = null,
+                        .input_tokens = 0,
+                        .output_tokens = 0,
+                        .callback_channel = null,
+                        .timestamp = common.sync.timestamp(),
+                    });
+                    if (job.is_subagent) self.subagent_registry.markStatus(&job.job_id, .stopped);
                     self.freeJobStrings(job);
                     continue;
                 }
@@ -673,8 +936,12 @@ pub const WorkerPool = struct {
                 std.log.info("Background chat: processing job {s}", .{job.job_id[0..8]});
 
                 // Track active job for tool event logging
-                self.tool_event_log.startJob(&job.job_id);
+                self.tool_event_log.startJob(self.allocator, &job.job_id);
+                self.active_job_mutex.lock();
                 self.active_job_id = job.job_id;
+                self.active_job_session_id = job.session_id;
+                self.active_job_cancel_flag = &job.cancelled;
+                self.active_job_mutex.unlock();
 
                 // Transition subagent registry status to running (no-op for non-subagent jobs).
                 if (job.is_subagent) {
@@ -689,8 +956,12 @@ pub const WorkerPool = struct {
                     &job.session_id,
                     job.model_override,
                     job.allowed_tools,
+                    job.attachments,
+                    job.adapter_context,
                     job.is_subagent,
                     job.is_explore,
+                    job.compact_tool_schemas,
+                    job.plans_required,
                     @ptrCast(&confirm_ctx),
                     &bgConfirmCallback,
                 );
@@ -745,8 +1016,12 @@ pub const WorkerPool = struct {
                             &job.session_id,
                             job.model_override,
                             job.chain_allowed_tools orelse job.allowed_tools,
+                            job.attachments,
+                            job.adapter_context,
                             false,
                             false,
+                            job.compact_tool_schemas,
+                            job.plans_required,
                             @ptrCast(&cont_confirm_ctx),
                             &bgConfirmCallback,
                         );
@@ -766,27 +1041,32 @@ pub const WorkerPool = struct {
                 }
 
                 // Clear active job tracking
+                self.active_job_mutex.lock();
                 self.active_job_id = null;
+                self.active_job_session_id = null;
+                self.active_job_cancel_flag = null;
+                self.active_job_mutex.unlock();
                 self.tool_event_log.endJob(&job.job_id);
 
+                const was_cancelled = job.cancelled.load(.acquire);
                 if (job.is_subagent) {
                     const final_status: SubagentStatus = if (final_output.ok)
-                        (if (self.subagent_registry.isStopRequested(&job.job_id)) .stopped else .completed)
+                        (if (was_cancelled or self.subagent_registry.isStopRequested(&job.job_id)) .stopped else .completed)
                     else
-                        .failed;
+                        (if (was_cancelled) .stopped else .failed);
                     self.subagent_registry.markStatus(&job.job_id, final_status);
                 }
 
                 if (final_output.ok) {
                     self.result_store.put(.{
                         .job_id = job.job_id,
-                        .status = .completed,
+                        .status = if (was_cancelled) .cancelled else .completed,
                         .text = final_output.text,
                         .model = final_output.model,
                         .input_tokens = final_output.input_tokens,
                         .output_tokens = final_output.output_tokens,
                         .callback_channel = job.callback_channel,
-                        .timestamp = std.time.timestamp(),
+                        .timestamp = common.sync.timestamp(),
                     });
                     std.log.info("Background chat: job {s} completed ({d} in / {d} out tokens)", .{
                         job.job_id[0..8], final_output.input_tokens, final_output.output_tokens,
@@ -794,13 +1074,13 @@ pub const WorkerPool = struct {
                 } else {
                     self.result_store.put(.{
                         .job_id = job.job_id,
-                        .status = .failed,
+                        .status = if (was_cancelled) .cancelled else .failed,
                         .text = final_output.error_message,
                         .model = null,
                         .input_tokens = 0,
                         .output_tokens = 0,
                         .callback_channel = job.callback_channel,
-                        .timestamp = std.time.timestamp(),
+                        .timestamp = common.sync.timestamp(),
                     });
                     std.log.err("Background chat: job {s} failed: {s}", .{
                         job.job_id[0..8], final_output.error_message orelse "unknown error",
@@ -814,12 +1094,15 @@ pub const WorkerPool = struct {
                 if (job.chain_allowed_tools) |cat| self.allocator.free(cat);
                 if (continuation_msg_opt) |cm| self.allocator.free(cm);
             } else {
-                self.background_chat_queue.waitOrTimeout(100_000_000);
+                self.waitForBackgroundChatJob();
             }
         }
 
         // Drain remaining jobs
         while (self.background_chat_queue.pop()) |job| {
+            self.freeJobStrings(job);
+        }
+        while (self.subagent_chat_queue.pop()) |job| {
             self.freeJobStrings(job);
         }
         std.log.info("Background chat worker stopped", .{});
@@ -831,6 +1114,15 @@ pub const WorkerPool = struct {
         if (job.callback_channel) |cc| self.allocator.free(cc);
         if (job.allowed_tools) |at| self.allocator.free(at);
         if (job.chain_allowed_tools) |at| self.allocator.free(at);
+        if (job.adapter_context) |ac| self.allocator.free(ac);
+        if (job.attachments) |attachments| {
+            for (attachments) |att| {
+                self.allocator.free(att.path);
+                self.allocator.free(att.mime);
+                self.allocator.free(att.name);
+            }
+            self.allocator.free(attachments);
+        }
     }
 };
 
@@ -882,6 +1174,8 @@ pub const BackgroundChatJob = struct {
     model_override: ?[]const u8,
     callback_channel: ?[]const u8,
     allowed_tools: ?[]const u8,
+    attachments: ?[]const common.Request.Attachment = null,
+    adapter_context: ?[]const u8 = null,
     /// True when this job was spawned by the summon_subagent tool. The
     /// engine uses this to skip session history and apply a hard
     /// subagent-execution adapter context.
@@ -890,6 +1184,8 @@ pub const BackgroundChatJob = struct {
     /// persona voice-pass on completion so the raw 3-layer JSON brief is
     /// preserved for the dispatcher to consume.
     is_explore: bool = false,
+    compact_tool_schemas: bool = false,
+    plans_required: bool = true,
     /// If true and is_explore is true and the subagent completes successfully,
     /// the worker will run a dispatcher continuation turn (feeding the brief
     /// back as a synthetic user message) before storing the final result.
@@ -922,14 +1218,69 @@ pub const PendingConfirmation = struct {
     approved: ?bool,
 };
 
-/// A single tool event captured during subagent execution.
+/// A single live event captured during background execution.
 pub const ToolEvent = struct {
-    event_type: enum { tool_use, tool_result },
+    event_type: enum { tool_use, tool_result, model_wait, model_text, control },
     tool_name: []const u8,
-    /// For tool_use: the input JSON. For tool_result: the output text.
+    /// For tool_use: input JSON. For tool_result: output text.
+    /// For model_wait: provider/model/round prompt-budget details.
+    /// For model_text: visible assistant progress text emitted before tool calls.
     content: []const u8,
     is_error: bool = false,
     timestamp: i64,
+};
+
+pub const SteeringStore = struct {
+    const MAX_JOBS = 16;
+    const MAX_NOTE_BYTES = 4096;
+
+    const Entry = struct {
+        active: bool = false,
+        job_id: [36]u8 = undefined,
+        note: [MAX_NOTE_BYTES]u8 = undefined,
+        len: usize = 0,
+    };
+
+    entries: [MAX_JOBS]Entry = [_]Entry{.{}} ** MAX_JOBS,
+    mutex: common.sync.Mutex = .{},
+
+    pub fn queue(self: *SteeringStore, job_id: *const [36]u8, note: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const slot = self.findOrCreateSlot(job_id);
+        const n = @min(note.len, MAX_NOTE_BYTES);
+        @memcpy(slot.note[0..n], note[0..n]);
+        slot.len = n;
+        slot.active = true;
+        slot.job_id = job_id.*;
+    }
+
+    pub fn consume(self: *SteeringStore, job_id: *const [36]u8, out: []u8) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (&self.entries) |*entry| {
+            if (entry.active and std.mem.eql(u8, &entry.job_id, job_id)) {
+                const n = @min(entry.len, out.len);
+                @memcpy(out[0..n], entry.note[0..n]);
+                entry.active = false;
+                entry.len = 0;
+                return n;
+            }
+        }
+        return 0;
+    }
+
+    fn findOrCreateSlot(self: *SteeringStore, job_id: *const [36]u8) *Entry {
+        for (&self.entries) |*entry| {
+            if (entry.active and std.mem.eql(u8, &entry.job_id, job_id)) return entry;
+        }
+        for (&self.entries) |*entry| {
+            if (!entry.active) return entry;
+        }
+        return &self.entries[0];
+    }
 };
 
 /// Per-job ring buffer of tool events for live transparency.
@@ -938,34 +1289,63 @@ pub const ToolEventLog = struct {
     const MAX_EVENTS = 128;
     const MAX_JOBS = 16;
 
-    pub const EventSlice = struct {
+    pub const EventSnapshot = struct {
+        allocator: std.mem.Allocator,
         events: []const ?ToolEvent,
         new_cursor: usize,
+
+        pub fn deinit(self: EventSnapshot) void {
+            for (self.events) |maybe_event| {
+                if (maybe_event) |event| {
+                    self.allocator.free(event.tool_name);
+                    self.allocator.free(event.content);
+                }
+            }
+            self.allocator.free(self.events);
+        }
     };
 
     /// Each slot is a job's event buffer.
     entries: [MAX_JOBS]JobEvents = [_]JobEvents{.{}} ** MAX_JOBS,
-    mutex: std.Thread.Mutex = .{},
+    mutex: common.sync.Mutex = .{},
 
     const JobEvents = struct {
-        job_id: [36]u8 = undefined,
+        job_id: [36]u8 = [_]u8{0} ** 36,
         active: bool = false,
         events: [MAX_EVENTS]?ToolEvent = [_]?ToolEvent{null} ** MAX_EVENTS,
         count: usize = 0,
+
+        fn clear(self: *JobEvents, allocator: std.mem.Allocator) void {
+            for (self.events[0..self.count]) |maybe_event| {
+                if (maybe_event) |event| {
+                    allocator.free(event.tool_name);
+                    allocator.free(event.content);
+                }
+            }
+            self.* = .{};
+        }
     };
 
-    pub fn startJob(self: *ToolEventLog, job_id: *const [36]u8) void {
+    pub fn startJob(self: *ToolEventLog, allocator: std.mem.Allocator, job_id: *const [36]u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         // Find empty or evict oldest
         for (&self.entries) |*slot| {
             if (!slot.active) {
+                slot.clear(allocator);
                 slot.* = .{ .job_id = job_id.*, .active = true };
                 return;
             }
         }
         // All full — evict first inactive, or first slot
+        self.entries[0].clear(allocator);
         self.entries[0] = .{ .job_id = job_id.*, .active = true };
+    }
+
+    pub fn deinit(self: *ToolEventLog, allocator: std.mem.Allocator) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (&self.entries) |*slot| slot.clear(allocator);
     }
 
     pub fn endJob(self: *ToolEventLog, job_id: *const [36]u8) void {
@@ -979,13 +1359,29 @@ pub const ToolEventLog = struct {
         }
     }
 
-    pub fn push(self: *ToolEventLog, job_id: *const [36]u8, event: ToolEvent) void {
+    pub fn push(
+        self: *ToolEventLog,
+        allocator: std.mem.Allocator,
+        job_id: *const [36]u8,
+        event: ToolEvent,
+    ) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (&self.entries) |*slot| {
             if (slot.active and std.mem.eql(u8, &slot.job_id, job_id)) {
                 if (slot.count < MAX_EVENTS) {
-                    slot.events[slot.count] = event;
+                    const tool_name = allocator.dupe(u8, event.tool_name) catch return;
+                    const content = allocator.dupe(u8, event.content) catch {
+                        allocator.free(tool_name);
+                        return;
+                    };
+                    slot.events[slot.count] = .{
+                        .event_type = event.event_type,
+                        .tool_name = tool_name,
+                        .content = content,
+                        .is_error = event.is_error,
+                        .timestamp = event.timestamp,
+                    };
                     slot.count += 1;
                 }
                 return;
@@ -993,20 +1389,59 @@ pub const ToolEventLog = struct {
         }
     }
 
-    /// Get events for a job starting from cursor. Returns slice of events and new cursor.
-    pub fn getEvents(self: *ToolEventLog, job_id: *const [36]u8, cursor: usize) EventSlice {
+    /// Copy events for a job while holding the lock so callers never observe
+    /// ring-buffer mutations or borrowed strings after their owners are freed.
+    pub fn getEvents(
+        self: *ToolEventLog,
+        allocator: std.mem.Allocator,
+        job_id: *const [36]u8,
+        cursor: usize,
+    ) !EventSnapshot {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (&self.entries) |*slot| {
             if (std.mem.eql(u8, &slot.job_id, job_id)) {
                 const start = @min(cursor, slot.count);
+                const events = try allocator.alloc(?ToolEvent, slot.count - start);
+                @memset(events, null);
+                errdefer {
+                    for (events) |maybe_event| {
+                        if (maybe_event) |event| {
+                            allocator.free(event.tool_name);
+                            allocator.free(event.content);
+                        }
+                    }
+                    allocator.free(events);
+                }
+
+                for (slot.events[start..slot.count], 0..) |maybe_event, i| {
+                    const event = maybe_event orelse continue;
+                    const tool_name = try allocator.dupe(u8, event.tool_name);
+                    const content = allocator.dupe(u8, event.content) catch |err| {
+                        allocator.free(tool_name);
+                        return err;
+                    };
+                    events[i] = .{
+                        .event_type = event.event_type,
+                        .tool_name = tool_name,
+                        .content = content,
+                        .is_error = event.is_error,
+                        .timestamp = event.timestamp,
+                    };
+                }
+
                 return .{
-                    .events = slot.events[start..slot.count],
+                    .allocator = allocator,
+                    .events = events,
                     .new_cursor = slot.count,
                 };
             }
         }
-        return .{ .events = &.{}, .new_cursor = cursor };
+        return .{
+            .allocator = allocator,
+            .events = try allocator.alloc(?ToolEvent, 0),
+            .new_cursor = cursor,
+        };
     }
 };
 
@@ -1017,6 +1452,9 @@ pub const SubagentStatus = enum { pending, running, completed, failed, stopped }
 pub const SubagentRecord = struct {
     job_id: [36]u8,
     parent_session_id: [36]u8,
+    /// Background job that spawned this subagent. Null for foreground
+    /// dispatchers. Used to cascade cancellation through the task tree.
+    parent_job_id: ?[36]u8 = null,
     is_explore: bool,
     spawned_at: i64,
     completed_at: ?i64 = null,
@@ -1062,12 +1500,13 @@ pub const SubagentRegistry = struct {
     pub const MAX_PER_SESSION = 16;
 
     entries: [MAX_RECORDS]?SubagentRecord = [_]?SubagentRecord{null} ** MAX_RECORDS,
-    mutex: std.Thread.Mutex = .{},
+    mutex: common.sync.Mutex = .{},
 
     pub fn register(
         self: *SubagentRegistry,
         job_id: *const [36]u8,
         parent_session_id: *const [36]u8,
+        parent_job_id: ?*const [36]u8,
         is_explore: bool,
         brief: []const u8,
     ) void {
@@ -1077,8 +1516,9 @@ pub const SubagentRegistry = struct {
         var rec = SubagentRecord{
             .job_id = job_id.*,
             .parent_session_id = parent_session_id.*,
+            .parent_job_id = if (parent_job_id) |id| id.* else null,
             .is_explore = is_explore,
-            .spawned_at = std.time.timestamp(),
+            .spawned_at = common.sync.timestamp(),
             .status = .pending,
         };
         const n = @min(brief.len, rec.brief.len);
@@ -1118,7 +1558,7 @@ pub const SubagentRegistry = struct {
                 if (std.mem.eql(u8, &rec.job_id, job_id)) {
                     rec.status = status;
                     if (status == .completed or status == .failed or status == .stopped) {
-                        rec.completed_at = std.time.timestamp();
+                        rec.completed_at = common.sync.timestamp();
                     }
                     return;
                 }
@@ -1238,13 +1678,36 @@ pub const SubagentRegistry = struct {
         }
         return null;
     }
+
+    /// Snapshot active direct children of a background job. The caller can
+    /// recursively walk these IDs without holding the registry mutex.
+    pub fn activeChildrenOf(
+        self: *SubagentRegistry,
+        parent_job_id: *const [36]u8,
+        out: *[MAX_PER_SESSION][36]u8,
+    ) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var count: usize = 0;
+        for (self.entries) |entry| {
+            if (count >= out.len) break;
+            const rec = entry orelse continue;
+            const parent = rec.parent_job_id orelse continue;
+            if (!std.mem.eql(u8, &parent, parent_job_id)) continue;
+            if (rec.status != .pending and rec.status != .running) continue;
+            out[count] = rec.job_id;
+            count += 1;
+        }
+        return count;
+    }
 };
 
 pub const ResultStore = struct {
     const MAX_RESULTS = 64;
 
     results: [MAX_RESULTS]?BackgroundChatResult = [_]?BackgroundChatResult{null} ** MAX_RESULTS,
-    mutex: std.Thread.Mutex = .{},
+    mutex: common.sync.Mutex = .{},
 
     pub fn put(self: *ResultStore, result: BackgroundChatResult) void {
         self.mutex.lock();
@@ -1290,7 +1753,7 @@ pub const ResultStore = struct {
 pub const CompactionGate = struct {
     pub const MAX_PENDING = 32;
 
-    mutex: std.Thread.Mutex = .{},
+    mutex: common.sync.Mutex = .{},
     active_streams: usize = 0,
     pending_sessions: [MAX_PENDING][36]u8 = undefined,
     pending_count: usize = 0,
@@ -1356,8 +1819,8 @@ fn Queue(comptime T: type) type {
         head: usize = 0,
         tail: usize = 0,
         count: usize = 0,
-        mutex: std.Thread.Mutex = .{},
-        condition: std.Thread.Condition = .{},
+        mutex: common.sync.Mutex = .{},
+        condition: common.sync.Condition = .{},
 
         pub fn init() Self {
             return .{};
@@ -1403,12 +1866,127 @@ fn Queue(comptime T: type) type {
             self.condition.signal();
         }
 
-        pub fn waitOrTimeout(self: *Self, timeout_ns: u64) void {
+        pub fn wait(self: *Self) void {
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.count == 0) {
-                self.condition.timedWait(&self.mutex, timeout_ns) catch {};
+                self.condition.wait(&self.mutex);
             }
         }
     };
+}
+
+test "tool event log owns event strings" {
+    const allocator = std.testing.allocator;
+    var log: ToolEventLog = .{};
+    defer log.deinit(allocator);
+
+    const job_id = [_]u8{'a'} ** 36;
+    log.startJob(allocator, &job_id);
+
+    const tool_name = try allocator.dupe(u8, "file_write");
+    const content = try allocator.dupe(u8, "temporary producer-owned content");
+    log.push(allocator, &job_id, .{
+        .event_type = .tool_use,
+        .tool_name = tool_name,
+        .content = content,
+        .timestamp = 1,
+    });
+    allocator.free(tool_name);
+    allocator.free(content);
+
+    const snapshot = try log.getEvents(allocator, &job_id, 0);
+    defer snapshot.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), snapshot.events.len);
+    const event = snapshot.events[0].?;
+    try std.testing.expectEqualStrings("file_write", event.tool_name);
+    try std.testing.expectEqualStrings("temporary producer-owned content", event.content);
+}
+
+test "background scheduling prioritizes dispatcher jobs over subagents" {
+    var pool = WorkerPool.init(std.testing.allocator, null, null, null);
+    const session_id = [_]u8{'s'} ** 36;
+
+    pool.enqueueBackgroundChat(.{
+        .job_id = [_]u8{'a'} ** 36,
+        .message = "subagent",
+        .session_id = session_id,
+        .model_override = null,
+        .callback_channel = null,
+        .allowed_tools = null,
+        .is_subagent = true,
+        .cancelled = std.atomic.Value(bool).init(false),
+    });
+    pool.enqueueBackgroundChat(.{
+        .job_id = [_]u8{'d'} ** 36,
+        .message = "dispatcher",
+        .session_id = session_id,
+        .model_override = null,
+        .callback_channel = null,
+        .allowed_tools = null,
+        .cancelled = std.atomic.Value(bool).init(false),
+    });
+
+    const first = pool.popNextBackgroundChatJob().?;
+    const second = pool.popNextBackgroundChatJob().?;
+    try std.testing.expect(!first.is_subagent);
+    try std.testing.expect(second.is_subagent);
+}
+
+test "background job presence distinguishes queued jobs from stale ids" {
+    var pool = WorkerPool.init(std.testing.allocator, null, null, null);
+    const queued_id = [_]u8{'q'} ** 36;
+    const stale_id = [_]u8{'x'} ** 36;
+
+    pool.enqueueBackgroundChat(.{
+        .job_id = queued_id,
+        .message = "queued dispatcher",
+        .session_id = [_]u8{'s'} ** 36,
+        .model_override = null,
+        .callback_channel = null,
+        .allowed_tools = null,
+        .cancelled = std.atomic.Value(bool).init(false),
+    });
+
+    try std.testing.expect(pool.hasBackgroundJob(&queued_id));
+    try std.testing.expect(!pool.hasBackgroundJob(&stale_id));
+}
+
+test "background worker cannot synchronously wait on its own queue" {
+    var pool = WorkerPool.init(std.testing.allocator, null, null, null);
+    try std.testing.expect(pool.canSynchronouslyWaitForBackgroundJob());
+
+    is_background_chat_worker_thread = true;
+    defer is_background_chat_worker_thread = false;
+    try std.testing.expect(!pool.canSynchronouslyWaitForBackgroundJob());
+}
+
+test "cancelling a dispatcher cascades to queued subagents" {
+    var pool = WorkerPool.init(std.testing.allocator, null, null, null);
+    const parent_id = [_]u8{'p'} ** 36;
+    const session_id = [_]u8{'s'} ** 36;
+    const child_a = [_]u8{'a'} ** 36;
+    const child_b = [_]u8{'b'} ** 36;
+
+    pool.subagent_registry.register(&child_a, &session_id, &parent_id, true, "first child");
+    pool.subagent_registry.register(&child_b, &session_id, &parent_id, true, "second child");
+    for ([_][36]u8{ child_a, child_b }) |child_id| {
+        pool.enqueueBackgroundChat(.{
+            .job_id = child_id,
+            .message = "research",
+            .session_id = session_id,
+            .model_override = null,
+            .callback_channel = null,
+            .allowed_tools = null,
+            .is_subagent = true,
+            .cancelled = std.atomic.Value(bool).init(false),
+        });
+    }
+
+    try std.testing.expect(pool.cancelBackgroundJob(&parent_id));
+    const queued_a = pool.subagent_chat_queue.pop().?;
+    const queued_b = pool.subagent_chat_queue.pop().?;
+    try std.testing.expect(queued_a.cancelled.load(.acquire));
+    try std.testing.expect(queued_b.cancelled.load(.acquire));
 }

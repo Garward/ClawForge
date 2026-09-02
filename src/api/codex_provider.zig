@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("common");
 const http = std.http;
 const json = std.json;
 const provider_mod = @import("provider.zig");
@@ -118,7 +119,7 @@ pub const CodexClient = struct {
             .{ .name = "user-agent", .value = "clawforge/0.1" },
         };
 
-        var client = http.Client{ .allocator = arena };
+        var client = http.Client{ .allocator = arena, .io = common.config.runtimeIo() };
         var req = client.request(.POST, uri, .{
             .extra_headers = &headers,
             .redirect_behavior = .unhandled,
@@ -141,7 +142,7 @@ pub const CodexClient = struct {
             // Drain the body. Error responses may be short JSON with no
             // trailing newline, so we use peek with a large length to grab
             // whatever's buffered, ignoring delimiters.
-            var err_acc: std.ArrayList(u8) = .{};
+            var err_acc: std.ArrayList(u8) = .empty;
             while (true) {
                 const chunk = err_reader.peekGreedy(1) catch break;
                 if (chunk.len == 0) break;
@@ -175,7 +176,7 @@ pub const CodexClient = struct {
 // =============================================================================
 
 fn buildResponsesUrl(buf: []u8, base_url: []const u8) ![]const u8 {
-    const trimmed = std.mem.trimRight(u8, base_url, "/");
+    const trimmed = std.mem.trimEnd(u8, base_url, "/");
     if (std.mem.endsWith(u8, trimmed, "/codex/responses")) {
         return std.fmt.bufPrint(buf, "{s}", .{trimmed});
     }
@@ -194,7 +195,7 @@ fn buildRequestBody(
     request: *const messages.MessageRequest,
     model: []const u8,
 ) ![]u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     try out.ensureTotalCapacity(arena, 16 * 1024);
 
     try out.appendSlice(arena, "{\"model\":\"");
@@ -253,11 +254,11 @@ fn emitInputItems(
 ) !void {
     // Split blocks by category. Tool_use, tool_result, and reasoning each get
     // their own top-level items; text is grouped into one message item per role.
-    var text_buf: std.ArrayList(messages.ContentBlock.TextBlock) = .{};
-    var image_buf: std.ArrayList(messages.ContentBlock.ImageBlock) = .{};
-    var tool_use_buf: std.ArrayList(messages.ContentBlock.ToolUseBlock) = .{};
-    var tool_res_buf: std.ArrayList(messages.ContentBlock.ToolResultBlock) = .{};
-    var reasoning_buf: std.ArrayList(messages.ContentBlock.ReasoningBlock) = .{};
+    var text_buf: std.ArrayList(messages.ContentBlock.TextBlock) = .empty;
+    var image_buf: std.ArrayList(messages.ContentBlock.ImageBlock) = .empty;
+    var tool_use_buf: std.ArrayList(messages.ContentBlock.ToolUseBlock) = .empty;
+    var tool_res_buf: std.ArrayList(messages.ContentBlock.ToolResultBlock) = .empty;
+    var reasoning_buf: std.ArrayList(messages.ContentBlock.ReasoningBlock) = .empty;
 
     for (msg.content) |block| {
         switch (block) {
@@ -360,9 +361,9 @@ fn parseSSE(
     var transfer_buf: [65536]u8 = undefined;
     const reader = response.reader(&transfer_buf);
 
-    var text_buf: std.ArrayList(u8) = .{};
-    var tool_uses: std.ArrayList(messages.ToolUseInfo) = .{};
-    var reasoning_items: std.ArrayList(messages.ReasoningInfo) = .{};
+    var text_buf: std.ArrayList(u8) = .empty;
+    var tool_uses: std.ArrayList(messages.ToolUseInfo) = .empty;
+    var reasoning_items: std.ArrayList(messages.ReasoningInfo) = .empty;
 
     // Active function_call accumulator. Codex emits args via
     // `response.function_call_arguments.delta` events keyed by item_id;
@@ -377,7 +378,7 @@ fn parseSSE(
     for (0..MaxToolCalls) |i| {
         tc_call_ids[i] = &.{};
         tc_names[i] = &.{};
-        tc_args[i] = .{};
+        tc_args[i] = .empty;
         tc_item_ids[i] = "";
     }
 
@@ -567,7 +568,7 @@ fn parseSSE(
             arena,
             args_str,
             .{ .allocate = .alloc_always },
-        ) catch json.Value{ .object = json.ObjectMap.init(arena) };
+        ) catch json.Value{ .object = .empty };
 
         tool_uses.append(arena, .{
             .id = tc_call_ids[i],

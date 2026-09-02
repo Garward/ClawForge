@@ -1,5 +1,6 @@
 const std = @import("std");
 const json = std.json;
+const common = @import("common");
 const registry = @import("registry.zig");
 
 pub const definition = registry.ToolDefinition{
@@ -10,8 +11,9 @@ pub const definition = registry.ToolDefinition{
         "The runtime enforces this — an unread path returns a BLOCKED tool error. This prevents " ++
         "editing files you can't actually see. " ++
         "For new files, set create_if_missing: true (bypasses the read requirement) or use file_write. " ++
-        "If a replacement fails (old_text not found or non-unique), re-read the target region and " ++
-        "include more unchanged surrounding context. Do not guess file state from memory.",
+        "If old_text is not found, re-read the exact target lines and use the smallest distinctive exact substring. " ++
+        "If old_text matches multiple locations, add unchanged context before and after until it is unique. " ++
+        "Do not guess file state from memory.",
     .input_schema_json =
     \\{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the file"},"old_text":{"type":"string","description":"Exact text to find in the file (must match uniquely)"},"new_text":{"type":"string","description":"Replacement text"},"create_if_missing":{"type":"boolean","description":"Create the file with new_text if it doesn't exist","default":false}},"required":["path","old_text","new_text"]}
     ,
@@ -33,7 +35,7 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
     defer if (owned_path) |p| allocator.free(p);
 
     const path = if (raw_path.len > 0 and raw_path[0] == '~') blk: {
-        const home = std.posix.getenv("HOME") orelse "/tmp";
+        const home = common.config.getEnvVar("HOME") orelse "/tmp";
         const expanded = std.fmt.allocPrint(allocator, "{s}{s}", .{ home, raw_path[1..] }) catch
             return .{ .content = "Path expansion failed", .is_error = true };
         owned_path = expanded;
@@ -106,12 +108,16 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
 
     // Find the old_text in the file
     const match_pos = std.mem.indexOf(u8, current_content, old_text) orelse {
-        // Show a helpful snippet of the file around where the text might be
-        const preview_len = @min(current_content.len, 500);
+        const diagnostic = buildClosestMatchDiagnostic(allocator, current_content, old_text) catch
+            allocator.dupe(u8, "Closest candidate unavailable; re-read the exact target lines.") catch
+            return .{ .content = "old_text not found in file", .is_error = true };
+        defer allocator.free(diagnostic);
         const msg = std.fmt.allocPrint(
             allocator,
-            "FILE DIFF FAILED\nPath: {s}\nReason: old_text not found\nHint: the replacement anchor must match exactly, including whitespace.\nNext step: rerun file_read on the exact target region and copy more unchanged surrounding context into old_text.\n\nFile start preview:\n{s}{s}",
-            .{ path, current_content[0..preview_len], if (current_content.len > 500) "\n...(truncated)" else "" },
+            "FILE DIFF FAILED\nPath: {s}\nReason: old_text not found\n" ++
+                "Hint: the replacement anchor must match exactly, including whitespace.\n" ++
+                "Next step: re-read the exact target lines and use the smallest distinctive exact substring.\n\n{s}",
+            .{ path, diagnostic },
         ) catch return .{ .content = "old_text not found in file", .is_error = true };
         return .{ .content = msg, .is_error = true };
     };
@@ -182,34 +188,204 @@ fn previewText(text: []const u8, max_len: usize) []const u8 {
     return text[0..max_len];
 }
 
+fn buildClosestMatchDiagnostic(allocator: std.mem.Allocator, content: []const u8, expected: []const u8) ![]u8 {
+    const actual_starts = try collectLineStarts(allocator, content);
+    defer allocator.free(actual_starts);
+    const expected_starts = try collectLineStarts(allocator, expected);
+    defer allocator.free(expected_starts);
+
+    var anchor_expected_idx: usize = 0;
+    var anchor_line: []const u8 = lineAt(expected, expected_starts, 0);
+    for (expected_starts, 0..) |_, i| {
+        const line = lineAt(expected, expected_starts, i);
+        if (std.mem.trim(u8, line, " \t\r").len > std.mem.trim(u8, anchor_line, " \t\r").len) {
+            anchor_expected_idx = i;
+            anchor_line = line;
+        }
+    }
+
+    var best_actual_idx: usize = 0;
+    var best_score: i64 = std.math.minInt(i64);
+    for (actual_starts, 0..) |_, i| {
+        const score = lineSimilarity(anchor_line, lineAt(content, actual_starts, i));
+        if (score > best_score) {
+            best_score = score;
+            best_actual_idx = i;
+        }
+    }
+
+    const candidate_start = best_actual_idx -| anchor_expected_idx;
+    var mismatch_expected_idx: usize = 0;
+    while (mismatch_expected_idx < expected_starts.len) : (mismatch_expected_idx += 1) {
+        const actual_idx = candidate_start + mismatch_expected_idx;
+        if (actual_idx >= actual_starts.len or
+            !std.mem.eql(
+                u8,
+                lineAt(expected, expected_starts, mismatch_expected_idx),
+                lineAt(content, actual_starts, actual_idx),
+            )) break;
+    }
+    if (mismatch_expected_idx >= expected_starts.len) mismatch_expected_idx = anchor_expected_idx;
+
+    const mismatch_actual_idx = candidate_start + mismatch_expected_idx;
+    const expected_line = lineAt(expected, expected_starts, mismatch_expected_idx);
+    const actual_line = if (mismatch_actual_idx < actual_starts.len)
+        lineAt(content, actual_starts, mismatch_actual_idx)
+    else
+        "<missing line>";
+    const visible_expected = try visibleLine(allocator, expected_line);
+    defer allocator.free(visible_expected);
+    const visible_actual = try visibleLine(allocator, actual_line);
+    defer allocator.free(visible_actual);
+    const difference = firstDifference(visible_expected, visible_actual);
+
+    const preview_start = candidate_start -| 2;
+    const desired_end = candidate_start + @min(expected_starts.len + 2, 12);
+    const preview_end = @min(actual_starts.len, @max(preview_start + 1, desired_end));
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.print(allocator, "Closest candidate around lines {d}-{d} (diagnostic only; no fuzzy edit applied):\n", .{
+        preview_start + 1,
+        preview_end,
+    });
+    for (preview_start..preview_end) |i| {
+        const visible = try visibleLine(allocator, lineAt(content, actual_starts, i));
+        defer allocator.free(visible);
+        try out.print(allocator, "{d:>6}| {s}\\n\n", .{ i + 1, visible });
+    }
+    try out.print(allocator, "\nexpected: {s}\\n\nactual:   {s}\\n\n          ", .{ visible_expected, visible_actual });
+    for (0..difference) |_| try out.append(allocator, ' ');
+    try out.appendSlice(allocator, "^ first difference\nWhitespace notation: \\n=line ending, \\r=CR, \\t=tab, \\x20=trailing space.");
+    return try out.toOwnedSlice(allocator);
+}
+
+fn collectLineStarts(allocator: std.mem.Allocator, text: []const u8) ![]usize {
+    var starts: std.ArrayList(usize) = .empty;
+    errdefer starts.deinit(allocator);
+    try starts.append(allocator, 0);
+    for (text, 0..) |byte, i| {
+        if (byte == '\n' and i + 1 < text.len) try starts.append(allocator, i + 1);
+    }
+    return try starts.toOwnedSlice(allocator);
+}
+
+fn lineAt(text: []const u8, starts: []const usize, index: usize) []const u8 {
+    if (index >= starts.len) return "";
+    const start = starts[index];
+    const raw_end = if (index + 1 < starts.len) starts[index + 1] - 1 else text.len;
+    return text[start..raw_end];
+}
+
+fn lineSimilarity(expected: []const u8, actual: []const u8) i64 {
+    const prefix = firstDifference(expected, actual);
+    var suffix: usize = 0;
+    while (suffix < expected.len -| prefix and suffix < actual.len -| prefix and
+        expected[expected.len - 1 - suffix] == actual[actual.len - 1 - suffix]) : (suffix += 1)
+    {}
+    const length_delta = if (expected.len > actual.len) expected.len - actual.len else actual.len - expected.len;
+    return @as(i64, @intCast(prefix * 4 + suffix * 2)) - @as(i64, @intCast(length_delta));
+}
+
+fn firstDifference(expected: []const u8, actual: []const u8) usize {
+    const shared = @min(expected.len, actual.len);
+    for (0..shared) |i| {
+        if (expected[i] != actual[i]) return i;
+    }
+    return shared;
+}
+
+fn visibleLine(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
+    var trailing_start = line.len;
+    while (trailing_start > 0 and line[trailing_start - 1] == ' ') trailing_start -= 1;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (line, 0..) |byte, i| {
+        switch (byte) {
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            ' ' => if (i >= trailing_start) try out.appendSlice(allocator, "\\x20") else try out.append(allocator, ' '),
+            else => if (byte < 0x20 or byte == 0x7f)
+                try out.print(allocator, "\\x{x:0>2}", .{byte})
+            else
+                try out.append(allocator, byte),
+        }
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
 fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+    const io = common.config.runtimeIo();
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
         else => return err,
     };
-    defer file.close();
-    const size = try file.getEndPos();
+    defer file.close(io);
+    const size = (try file.stat(io)).size;
     if (size > 10 * 1024 * 1024) return error.FileTooBig;
-    return try file.readToEndAlloc(allocator, @intCast(size + 1));
+    var file_reader = file.reader(io, &.{});
+    return try file_reader.interface.allocRemaining(allocator, .limited(@intCast(size + 1)));
 }
 
 fn createBackup(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const timestamp = std.time.timestamp();
+    const timestamp = common.sync.timestamp();
     const backup_path = try std.fmt.allocPrint(allocator, "{s}.backup.{d}", .{ path, timestamp });
     errdefer allocator.free(backup_path);
-    try std.fs.copyFileAbsolute(path, backup_path, .{});
+    try std.Io.Dir.copyFileAbsolute(path, backup_path, common.config.runtimeIo(), .{});
     return backup_path;
 }
 
 fn atomicWriteAbsolute(path: []const u8, content: []const u8) !void {
-    var write_buffer: [4096]u8 = undefined;
-    var atomic_file = try std.fs.cwd().atomicFile(path, .{
-        .mode = 0o644,
+    const io = common.config.runtimeIo();
+    var atomic_file = try std.Io.Dir.cwd().createFileAtomic(io, path, .{
+        .permissions = .fromMode(0o644),
         .make_path = true,
-        .write_buffer = &write_buffer,
+        .replace = true,
     });
-    defer atomic_file.deinit();
+    defer atomic_file.deinit(io);
 
-    try atomic_file.file_writer.interface.writeAll(content);
-    try atomic_file.finish();
+    var write_buffer: [4096]u8 = undefined;
+    var file_writer = atomic_file.file.writer(io, &write_buffer);
+    try file_writer.interface.writeAll(content);
+    try file_writer.flush();
+    try atomic_file.replace(io);
+}
+
+test "closest diagnostic shows wording drift away from file start" {
+    const content =
+        "title\n" ++
+        "unrelated setup\n" ++
+        "more unrelated setup\n" ++
+        "Optional UnrealPak/repak-style tools\n" ++
+        "final line\n";
+    const diagnostic = try buildClosestMatchDiagnostic(
+        std.testing.allocator,
+        content,
+        "Optional UnrealPak/IoStore tooling",
+    );
+    defer std.testing.allocator.free(diagnostic);
+
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "expected: Optional UnrealPak/IoStore tooling\\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "actual:   Optional UnrealPak/repak-style tools\\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "^ first difference") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "diagnostic only; no fuzzy edit applied") != null);
+}
+
+test "closest diagnostic exposes skipped lines and whitespace" {
+    const content =
+        "probe_dst=\"$mods_dir/probe\"\r\n" ++
+        "\tif [[ ! -d \"$probe_src\" ]]; then  \r\n" ++
+        "    exit 1\r\n" ++
+        "fi\r\n" ++
+        "mkdir -p \"$mods_dir\"\r\n";
+    const expected =
+        "probe_dst=\"$mods_dir/probe\"\n" ++
+        "mkdir -p \"$mods_dir\"";
+    const diagnostic = try buildClosestMatchDiagnostic(std.testing.allocator, content, expected);
+    defer std.testing.allocator.free(diagnostic);
+
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "expected: mkdir -p \"$mods_dir\"\\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "actual:   \\tif [[ ! -d \"$probe_src\" ]]; then\\x20\\x20\\r\\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\\r=CR, \\t=tab, \\x20=trailing space") != null);
 }

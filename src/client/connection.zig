@@ -1,57 +1,35 @@
 const std = @import("std");
-const posix = std.posix;
 const common = @import("common");
 
 pub const Connection = struct {
     allocator: std.mem.Allocator,
-    socket_fd: posix.socket_t,
+    io: std.Io,
+    stream: std.Io.net.Stream,
 
     pub fn connect(allocator: std.mem.Allocator, socket_path: []const u8) !Connection {
-        const socket_fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-        errdefer posix.close(socket_fd);
-
-        var addr: posix.sockaddr.un = .{
-            .family = posix.AF.UNIX,
-            .path = undefined,
-        };
-
-        if (socket_path.len >= addr.path.len) {
-            return error.NameTooLong;
-        }
-
-        @memset(&addr.path, 0);
-        @memcpy(addr.path[0..socket_path.len], socket_path);
-
-        try posix.connect(socket_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
+        const io = common.config.runtimeIo();
+        const address = try std.Io.net.UnixAddress.init(socket_path);
+        const stream = try address.connect(io);
 
         return .{
             .allocator = allocator,
-            .socket_fd = socket_fd,
+            .io = io,
+            .stream = stream,
         };
     }
 
     pub fn deinit(self: *Connection) void {
-        posix.close(self.socket_fd);
+        self.stream.close(self.io);
     }
 
     fn writeAll(self: *Connection, data: []const u8) !void {
-        var written: usize = 0;
-        while (written < data.len) {
-            written += posix.write(self.socket_fd, data[written..]) catch |err| {
-                return err;
-            };
-        }
+        var stream_writer = self.stream.writer(self.io, &.{});
+        try stream_writer.interface.writeAll(data);
     }
 
     fn readExact(self: *Connection, buf: []u8) !void {
-        var read_total: usize = 0;
-        while (read_total < buf.len) {
-            const n = posix.read(self.socket_fd, buf[read_total..]) catch |err| {
-                return err;
-            };
-            if (n == 0) return error.EndOfStream;
-            read_total += n;
-        }
+        var stream_reader = self.stream.reader(self.io, &.{});
+        try stream_reader.interface.readSliceAll(buf);
     }
 
     pub fn send(self: *Connection, request: common.Request) !void {
@@ -112,11 +90,13 @@ pub const Connection = struct {
 
     /// Read y/N from stdin for tool confirmation.
     fn readUserConfirmation() bool {
-        const stdin = std.fs.File{ .handle = std.posix.STDIN_FILENO };
+        const io = common.config.runtimeIo();
+        const stdin = std.Io.File.stdin();
         var buf: [16]u8 = undefined;
-        const n = stdin.read(&buf) catch return false;
+        var stdin_reader = stdin.reader(io, &.{});
+        const n = stdin_reader.interface.readSliceShort(&buf) catch return false;
         if (n == 0) return false;
-        const input = std.mem.trimRight(u8, buf[0..n], "\r\n \t");
+        const input = std.mem.trimEnd(u8, buf[0..n], "\r\n \t");
         return input.len > 0 and (input[0] == 'y' or input[0] == 'Y');
     }
 };

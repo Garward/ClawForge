@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("common");
 
 /// LRU file cache for frequent reads. Validates entries against mtime
 /// so stale content is never served. Used by file_read tool to avoid
@@ -56,7 +57,7 @@ pub const FileCache = struct {
         }
 
         entry_ptr.access_count += 1;
-        entry_ptr.last_access = std.time.timestamp();
+        entry_ptr.last_access = common.sync.timestamp();
         self.hits += 1;
         return entry_ptr.content;
     }
@@ -76,7 +77,7 @@ pub const FileCache = struct {
                 .content = try self.allocator.dupe(u8, content),
                 .mtime = stat.mtime,
                 .access_count = 1,
-                .last_access = std.time.timestamp(),
+                .last_access = common.sync.timestamp(),
             };
             return;
         }
@@ -90,7 +91,7 @@ pub const FileCache = struct {
             .content = owned_content,
             .mtime = stat.mtime,
             .access_count = 1,
-            .last_access = std.time.timestamp(),
+            .last_access = common.sync.timestamp(),
         });
     }
 

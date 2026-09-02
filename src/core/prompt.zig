@@ -20,11 +20,16 @@ pub const PromptLayers = struct {
     /// Tagged: [from project state]
     project: ?ProjectLayer = null,
 
+    /// Session-scoped working directory inferred from explicit user paths.
+    /// This is daemon-owned state shared across adapters.
+    session_workdir: ?[]const u8 = null,
+
     /// Layer 3.5: Active execution plan — persisted per-session.
     /// Injected after project context so the model always sees its current
-    /// plan state. When null, a mandatory planning instruction is injected
-    /// instead to force plan creation on multi-step work.
+    /// plan state. When null and plans_required is true, a mandatory planning
+    /// instruction is injected instead to force plan creation on multi-step work.
     active_plan: ?[]const u8 = null,
+    plans_required: bool = true,
 
     /// Layer 3.55: Active subagents — auto-injected status of background jobs
     /// spawned via summon_subagent in the current session. Lets the dispatcher
@@ -83,7 +88,7 @@ pub fn buildEnvironmentBlock(allocator: std.mem.Allocator) ![]const u8 {
     const cwd_opt: ?[]const u8 = common.config.getProjectRoot(allocator) catch null;
     defer if (cwd_opt) |c| allocator.free(c);
 
-    const ts: i64 = std.time.timestamp();
+    const ts: i64 = common.sync.timestamp();
     const epoch_secs = std.time.epoch.EpochSeconds{ .secs = @intCast(if (ts < 0) 0 else ts) };
     const epoch_day = epoch_secs.getEpochDay();
     const day_secs = epoch_secs.getDaySeconds();
@@ -122,9 +127,11 @@ pub fn loadPersona(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
     const abs_path = common.config.resolveProjectPath(allocator, rel_path) catch return null;
     defer allocator.free(abs_path);
 
-    const file = std.fs.openFileAbsolute(abs_path, .{}) catch return null;
-    defer file.close();
-    return file.readToEndAlloc(allocator, 64 * 1024) catch null;
+    const io = common.config.runtimeIo();
+    const file = std.Io.Dir.openFileAbsolute(io, abs_path, .{}) catch return null;
+    defer file.close(io);
+    var file_reader = file.reader(io, &.{});
+    return file_reader.interface.allocRemaining(allocator, .limited(64 * 1024)) catch null;
 }
 
 /// List available persona names from config/personas/*.txt.
@@ -133,12 +140,13 @@ pub fn listPersonas(allocator: std.mem.Allocator) ![]const []const u8 {
     const dir_path = common.config.resolveProjectPath(allocator, "config/personas") catch return &.{};
     defer allocator.free(dir_path);
 
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return &.{};
-    defer dir.close();
+    const io = common.config.runtimeIo();
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return &.{};
+    defer dir.close(io);
 
-    var names: std.ArrayList([]const u8) = .{};
+    var names: std.ArrayList([]const u8) = .empty;
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
         const fname = entry.name;
         if (!std.mem.endsWith(u8, fname, ".txt")) continue;
@@ -159,9 +167,11 @@ pub fn savePersona(allocator: std.mem.Allocator, name: []const u8, content: []co
     const abs_path = try common.config.resolveProjectPath(allocator, rel_path);
     defer allocator.free(abs_path);
 
-    const file = try std.fs.createFileAbsolute(abs_path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(content);
+    const io = common.config.runtimeIo();
+    const file = try std.Io.Dir.createFileAbsolute(io, abs_path, .{ .truncate = true });
+    defer file.close(io);
+    var file_writer = file.writer(io, &.{});
+    try file_writer.interface.writeAll(content);
 }
 
 /// Delete a persona file. Cannot delete "default".
@@ -175,7 +185,7 @@ pub fn deletePersona(allocator: std.mem.Allocator, name: []const u8) !void {
     const abs_path = try common.config.resolveProjectPath(allocator, rel_path);
     defer allocator.free(abs_path);
 
-    try std.fs.deleteFileAbsolute(abs_path);
+    try std.Io.Dir.deleteFileAbsolute(common.config.runtimeIo(), abs_path);
 }
 
 /// Assemble a system prompt from layers. Returns allocated string.
@@ -208,6 +218,21 @@ pub fn assemble(allocator: std.mem.Allocator, layers: PromptLayers, max_chars: u
         write(buf, &pos, "\n\n--- Environment ---\n");
         write(buf, &pos, env_block);
     } else |_| {}
+
+    if (layers.session_workdir) |workdir| {
+        write(buf, &pos, "\n--- Session Working Directory ---\n");
+        write(buf, &pos, "Current task directory: ");
+        write(buf, &pos, workdir);
+        write(buf, &pos, "\n");
+        write(buf, &pos,
+            \\This is daemon-owned session state and applies across web, Discord,
+            \\and other adapters. Prefer it when the user refers to "here",
+            \\"this project", "the current directory", or relative project paths.
+            \\Bash still starts in the daemon working directory unless you cd or
+            \\pass an explicit path; file tools require absolute paths.
+            \\
+        );
+    }
 
     // Layer 2: User context
     if (layers.user_context) |user_ctx| {
@@ -257,7 +282,7 @@ pub fn assemble(allocator: std.mem.Allocator, layers: PromptLayers, max_chars: u
         write(buf, &pos, "\n\n--- Active Execution Plan (delegate work via summon_subagent — do NOT hallucinate results) ---\n");
         write(buf, &pos, plan);
         write(buf, &pos, "\n--- End Plan ---");
-    } else {
+    } else if (layers.plans_required) {
         // No plan exists. The persona layer and any adapter_context set the
         // delegation policy (dispatcher vs. subagent vs. CLI). This layer just
         // lists what's available and the ONE hard rule: heavy destructive work
@@ -275,6 +300,15 @@ pub fn assemble(allocator: std.mem.Allocator, layers: PromptLayers, max_chars: u
             \\Plan is REQUIRED before: file_write (creating new files), destructive
             \\bash (rm/mv/cp, git commit/push/reset), or summon_subagent. A plan is
             \\NOT required for read-only tools or for a single file_diff edit.
+        );
+        write(buf, &pos, "\n--- End Plan ---");
+    } else {
+        write(buf, &pos, "\n\n--- Execution Plan: Optional ---\n");
+        write(buf, &pos,
+            \\No plan is active, and this adapter has disabled mandatory plan
+            \\enforcement. Use read-only tools, research tools, file edits, bash,
+            \\and summon_subagent as needed. Create or update a plan only when it
+            \\would make multi-step work clearer for the user or for delegation.
         );
         write(buf, &pos, "\n--- End Plan ---");
     }

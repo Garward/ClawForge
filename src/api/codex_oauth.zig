@@ -1,6 +1,7 @@
 const std = @import("std");
 const json = std.json;
 const http = std.http;
+const common = @import("common");
 
 /// Codex (ChatGPT subscription) OAuth — read/refresh tokens stored at
 /// `~/.codex/auth.json` by the Codex CLI. The refresh endpoint is the
@@ -15,7 +16,6 @@ const http = std.http;
 /// We do NOT implement the interactive OAuth login flow. Users authenticate
 /// with the Codex CLI (`codex login`) and ClawForge consumes whatever
 /// auth.json that flow produces.
-
 pub const TOKEN_URL = "https://auth.openai.com/oauth/token";
 pub const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const JWT_CLAIM = "https://api.openai.com/auth";
@@ -44,7 +44,7 @@ pub const Store = struct {
     allocator: std.mem.Allocator,
     auth_path: []const u8, // owned
     tokens: Tokens,
-    mutex: std.Thread.Mutex = .{},
+    mutex: common.sync.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator, auth_path: []const u8) !Store {
         const path_dup = try allocator.dupe(u8, auth_path);
@@ -72,7 +72,7 @@ pub const Store = struct {
     } {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const now = std.time.timestamp();
+        const now = common.sync.timestamp();
         if (self.tokens.expires_at - now < 60) {
             try self.refreshLocked();
         }
@@ -120,9 +120,11 @@ pub const Store = struct {
 // =============================================================================
 
 pub fn readAuthFile(allocator: std.mem.Allocator, path: []const u8) !Tokens {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    const io = common.config.runtimeIo();
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var file_reader = file.reader(io, &.{});
+    const content = try file_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
     defer allocator.free(content);
 
     var parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -178,7 +180,7 @@ pub fn readAuthFile(allocator: std.mem.Allocator, path: []const u8) !Tokens {
 /// atomically (write to .tmp, rename) so a crash mid-write never leaves a
 /// truncated file that locks the user out of their session.
 pub fn writeAuthFile(allocator: std.mem.Allocator, path: []const u8, tokens: *const Tokens) !void {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
 
     try out.appendSlice(allocator, "{\n  \"OPENAI_API_KEY\": null,\n  \"tokens\": {\n    \"id_token\": ");
@@ -193,7 +195,7 @@ pub fn writeAuthFile(allocator: std.mem.Allocator, path: []const u8, tokens: *co
 
     // ISO-8601 UTC timestamp.
     var ts_buf: [40]u8 = undefined;
-    const ts = formatIso8601(&ts_buf, std.time.timestamp());
+    const ts = formatIso8601(&ts_buf, common.sync.timestamp());
     try appendJsonString(&out, allocator, ts);
     try out.appendSlice(allocator, "\n}\n");
 
@@ -202,11 +204,14 @@ pub fn writeAuthFile(allocator: std.mem.Allocator, path: []const u8, tokens: *co
     defer allocator.free(tmp_path);
 
     {
-        const tmp_file = try std.fs.cwd().createFile(tmp_path, .{ .mode = 0o600 });
-        defer tmp_file.close();
-        try tmp_file.writeAll(out.items);
+        const io = common.config.runtimeIo();
+        const tmp_file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .permissions = .fromMode(0o600) });
+        defer tmp_file.close(io);
+        var file_writer = tmp_file.writer(io, &.{});
+        try file_writer.interface.writeAll(out.items);
     }
-    try std.fs.cwd().rename(tmp_path, path);
+    const io = common.config.runtimeIo();
+    try std.Io.Dir.cwd().rename(tmp_path, .cwd(), path, io);
 }
 
 fn appendJsonString(out: *std.ArrayList(u8), a: std.mem.Allocator, s: []const u8) !void {
@@ -322,7 +327,7 @@ pub fn refreshTokens(allocator: std.mem.Allocator, refresh_token: []const u8) !T
         .{ enc_refresh, CLIENT_ID },
     );
 
-    var client = http.Client{ .allocator = arena };
+    var client = http.Client{ .allocator = arena, .io = common.config.runtimeIo() };
     var response_writer = std.Io.Writer.Allocating.init(arena);
     var redirect_buf: [8 * 1024]u8 = undefined;
 
@@ -384,9 +389,9 @@ pub fn refreshTokens(allocator: std.mem.Allocator, refresh_token: []const u8) !T
                 .float => |f| @intFromFloat(f),
                 else => 3600,
             };
-            exp_seconds = std.time.timestamp() + ein;
+            exp_seconds = common.sync.timestamp() + ein;
         } else {
-            exp_seconds = std.time.timestamp() + 3600;
+            exp_seconds = common.sync.timestamp() + 3600;
         }
         // Without a JWT we can't extract account_id; bail. The caller
         // should treat this as "manually re-authenticate via codex CLI".
@@ -403,7 +408,7 @@ pub fn refreshTokens(allocator: std.mem.Allocator, refresh_token: []const u8) !T
 }
 
 fn urlEncode(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayList(u8) = .empty;
     try out.ensureTotalCapacity(arena, s.len + 16);
     for (s) |c| {
         const safe = (c >= 'a' and c <= 'z') or

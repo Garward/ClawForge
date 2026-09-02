@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("common");
 const db_mod = @import("db.zig");
 const api = @import("api");
 
@@ -58,7 +59,7 @@ pub const MessageStore = struct {
         try stmt.bindOptionalText(7, route_reason);
         try stmt.bindOptionalInt64(8, input_tokens);
         try stmt.bindOptionalInt64(9, output_tokens);
-        try stmt.bindInt64(10, std.time.timestamp());
+        try stmt.bindInt64(10, common.sync.timestamp());
         try stmt.exec();
 
         return self.conn.lastInsertRowId();
@@ -252,6 +253,80 @@ pub const MessageStore = struct {
         defer stmt.deinit();
         try stmt.bindText(1, session_id);
         try stmt.bindInt64(2, @intCast(max_messages));
+
+        var raw_desc: [256]api.messages.Message = undefined;
+        var raw_count: usize = 0;
+        var used_chars: usize = 0;
+
+        while (try stmt.step()) {
+            if (raw_count >= raw_desc.len) break;
+
+            const role_str = stmt.columnText(0) orelse "user";
+            const content = stmt.columnText(1) orelse "";
+            const role: api.messages.Role = if (std.mem.eql(u8, role_str, "assistant")) .assistant else .user;
+
+            const clean_content = if (role == .assistant)
+                try self.stripToolCallsXml(content)
+            else
+                try self.allocator.dupe(u8, content);
+
+            const content_len = clean_content.len;
+            const would_overflow = used_chars > 0 and used_chars + content_len > max_chars;
+            if (would_overflow) {
+                self.allocator.free(clean_content);
+                break;
+            }
+
+            const content_slice = try self.allocator.alloc(api.messages.ContentBlock, 1);
+            content_slice[0] = .{ .text = .{ .text = clean_content } };
+
+            raw_desc[raw_count] = .{ .role = role, .content = content_slice };
+            raw_count += 1;
+            used_chars += content_len;
+        }
+
+        if (raw_count == 0) return &.{};
+
+        var raw: [256]api.messages.Message = undefined;
+        for (0..raw_count) |i| {
+            raw[i] = raw_desc[raw_count - 1 - i];
+        }
+        return try self.sanitizeMessages(raw[0..raw_count]);
+    }
+
+    /// Latest daemon-plan handoff point. A plan create/update means the plan
+    /// now carries the working summary, so older tool-heavy transcript can be
+    /// omitted from future prompts.
+    pub fn latestPlanBoundaryCreatedAt(self: *MessageStore, session_id: []const u8) !?i64 {
+        var stmt = try self.conn.prepare(
+            "SELECT MAX(created_at) FROM tool_calls " ++
+                "WHERE session_id = ? AND tool_name = 'plan' AND status = 'success' " ++
+                "AND (tool_input LIKE '%\"operation\":\"create\"%' " ++
+                "OR tool_input LIKE '%\"operation\":\"update\"%')",
+        );
+        defer stmt.deinit();
+        try stmt.bindText(1, session_id);
+        if (!try stmt.step()) return null;
+        return stmt.columnOptionalInt64(0);
+    }
+
+    /// Build API messages from the latest plan handoff forward, bounded by a
+    /// hard character cap. This is intentionally independent of the usual
+    /// recent-window count: subagent plan updates are the context boundary.
+    pub fn buildApiMessagesSinceTimestampBudgeted(
+        self: *MessageStore,
+        session_id: []const u8,
+        since_created_at: i64,
+        max_chars: usize,
+    ) ![]const api.messages.Message {
+        var stmt = try self.conn.prepare(
+            "SELECT role, content FROM messages " ++
+                "WHERE session_id = ? AND created_at >= ? " ++
+                "ORDER BY sequence DESC",
+        );
+        defer stmt.deinit();
+        try stmt.bindText(1, session_id);
+        try stmt.bindInt64(2, since_created_at);
 
         var raw_desc: [256]api.messages.Message = undefined;
         var raw_count: usize = 0;

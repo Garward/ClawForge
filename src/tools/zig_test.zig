@@ -32,7 +32,7 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
             return .{ .content = "Failed to resolve project root", .is_error = true };
         defer allocator.free(project_root);
 
-        const result = std.process.Child.run(.{
+        const result = common.process.run(.{
             .allocator = allocator,
             .argv = &.{ "/usr/bin/timeout", "90", "zig", "build" },
             .max_output_bytes = 512 * 1024,
@@ -59,14 +59,14 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
     defer if (owned_path) |p| allocator.free(p);
 
     const path = if (raw_path.len > 0 and raw_path[0] == '~') blk: {
-        const home = std.posix.getenv("HOME") orelse "/tmp";
+        const home = common.config.getEnvVar("HOME") orelse "/tmp";
         const expanded = std.fmt.allocPrint(allocator, "{s}{s}", .{ home, raw_path[1..] }) catch
             return .{ .content = "Path expansion failed", .is_error = true };
         owned_path = expanded;
         break :blk expanded;
     } else raw_path;
 
-    const result = std.process.Child.run(.{
+    const result = common.process.run(.{
         .allocator = allocator,
         .argv = &.{ "/usr/bin/timeout", "30", "zig", "ast-check", path },
         .max_output_bytes = 256 * 1024,
@@ -83,7 +83,7 @@ fn formatCompilerResult(
     allocator: std.mem.Allocator,
     mode: []const u8,
     path: ?[]const u8,
-    result: std.process.Child.RunResult,
+    result: common.process.RunResult,
 ) registry.ToolResult {
     defer {
         allocator.free(result.stdout);
@@ -150,7 +150,7 @@ fn joinDiagnostics(allocator: std.mem.Allocator, stdout: []const u8, stderr: []c
     );
 }
 
-fn formatTermination(allocator: std.mem.Allocator, term: std.process.Child.Term) ![]const u8 {
+fn formatTermination(allocator: std.mem.Allocator, term: common.process.Term) ![]const u8 {
     return switch (term) {
         .Exited => |code| std.fmt.allocPrint(allocator, "exit {d}", .{code}),
         .Signal => |sig| std.fmt.allocPrint(allocator, "signal {d}", .{sig}),

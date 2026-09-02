@@ -1,5 +1,24 @@
 #!/bin/bash
 # Quick daemon restart for testing
+
+SCRIPT_ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+# A source checkout delegates routine operation to its isolated active tree.
+# Set CLAWFORGE_RUN_FROM_SOURCE=1 only when deliberately testing in-place.
+if [ -d "$SCRIPT_ROOT/.git" ] && [ "${CLAWFORGE_RUN_FROM_SOURCE:-0}" != "1" ]; then
+    ACTIVE_ROOT="${CLAWFORGE_RUNTIME_ROOT:-$(dirname "$SCRIPT_ROOT")/ClawForge-active}"
+    if [ -x "$ACTIVE_ROOT/restart.sh" ]; then
+        if [ "${1:-}" = "build" ]; then
+            CLAWFORGE_RUNTIME_ROOT="$ACTIVE_ROOT" "$SCRIPT_ROOT/scripts/deploy.sh" --build || exit 1
+            if [ "${2:-}" = "clean" ]; then
+                exec "$ACTIVE_ROOT/restart.sh" clean
+            fi
+            exec "$ACTIVE_ROOT/restart.sh"
+        fi
+        exec "$ACTIVE_ROOT/restart.sh" "$@"
+    fi
+fi
+
 # SIGTERM first to let SQLite checkpoint the WAL cleanly
 pkill -f clawforged 2>/dev/null
 # The Discord bridge is spawned as a child of clawforged but when
@@ -12,7 +31,7 @@ sleep 1
 pkill -9 -f clawforged 2>/dev/null
 pkill -9 -f "bridges/discord_bridge.py" 2>/dev/null
 sleep 0.3
-CLAWFORGE_ROOT="${CLAWFORGE_ROOT:-$(cd "$(dirname "$(readlink -f "$0")")" && pwd)}"
+CLAWFORGE_ROOT="${CLAWFORGE_ROOT:-$SCRIPT_ROOT}"
 rm -f "$CLAWFORGE_ROOT/data/clawforge.sock"
 cd "$CLAWFORGE_ROOT"
 
@@ -25,7 +44,7 @@ if [ "$1" = "clean" ] || [ "$2" = "clean" ]; then
     echo "Cleaned messages and sessions"
 fi
 
-./zig-out/bin/clawforged 2>/tmp/clawforge.log &
+nohup ./zig-out/bin/clawforged >/tmp/clawforge.log 2>&1 &
 sleep 1.5
 
 if curl -s --max-time 2 http://127.0.0.1:8081/api/status > /dev/null 2>&1; then

@@ -5,8 +5,7 @@ const registry = @import("registry.zig");
 
 pub const definition = registry.ToolDefinition{
     .name = "meme_tool",
-    .description =
-        "Generate a meme via the Imgflip API and return its image URL. " ++
+    .description = "Generate a meme via the Imgflip API and return its image URL. " ++
         "The URL is auto-embedded — do NOT paste it in your reply text. " ++
         "Just react to the meme naturally (comment on it, roast it, etc). " ++
         "\n\nSTRONG PREFERENCE: ALWAYS write your own top_text and bottom_text " ++
@@ -41,7 +40,7 @@ pub const definition = registry.ToolDefinition{
         "success_kid, picard_facepalm, confused_math, expanding_brain, " ++
         "surprised_pikachu, change_my_mind, batman_slap, woman_yelling_cat.",
     .input_schema_json =
-        \\{"type":"object","properties":{"template":{"type":"string","description":"PREFERRED: pick the template whose format fits the joke. One of: drake, this_is_fine, success_kid, picard_facepalm, confused_math, expanding_brain, surprised_pikachu, change_my_mind, batman_slap, woman_yelling_cat."},"top_text":{"type":"string","description":"PREFERRED: top caption, written by you, specific to the current conversation. Keep under ~60 chars."},"bottom_text":{"type":"string","description":"PREFERRED: bottom caption, written by you, specific to the current conversation. Keep under ~60 chars."},"context":{"type":"string","description":"FALLBACK ONLY: generic context keyword (debugging, success, gaming, etc.) used to auto-pick a template with default captions. Do not use if you can write your own top_text/bottom_text."},"mood":{"type":"string","description":"FALLBACK ONLY: mood keyword for auto-selection. Same guidance as context — prefer writing your own captions."}}}
+    \\{"type":"object","properties":{"template":{"type":"string","description":"PREFERRED: pick the template whose format fits the joke. One of: drake, this_is_fine, success_kid, picard_facepalm, confused_math, expanding_brain, surprised_pikachu, change_my_mind, batman_slap, woman_yelling_cat."},"top_text":{"type":"string","description":"PREFERRED: top caption, written by you, specific to the current conversation. Keep under ~60 chars."},"bottom_text":{"type":"string","description":"PREFERRED: bottom caption, written by you, specific to the current conversation. Keep under ~60 chars."},"context":{"type":"string","description":"FALLBACK ONLY: generic context keyword (debugging, success, gaming, etc.) used to auto-pick a template with default captions. Do not use if you can write your own top_text/bottom_text."},"mood":{"type":"string","description":"FALLBACK ONLY: mood keyword for auto-selection. Same guidance as context — prefer writing your own captions."}}}
     ,
     .requires_confirmation = false,
     .handler = &execute,
@@ -62,7 +61,7 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
         return .{ .content = "Failed to resolve meme script", .is_error = true };
     defer allocator.free(script);
 
-    const result = std.process.Child.run(.{
+    const result = common.process.run(.{
         .allocator = allocator,
         .argv = &.{ python, script, input_str },
         .max_output_bytes = 256 * 1024,

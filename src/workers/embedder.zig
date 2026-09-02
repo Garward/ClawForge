@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("common");
 const storage = @import("storage");
 
 /// Embedding worker. Generates vector embeddings via local Ollama API.
@@ -120,7 +121,7 @@ pub const Embedder = struct {
     // ================================================================
 
     fn generateEmbedding(self: *Embedder, text: []const u8) ![]f32 {
-        var client = std.http.Client{ .allocator = self.allocator };
+        var client = std.http.Client{ .allocator = self.allocator, .io = common.config.runtimeIo() };
         defer client.deinit();
 
         // Build request body: {"model": "...", "prompt": "..."}

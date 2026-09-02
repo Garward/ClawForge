@@ -28,7 +28,7 @@ pub const SessionStore = struct {
     pub fn createSession(self: *SessionStore, name: ?[]const u8) !SessionInfo {
         var id: [36]u8 = undefined;
         generateUUID(&id);
-        const now = std.time.timestamp();
+        const now = common.sync.timestamp();
 
         var stmt = try self.conn.prepare(
             "INSERT INTO sessions (id, namespace_id, name, model, status, message_count, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)",
@@ -176,7 +176,7 @@ pub const SessionStore = struct {
         var stmt = try self.conn.prepare("UPDATE sessions SET model = ?, updated_at = ? WHERE id = ?");
         defer stmt.deinit();
         try stmt.bindText(1, model);
-        try stmt.bindInt64(2, std.time.timestamp());
+        try stmt.bindInt64(2, common.sync.timestamp());
         try stmt.bindText(3, id);
         try stmt.exec();
     }
@@ -185,9 +185,43 @@ pub const SessionStore = struct {
         var stmt = try self.conn.prepare("UPDATE sessions SET system_prompt = ?, updated_at = ? WHERE id = ?");
         defer stmt.deinit();
         try stmt.bindOptionalText(1, system_prompt);
-        try stmt.bindInt64(2, std.time.timestamp());
+        try stmt.bindInt64(2, common.sync.timestamp());
         try stmt.bindText(3, id);
         try stmt.exec();
+    }
+
+    pub fn updateWorkingDirectory(self: *SessionStore, id: []const u8, workdir: []const u8) !void {
+        var metadata: std.ArrayList(u8) = .empty;
+        defer metadata.deinit(self.allocator);
+        try metadata.appendSlice(self.allocator, "{\"current_workdir\":\"");
+        try appendJsonEscaped(&metadata, self.allocator, workdir);
+        try metadata.appendSlice(self.allocator, "\"}");
+
+        var stmt = try self.conn.prepare("UPDATE sessions SET metadata = ?, updated_at = ? WHERE id = ? AND namespace_id = ?");
+        defer stmt.deinit();
+        try stmt.bindText(1, metadata.items);
+        try stmt.bindInt64(2, common.sync.timestamp());
+        try stmt.bindText(3, id);
+        try stmt.bindInt64(4, self.namespace_id);
+        try stmt.exec();
+    }
+
+    pub fn getWorkingDirectory(self: *SessionStore, id: []const u8) !?[]const u8 {
+        var stmt = try self.conn.prepare("SELECT metadata FROM sessions WHERE id = ? AND namespace_id = ?");
+        defer stmt.deinit();
+        try stmt.bindText(1, id);
+        try stmt.bindInt64(2, self.namespace_id);
+
+        if (!try stmt.step()) return null;
+        const metadata = stmt.columnOptionalText(0) orelse return null;
+        if (metadata.len == 0 or std.mem.eql(u8, metadata, "{}")) return null;
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, metadata, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const value = parsed.value.object.get("current_workdir") orelse return null;
+        if (value != .string or value.string.len == 0) return null;
+        return try self.allocator.dupe(u8, value.string);
     }
 
     /// Get session count for the current namespace.
@@ -203,7 +237,7 @@ pub const SessionStore = struct {
         var stmt = try self.conn.prepare("UPDATE sessions SET name = ?, updated_at = ? WHERE id = ? AND namespace_id = ?");
         defer stmt.deinit();
         try stmt.bindText(1, name);
-        try stmt.bindInt64(2, std.time.timestamp());
+        try stmt.bindInt64(2, common.sync.timestamp());
         try stmt.bindText(3, id);
         try stmt.bindInt64(4, self.namespace_id);
         try stmt.exec();
@@ -227,7 +261,7 @@ pub const SessionStore = struct {
         var stmt = try self.conn.prepare("UPDATE sessions SET active_plan = ?, updated_at = ? WHERE id = ?");
         defer stmt.deinit();
         try stmt.bindOptionalText(1, plan);
-        try stmt.bindInt64(2, std.time.timestamp());
+        try stmt.bindInt64(2, common.sync.timestamp());
         try stmt.bindText(3, id);
         try stmt.exec();
     }
@@ -236,7 +270,7 @@ pub const SessionStore = struct {
         var stmt = try self.conn.prepare("UPDATE sessions SET status = ?, updated_at = ? WHERE id = ? AND namespace_id = ?");
         defer stmt.deinit();
         try stmt.bindText(1, status);
-        try stmt.bindInt64(2, std.time.timestamp());
+        try stmt.bindInt64(2, common.sync.timestamp());
         try stmt.bindText(3, id);
         try stmt.bindInt64(4, self.namespace_id);
         try stmt.exec();
@@ -252,6 +286,19 @@ pub const SessionStore = struct {
     }
 };
 
+fn appendJsonEscaped(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+    for (text) |c| {
+        switch (c) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => try out.append(allocator, c),
+        }
+    }
+}
+
 /// Session metadata (read from DB). Not the full message history — that's in messages.zig.
 pub const SessionInfo = struct {
     id: [36]u8,
@@ -265,7 +312,7 @@ pub const SessionInfo = struct {
 
 fn generateUUID(buf: *[36]u8) void {
     var random_bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
+    std.Io.random(common.config.runtimeIo(), &random_bytes);
 
     random_bytes[6] = (random_bytes[6] & 0x0f) | 0x40;
     random_bytes[8] = (random_bytes[8] & 0x3f) | 0x80;

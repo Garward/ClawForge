@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("common");
 
 /// Coalesces multiple file operations within a time window to reduce syscalls.
 /// Deduplicates reads (same path → one read) and writes (latest write wins).
@@ -21,9 +22,9 @@ pub const BatchProcessor = struct {
     pub fn init(allocator: std.mem.Allocator, batch_window_ms: i64) BatchProcessor {
         return .{
             .allocator = allocator,
-            .pending_ops = .{},
+            .pending_ops = .empty,
             .batch_window_ms = batch_window_ms,
-            .last_flush = std.time.milliTimestamp(),
+            .last_flush = common.sync.milliTimestamp(),
             .total_flushed = 0,
         };
     }
@@ -57,7 +58,7 @@ pub const BatchProcessor = struct {
             .op_type = op_type,
             .path = owned_path,
             .content = owned_content,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = common.sync.milliTimestamp(),
         });
 
         if (self.shouldFlush()) {
@@ -69,12 +70,12 @@ pub const BatchProcessor = struct {
     }
 
     pub fn shouldFlush(self: *const BatchProcessor) bool {
-        const now = std.time.milliTimestamp();
+        const now = common.sync.milliTimestamp();
         return (now - self.last_flush) > self.batch_window_ms or self.pending_ops.items.len > 10;
     }
 
     pub fn flush(self: *BatchProcessor) !std.ArrayList([]u8) {
-        var results: std.ArrayList([]u8) = .{};
+        var results: std.ArrayList([]u8) = .empty;
 
         if (self.pending_ops.items.len == 0) return results;
 
@@ -128,7 +129,7 @@ pub const BatchProcessor = struct {
         }
         self.pending_ops.clearRetainingCapacity();
         self.total_flushed += results.items.len;
-        self.last_flush = std.time.milliTimestamp();
+        self.last_flush = common.sync.milliTimestamp();
 
         return results;
     }
@@ -170,7 +171,7 @@ pub const BatchProcessor = struct {
 
     pub fn getStats(self: *const BatchProcessor, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator, "BatchProcessor: {d} pending, {d} total flushed, last flush {d}ms ago", .{
-            self.pending_ops.items.len, self.total_flushed, std.time.milliTimestamp() - self.last_flush,
+            self.pending_ops.items.len, self.total_flushed, common.sync.milliTimestamp() - self.last_flush,
         });
     }
 };

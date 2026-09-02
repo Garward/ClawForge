@@ -23,6 +23,21 @@ immediately benefit from the user's entire history, preferences, and project sta
 
 ## Current State (v0.2.0)
 
+### Distribution and installation
+
+- [x] Build a versioned Linux x86_64 release zip with a SHA-256 checksum.
+- [x] Include a user-local installer that preserves configuration and data.
+- [x] Publish archives automatically for `v*` tags through GitHub Actions.
+- [x] Provide a checksum-verified, data-preserving `clawforge-update` command.
+- [x] Seed a native operational skill for runtime, update, config, and data questions.
+- [ ] Test clean installs on Ubuntu/Debian, Fedora, Arch, and Windows WSL.
+- [ ] Add Linux ARM64 release archives and CI coverage.
+- [ ] Investigate a fully static musl/SQLite build for distributions older
+      than the Ubuntu 22.04 release baseline.
+- [ ] Add optional systemd user-service installation and uninstall support.
+- [ ] Decide whether Playwright browser downloads should be automatic or an
+      explicit post-install step.
+
 ### Working Systems
 - [x] Engine: 20-round tool loop, per-request arena allocator, forced final text summary
 - [x] Real SSE streaming: text deltas + tool_use/tool_result events end-to-end

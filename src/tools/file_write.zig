@@ -1,15 +1,17 @@
 const std = @import("std");
 const json = std.json;
+const common = @import("common");
 const registry = @import("registry.zig");
 
 pub const definition = registry.ToolDefinition{
     .name = "file_write",
     .description = "Create or overwrite a file. Use this instead of bash for ALL file creation. " ++
         "For editing existing files, prefer file_diff (targeted changes with backup). " ++
-        "Set force=true to overwrite existing files after reading them first. Creates automatic backups. " ++
+        "Parent directories are created automatically; do not run mkdir/test probes before writing a new file. " ++
+        "Leave force=false for brand-new files. Set force=true only to overwrite existing files after reading them first. Creates automatic backups. " ++
         "Do not use this to guess edits to an existing file you have not reread.",
     .input_schema_json =
-    \\{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to write to"},"content":{"type":"string","description":"Content to write to the file"},"force":{"type":"boolean","description":"Required to overwrite existing files. Use file_read first to see current content.","default":false}},"required":["path","content"]}
+    \\{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to write to"},"content":{"type":"string","description":"Content to write to the file"},"force":{"type":"boolean","description":"Leave false for new files. Required only to overwrite an existing file after file_read.","default":false}},"required":["path","content"]}
     ,
     .requires_confirmation = true,
     .handler = &execute,
@@ -29,7 +31,7 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
     defer if (owned_path) |p| allocator.free(p);
 
     const path = if (raw_path.len > 0 and raw_path[0] == '~') blk: {
-        const home = std.posix.getenv("HOME") orelse "/tmp";
+        const home = common.config.getEnvVar("HOME") orelse "/tmp";
         const expanded = std.fmt.allocPrint(allocator, "{s}{s}", .{ home, raw_path[1..] }) catch
             return .{ .content = "Path expansion failed", .is_error = true };
         owned_path = expanded;
@@ -123,27 +125,30 @@ fn previewText(text: []const u8, max_len: usize) []const u8 {
 }
 
 fn fileExists(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    std.Io.Dir.accessAbsolute(common.config.runtimeIo(), path, .{}) catch return false;
     return true;
 }
 
 fn createBackup(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const timestamp = std.time.timestamp();
+    const timestamp = common.sync.timestamp();
     const backup_path = try std.fmt.allocPrint(allocator, "{s}.backup.{d}", .{ path, timestamp });
     errdefer allocator.free(backup_path);
-    try std.fs.copyFileAbsolute(path, backup_path, .{});
+    try std.Io.Dir.copyFileAbsolute(path, backup_path, common.config.runtimeIo(), .{});
     return backup_path;
 }
 
 fn atomicWriteAbsolute(path: []const u8, content: []const u8) !void {
-    var write_buffer: [4096]u8 = undefined;
-    var atomic_file = try std.fs.cwd().atomicFile(path, .{
-        .mode = 0o644,
+    const io = common.config.runtimeIo();
+    var atomic_file = try std.Io.Dir.cwd().createFileAtomic(io, path, .{
+        .permissions = .fromMode(0o644),
         .make_path = true,
-        .write_buffer = &write_buffer,
+        .replace = true,
     });
-    defer atomic_file.deinit();
+    defer atomic_file.deinit(io);
 
-    try atomic_file.file_writer.interface.writeAll(content);
-    try atomic_file.finish();
+    var write_buffer: [4096]u8 = undefined;
+    var file_writer = atomic_file.file.writer(io, &write_buffer);
+    try file_writer.interface.writeAll(content);
+    try file_writer.flush();
+    try atomic_file.replace(io);
 }

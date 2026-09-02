@@ -120,6 +120,17 @@ pub fn buildCompactedMessages(
     // Use API-visible content size so stored tool XML does not distort compaction decisions.
     const total_chars = try message_store.totalApiVisibleContentLength(session_id);
 
+    if (try message_store.latestPlanBoundaryCreatedAt(session_id)) |plan_boundary| {
+        const phase_messages = try message_store.buildApiMessagesSinceTimestampBudgeted(
+            session_id,
+            plan_boundary,
+            compact_config.max_context_chars,
+        );
+        if (phase_messages.len > 0) {
+            return phase_messages;
+        }
+    }
+
     if (total_chars <= compact_config.compact_threshold and total_chars <= compact_config.max_context_chars) {
         // Small session — use all raw messages (no compaction needed)
         return try message_store.buildApiMessages(session_id);

@@ -102,7 +102,7 @@ pub const ToolGenerator = struct {
             "UPDATE generated_tools SET status = 'revoked', updated_at = ? WHERE name = ? AND namespace_id = ?",
         );
         defer stmt.deinit();
-        try stmt.bindInt64(1, std.time.timestamp());
+        try stmt.bindInt64(1, common.sync.timestamp());
         try stmt.bindText(2, name);
         try stmt.bindInt64(3, self.namespace_id);
         try stmt.exec();
@@ -177,20 +177,20 @@ pub const ToolGenerator = struct {
         // Ensure tools/generated/ directory exists
         const gen_dir = try common.config.resolveProjectPath(self.allocator, "tools/generated");
         defer self.allocator.free(gen_dir);
-        std.fs.makeDirAbsolute(gen_dir) catch |err| {
-            if (err != error.PathAlreadyExists) return err;
-        };
+        const io = common.config.runtimeIo();
+        try std.Io.Dir.cwd().createDirPath(io, gen_dir);
 
         // Write script file
         const ext = if (std.mem.eql(u8, tool.language, "python")) ".py" else ".sh";
         const script_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}{s}", .{ gen_dir, tool.name, ext });
 
-        const file = try std.fs.createFileAbsolute(script_path, .{});
-        defer file.close();
-        try file.writeAll(tool.implementation);
+        const file = try std.Io.Dir.createFileAbsolute(io, script_path, .{});
+        defer file.close(io);
+        var file_writer = file.writer(io, &.{});
+        try file_writer.interface.writeAll(tool.implementation);
 
         // Make executable
-        if (std.process.Child.run(.{
+        if (common.process.run(.{
             .allocator = self.allocator,
             .argv = &.{ "chmod", "+x", script_path },
             .max_output_bytes = 1024,
@@ -301,7 +301,7 @@ pub const ToolGenerator = struct {
     }
 
     fn storeTool(self: *ToolGenerator, spec: GeneratedTool) !i64 {
-        const now = std.time.timestamp();
+        const now = common.sync.timestamp();
         var stmt = try self.conn.prepare(
             "INSERT OR REPLACE INTO generated_tools " ++
                 "(namespace_id, name, description, input_schema, implementation, language, status, created_at, updated_at) " ++
@@ -328,7 +328,7 @@ pub const ToolGenerator = struct {
             defer stmt.deinit();
             try stmt.bindText(1, status);
             try stmt.bindOptionalText(2, test_output);
-            try stmt.bindInt64(3, std.time.timestamp());
+            try stmt.bindInt64(3, common.sync.timestamp());
             try stmt.bindInt64(4, id);
             try stmt.exec();
         }

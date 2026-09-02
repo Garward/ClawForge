@@ -1,6 +1,6 @@
 const std = @import("std");
 const json = std.json;
-const fs = std.fs;
+const sync = @import("sync.zig");
 
 /// Type of authentication credential
 pub const CredentialType = enum {
@@ -40,21 +40,25 @@ pub const ProfileStatus = enum {
 /// Auth profiles store
 pub const AuthProfileStore = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     profiles: std.StringHashMap(AuthProfile),
     usage_stats: std.StringHashMap(UsageStats),
     active_profile: ?[]const u8,
     last_good: std.StringHashMap([]const u8), // provider -> profile_id
+    parsed: ?json.Parsed(json.Value),
 
     // Cooldown stages in milliseconds: 1min, 5min, 25min, 1hr
     const COOLDOWN_STAGES = [_]i64{ 60_000, 300_000, 1_500_000, 3_600_000 };
 
-    pub fn init(allocator: std.mem.Allocator) AuthProfileStore {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) AuthProfileStore {
         return .{
             .allocator = allocator,
+            .io = io,
             .profiles = std.StringHashMap(AuthProfile).init(allocator),
             .usage_stats = std.StringHashMap(UsageStats).init(allocator),
             .active_profile = null,
             .last_good = std.StringHashMap([]const u8).init(allocator),
+            .parsed = null,
         };
     }
 
@@ -62,31 +66,34 @@ pub const AuthProfileStore = struct {
         self.profiles.deinit();
         self.usage_stats.deinit();
         self.last_good.deinit();
+        if (self.parsed) |*parsed| parsed.deinit();
     }
 
     /// Load profiles from JSON file
-    pub fn load(allocator: std.mem.Allocator, path: []const u8) !AuthProfileStore {
-        var store = AuthProfileStore.init(allocator);
+    pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !AuthProfileStore {
+        var store = AuthProfileStore.init(allocator, io);
         errdefer store.deinit();
 
-        const file = fs.cwd().openFile(path, .{}) catch |err| {
+        var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| {
             if (err == error.FileNotFound) {
                 std.log.info("Auth profiles not found at {s}, starting fresh", .{path});
                 return store;
             }
             return err;
         };
-        defer file.close();
+        defer file.close(io);
+        var file_reader = file.reader(io, &.{});
 
-        const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+        const content = try file_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
         defer allocator.free(content);
 
-        const parsed = json.parseFromSlice(json.Value, allocator, content, .{
+        var parsed = json.parseFromSlice(json.Value, allocator, content, .{
             .allocate = .alloc_always,
         }) catch {
             std.log.warn("Failed to parse auth profiles, starting fresh", .{});
             return store;
         };
+        errdefer parsed.deinit();
 
         const obj = parsed.value.object;
 
@@ -159,6 +166,7 @@ pub const AuthProfileStore = struct {
         }
 
         std.log.info("Loaded {d} auth profiles", .{store.profiles.count()});
+        store.parsed = parsed;
         return store;
     }
 
@@ -296,13 +304,13 @@ pub const AuthProfileStore = struct {
 
         // Ensure directory exists
         if (std.fs.path.dirname(path)) |dir| {
-            std.fs.cwd().makePath(dir) catch {};
+            std.Io.Dir.cwd().createDirPath(self.io, dir) catch {};
         }
 
         // Write file
-        const file = try fs.cwd().createFile(path, .{});
-        defer file.close();
-        try file.writeAll(buf[0..pos]);
+        var file = try std.Io.Dir.createFileAbsolute(self.io, path, .{});
+        defer file.close(self.io);
+        try file.writeStreamingAll(self.io, buf[0..pos]);
 
         std.log.debug("Saved {d} auth profiles to {s}", .{ self.profiles.count(), path });
     }
@@ -319,13 +327,13 @@ pub const AuthProfileStore = struct {
         // Check expiry
         if (profile.expires) |exp| {
             if (exp <= 0) return .invalid_expires;
-            const now = std.time.milliTimestamp();
+            const now = sync.milliTimestamp();
             if (now > exp) return .expired;
         }
 
         // Check cooldown/disabled
         if (self.usage_stats.get(profile_id)) |stats| {
-            const now = std.time.milliTimestamp();
+            const now = sync.milliTimestamp();
             if (stats.disabled_until > now) return .disabled;
             if (stats.cooldown_until > now) return .cooldown;
         }
@@ -370,7 +378,7 @@ pub const AuthProfileStore = struct {
 
     /// Mark profile as successfully used
     pub fn markUsed(self: *AuthProfileStore, profile_id: []const u8) void {
-        const now = std.time.milliTimestamp();
+        const now = sync.milliTimestamp();
 
         if (self.usage_stats.getPtr(profile_id)) |stats| {
             stats.last_used = now;
@@ -390,7 +398,7 @@ pub const AuthProfileStore = struct {
 
     /// Mark profile as failed
     pub fn markFailed(self: *AuthProfileStore, profile_id: []const u8) void {
-        const now = std.time.milliTimestamp();
+        const now = sync.milliTimestamp();
 
         if (self.usage_stats.getPtr(profile_id)) |stats| {
             stats.error_count += 1;

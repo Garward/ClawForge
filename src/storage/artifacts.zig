@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("common");
 const db_mod = @import("db.zig");
 
 /// Artifact + artifact_analysis CRUD. Used by the vision pipeline:
@@ -49,7 +50,7 @@ pub const ArtifactStore = struct {
 
     /// Insert (or upsert) an artifact row. Returns the artifact id.
     pub fn insertArtifact(self: *ArtifactStore, req: InsertArtifact) !i64 {
-        const now = std.time.timestamp();
+        const now = common.sync.timestamp();
         var stmt = try self.conn.prepare(
             "INSERT INTO artifacts (namespace_id, session_id, name, artifact_type, mime_type, " ++
                 "content_path, content_size, content_hash, description, source, created_at, updated_at) " ++
@@ -80,7 +81,7 @@ pub const ArtifactStore = struct {
     /// inserts of the same (content_hash, analysis_type, detail_level) don't
     /// error — the first writer wins.
     pub fn insertAnalysis(self: *ArtifactStore, req: InsertAnalysis) !void {
-        const now = std.time.timestamp();
+        const now = common.sync.timestamp();
         var stmt = try self.conn.prepare(
             "INSERT OR IGNORE INTO artifact_analysis " ++
                 "(artifact_id, content_hash, analysis_type, detail_level, description, " ++

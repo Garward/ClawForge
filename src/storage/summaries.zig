@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("common");
 const db_mod = @import("db.zig");
 
 /// Summary CRUD backed by SQLite. FTS sync handled by triggers.
@@ -38,7 +39,7 @@ pub const SummaryStore = struct {
         try stmt.bindOptionalText(15, params.recall);
         try stmt.bindOptionalText(16, params.model_used);
         try stmt.bindOptionalInt64(17, params.token_cost);
-        try stmt.bindInt64(18, std.time.timestamp());
+        try stmt.bindInt64(18, common.sync.timestamp());
         try stmt.exec();
 
         return self.conn.lastInsertRowId();

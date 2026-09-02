@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("common");
 const db_mod = @import("db.zig");
 
 /// Run all pending migrations. Idempotent — safe to call on every startup.
@@ -42,7 +43,7 @@ fn recordVersion(conn: *db_mod.Connection, version: usize, description: []const 
     var stmt = try conn.prepare("INSERT INTO schema_version (version, applied_at, description) VALUES (?, ?, ?)");
     defer stmt.deinit();
     try stmt.bindInt64(1, @intCast(version));
-    try stmt.bindInt64(2, std.time.timestamp());
+    try stmt.bindInt64(2, common.sync.timestamp());
     try stmt.bindText(3, description);
     try stmt.exec();
 }

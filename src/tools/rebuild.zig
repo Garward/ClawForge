@@ -1,5 +1,6 @@
 const std = @import("std");
 const json = std.json;
+const common = @import("common");
 const registry = @import("registry.zig");
 
 pub const definition = registry.ToolDefinition{
@@ -9,7 +10,7 @@ pub const definition = registry.ToolDefinition{
         "NOT needed for Python-only tools registered via /api/tools/register. " ++
         "The rebuild log is written to /tmp/clawforge_rebuild.log.",
     .input_schema_json =
-        \\{"type":"object","properties":{"delay":{"type":"integer","description":"Seconds to wait before rebuilding (default: 3, minimum: 2)"}}}
+    \\{"type":"object","properties":{"delay":{"type":"integer","description":"Seconds to wait before rebuilding (default: 3, minimum: 2)"}}}
     ,
     .requires_confirmation = true,
     .handler = &execute,
@@ -31,8 +32,8 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
 
     // Resolve rebuild script: CLAWFORGE_REBUILD_SCRIPT env, else $HOME/.local/bin/clawforge-rebuild.sh
     const script_path = blk: {
-        if (std.process.getEnvVarOwned(allocator, "CLAWFORGE_REBUILD_SCRIPT")) |v| break :blk v else |_| {}
-        const home = std.process.getEnvVarOwned(allocator, "HOME") catch
+        if (common.config.getEnvVarOwned(allocator, "CLAWFORGE_REBUILD_SCRIPT")) |v| break :blk v else |_| {}
+        const home = common.config.getEnvVarOwned(allocator, "HOME") catch
             return .{ .content = "Cannot resolve HOME for rebuild script", .is_error = true };
         defer allocator.free(home);
         break :blk std.fmt.allocPrint(allocator, "{s}/.local/bin/clawforge-rebuild.sh", .{home}) catch
@@ -40,7 +41,7 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
     };
     defer allocator.free(script_path);
 
-    const result = std.process.Child.run(.{
+    const result = common.process.run(.{
         .allocator = allocator,
         .argv = &.{ "/bin/bash", script_path, delay_str },
         .max_output_bytes = 4096,

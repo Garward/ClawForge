@@ -1,0 +1,2015 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>ClawForge Narrative Studio</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><path fill='%23ff8700' d='M12 8h40v10H12zm6 15h28v8H18zm7 13h14v20H25z'/></svg>">
+    <style>
+        :root {
+            color-scheme: dark;
+            --bg: #101010;
+            --header: #141414;
+            --sidebar: #181818;
+            --panel: #1d1d20;
+            --panel-soft: #202023;
+            --border: #2d2d31;
+            --text: #ddd;
+            --muted: #71839c;
+            --accent: #ff8700;
+            --accent-soft: rgba(255,135,0,.12);
+            --success: #00d85a;
+            --danger: #ff4b4b;
+            --header-height: 48px;
+            font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+        }
+        * { box-sizing: border-box; }
+        html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
+        button, input, textarea, select { font: inherit; }
+        button { cursor: pointer; }
+        #app { height: 100%; display: grid; grid-template-rows: var(--header-height) 1fr; }
+        header {
+            display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
+            padding: 0 16px; background: var(--header); border-bottom: 1px solid var(--border);
+        }
+        .brand-row, .status-row, .header-actions { display: flex; align-items: center; gap: 14px; }
+        .brand { color: var(--accent); font-weight: 750; letter-spacing: .4px; white-space: nowrap; }
+        .brand small { color: var(--muted); font-weight: 400; }
+        .surface-tabs { display: flex; height: 34px; align-items: stretch; border-left: 1px solid var(--border); padding-left: 10px; }
+        .surface-tab {
+            display: flex; align-items: center; padding: 0 11px; color: #8792a2;
+            text-decoration: none; border-radius: 4px; font-size: 12px;
+        }
+        .surface-tab:hover { color: var(--text); background: #202020; }
+        .surface-tab.active { color: var(--accent); background: var(--accent-soft); }
+        .status-row { justify-self: center; color: var(--muted); font-size: 11px; }
+        .dot { width: 7px; height: 7px; background: var(--success); border-radius: 50%; }
+        .header-actions { justify-self: end; }
+        .model-role { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .5px; }
+        select {
+            max-width: 300px; color: var(--text); background: #19191b; border: 1px solid var(--border);
+            border-radius: 4px; padding: 6px 28px 6px 9px;
+        }
+        .layout { min-height: 0; display: grid; grid-template-columns: 260px 1fr 300px; }
+        aside, .inspector { min-height: 0; overflow: auto; background: var(--sidebar); }
+        aside { border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+        .inspector { border-left: 1px solid var(--border); padding: 18px; }
+        .sidebar-title {
+            display: flex; justify-content: space-between; padding: 15px 16px 10px;
+            color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: 1px;
+        }
+        #stories { border-bottom: 1px solid var(--border); padding-bottom: 8px; max-height: 34vh; overflow: auto; }
+        .story-item, .nav-item {
+            width: 100%; border: 0; text-align: left; color: #cfd2d6; background: transparent;
+            padding: 10px 16px; border-left: 2px solid transparent;
+        }
+        .story-item:hover, .nav-item:hover { background: #202020; }
+        .story-item.active, .nav-item.active {
+            border-left-color: var(--accent); color: var(--accent); background: var(--accent-soft);
+        }
+        .story-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .story-meta { display: block; color: var(--muted); font-size: 10px; margin-top: 3px; }
+        .workspace-nav { padding-top: 8px; flex: 1; }
+        .new-story {
+            margin: 10px; padding: 9px; border: 1px solid var(--border); color: #bbc3cc;
+            background: transparent; border-radius: 3px;
+        }
+        .new-story:hover, .primary:hover { border-color: var(--accent); }
+        main { min-width: 0; overflow: auto; padding: 28px clamp(24px, 4vw, 64px) 80px; }
+        .page { max-width: 1100px; margin: 0 auto; }
+        h1 { font-family: Georgia, serif; font-size: 32px; margin: 0 0 8px; }
+        h2 { font-size: 18px; margin: 0 0 12px; }
+        p { color: #aeb3ba; line-height: 1.65; }
+        .eyebrow { color: var(--accent); text-transform: uppercase; letter-spacing: 1px; font-size: 10px; font-weight: 700; }
+        .cards { display: grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); gap: 14px; margin-top: 24px; }
+        .card { background: var(--panel); border: 1px solid var(--border); padding: 18px; border-radius: 5px; }
+        .card h3 { margin: 0 0 8px; font-size: 14px; }
+        .card p { margin: 0 0 14px; font-size: 12px; }
+        .primary, .secondary {
+            border-radius: 3px; padding: 8px 12px; font-weight: 650; font-size: 12px;
+        }
+        .primary { background: var(--accent); color: #111; border: 1px solid var(--accent); }
+        .secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
+        .muted { color: var(--muted); font-size: 11px; }
+        .inspector h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+        .inspector-section { padding: 13px 0; border-bottom: 1px solid var(--border); }
+        .kv { display: grid; grid-template-columns: 90px 1fr; gap: 8px; margin: 7px 0; font-size: 11px; }
+        .kv span:first-child { color: var(--muted); }
+        dialog {
+            width: min(520px, calc(100vw - 30px)); background: var(--panel); color: var(--text);
+            border: 1px solid #444; border-radius: 6px; padding: 0;
+        }
+        dialog::backdrop { background: rgba(0,0,0,.7); }
+        form { padding: 22px; }
+        label { display: block; color: var(--muted); font-size: 11px; margin: 14px 0 5px; }
+        input, textarea {
+            width: 100%; padding: 9px; color: var(--text); background: #131313;
+            border: 1px solid var(--border); border-radius: 3px;
+        }
+        textarea { min-height: 90px; resize: vertical; }
+        .form-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+        .empty { padding: 16px; color: var(--muted); font-size: 11px; }
+        .error { color: var(--danger); font-size: 11px; min-height: 16px; }
+        .document-layout {
+            display: grid; grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
+            gap: 14px; margin-top: 22px; align-items: start;
+        }
+        .document-list, .document-editor {
+            background: var(--panel); border: 1px solid var(--border); border-radius: 5px;
+        }
+        .document-list { max-height: calc(100vh - 230px); overflow: auto; padding: 6px; }
+        .document-group {
+            padding: 10px 9px 5px; color: var(--muted); font-size: 9px;
+            font-weight: 750; letter-spacing: .8px; text-transform: uppercase;
+        }
+        .document-item {
+            width: 100%; border: 0; border-left: 2px solid transparent; border-radius: 2px;
+            padding: 9px; color: #c7cbd0; background: transparent; text-align: left;
+        }
+        .document-item:hover { background: var(--panel-soft); }
+        .document-item.active { color: var(--accent); border-left-color: var(--accent); background: var(--accent-soft); }
+        .document-item small { display: block; margin-top: 2px; color: var(--muted); }
+        .document-editor { padding: 18px; }
+        .document-editor h2 { margin-bottom: 4px; }
+        .document-heading {
+            display: flex; align-items: flex-start; justify-content: space-between; gap: 16px;
+            padding-bottom: 14px; border-bottom: 1px solid var(--border);
+        }
+        .document-heading-actions { display: flex; align-items: center; gap: 8px; }
+        .document-view { min-height: 390px; padding: 8px 0 4px; }
+        .doc-section { padding: 16px 0; border-bottom: 1px solid #303034; }
+        .doc-section:last-child { border-bottom: 0; }
+        .doc-section h3 {
+            margin: 0 0 8px; color: #e1e3e6; font-size: 12px; line-height: 1.35;
+            letter-spacing: .25px;
+        }
+        .doc-section > p, .doc-card p, .doc-scalar {
+            margin: 0; color: #c4c8ce; font-size: 13px; line-height: 1.65;
+        }
+        .doc-list { margin: 6px 0 0; padding-left: 22px; color: #c4c8ce; }
+        .doc-list li { margin: 7px 0; padding-left: 3px; line-height: 1.55; }
+        .doc-cards { display: grid; gap: 9px; margin-top: 8px; }
+        .doc-card {
+            padding: 12px 14px; background: #1c1c1f; border: 1px solid #343438;
+            border-left: 2px solid #4d5662; border-radius: 3px;
+        }
+        .doc-card-title { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+        .doc-card-title strong { color: #e2e4e7; font-size: 13px; }
+        details.doc-card > summary { cursor: pointer; margin-bottom: 0; }
+        details.doc-card[open] > summary { margin-bottom: 11px; }
+        details.doc-card > summary::marker { color: var(--muted); }
+        .doc-fields { display: grid; gap: 8px; }
+        .doc-field { display: grid; grid-template-columns: minmax(105px, 28%) minmax(0, 1fr); gap: 12px; }
+        .doc-field-label {
+            color: var(--muted); font-size: 9px; font-weight: 700; letter-spacing: .55px;
+            line-height: 1.65; text-transform: uppercase;
+        }
+        .status-tag {
+            display: inline-flex; align-items: center; padding: 2px 6px; border: 1px solid #46515e;
+            border-radius: 999px; color: #8fa4bd; font-size: 8px; font-weight: 700;
+            letter-spacing: .4px; text-transform: uppercase; white-space: nowrap;
+        }
+        .status-tag.accepted, .status-tag.premise-fact { border-color: #315f43; color: #79bd90; }
+        .status-tag.open-question { border-color: #735d2f; color: #d5aa54; }
+        .status-tag.protected-choice, .status-tag.load-bearing-assumption {
+            border-color: #65465e; color: #c993bc;
+        }
+        .doc-reference { margin-top: 14px; color: #596474; font-size: 9px; overflow-wrap: anywhere; }
+        .document-editor textarea {
+            min-height: 390px; margin-top: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 12px; line-height: 1.55; tab-size: 2;
+        }
+        .editor-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
+        .editor-toolbar select { max-width: 180px; }
+        .blueprint-toolbar { display: flex; justify-content: flex-end; margin: 18px 0 10px; }
+        .node-tree { display: grid; gap: 7px; }
+        .node-row {
+            display: grid; grid-template-columns: 82px minmax(0,1fr) auto; gap: 12px; align-items: center;
+            padding: 12px 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 4px;
+        }
+        .node-type { color: var(--accent); font-size: 9px; font-weight: 750; letter-spacing: .7px; text-transform: uppercase; }
+        .node-row strong { display: block; }
+        .node-row p { margin: 2px 0 0; font-size: 11px; }
+        .node-indent { display: inline-block; }
+        .manuscript-toolbar {
+            display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap;
+            margin: 18px 0; padding: 10px; background: var(--panel); border: 1px solid var(--border);
+        }
+        .manuscript-toolbar select { max-width: min(520px, 60vw); flex: 1; }
+        .manuscript-actions { display: flex; gap: 8px; align-items: center; }
+        .prose-sheet {
+            max-width: 820px; margin: 0 auto; padding: clamp(28px,5vw,66px);
+            background: #202020; border: 1px solid #303030; box-shadow: 0 20px 50px rgba(0,0,0,.22);
+        }
+        .prose-block {
+            position: relative; padding: 6px 40px 6px 8px; margin: 0 -8px 12px;
+            border-left: 2px solid transparent;
+        }
+        .prose-block:hover { background: rgba(255,255,255,.018); border-left-color: var(--accent); }
+        .prose-block p {
+            margin: 0; color: #d4d4d4; font-family: Georgia, 'Times New Roman', serif;
+            font-size: 18px; line-height: 1.8;
+        }
+        .prose-block p em { color: #dedede; font-style: italic; }
+        .prose-block p strong { color: #eeeeee; font-weight: 700; }
+        .prose-block p del { color: #9a9a9a; }
+        .prose-block p code {
+            padding: 1px 4px; border-radius: 3px; background: #171717;
+            color: #e2c08d; font-family: ui-monospace, monospace; font-size: .88em;
+        }
+        .prose-actions { position: absolute; right: 4px; top: 6px; display: none; gap: 4px; }
+        .prose-block:hover .prose-actions { display: flex; }
+        .icon-button { border: 1px solid var(--border); color: var(--muted); background: #171717; padding: 3px 6px; }
+        .icon-button:hover { color: var(--accent); border-color: var(--accent); }
+        .append-prose { max-width: 820px; margin: 14px auto; background: var(--panel); border: 1px solid var(--border); padding: 14px; }
+        .append-prose textarea { min-height: 110px; }
+        .author-room {
+            display: grid; grid-template-rows: minmax(360px, calc(100vh - 370px)) auto;
+            margin-top: 18px; background: var(--panel); border: 1px solid var(--border); min-height: 520px;
+        }
+        .author-messages { overflow: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
+        .author-message {
+            max-width: 86%; padding: 13px 15px; border: 1px solid var(--border);
+            background: #19191b; white-space: pre-wrap; line-height: 1.6;
+        }
+        .author-message.user { align-self: flex-end; border-left: 2px solid var(--accent); background: #211c17; }
+        .author-message.assistant { align-self: flex-start; border-left: 2px solid #5b789c; }
+        .author-message-meta { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .7px; margin-bottom: 5px; }
+        .markdown-body { white-space: normal; overflow-wrap: anywhere; }
+        .markdown-body > :first-child { margin-top: 0; }
+        .markdown-body > :last-child { margin-bottom: 0; }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4 {
+            font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+            color: #e5e7eb; line-height: 1.3; margin: 1.25em 0 .45em;
+        }
+        .markdown-body h1 { font-size: 20px; }
+        .markdown-body h2 { font-size: 17px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+        .markdown-body h3 { font-size: 15px; color: #d7dbe1; }
+        .markdown-body h4 { font-size: 13px; }
+        .markdown-body p { color: inherit; line-height: 1.65; margin: .55em 0; }
+        .markdown-body ul, .markdown-body ol { margin: .55em 0 .8em; padding-left: 1.55em; }
+        .markdown-body li { margin: .28em 0; padding-left: .18em; }
+        .markdown-body li::marker { color: var(--accent); }
+        .markdown-body strong { color: #f0f1f3; font-weight: 700; }
+        .markdown-body em { color: #cbd2dc; }
+        .markdown-body blockquote {
+            margin: .85em 0; padding: .25em .85em; color: #b5bfcc;
+            border-left: 3px solid #5b789c; background: rgba(91,120,156,.08);
+        }
+        .markdown-body code {
+            padding: .12em .35em; border: 1px solid #34343a; border-radius: 3px;
+            background: #121214; color: #e1b77d; font: .9em ui-monospace, SFMono-Regular, Consolas, monospace;
+        }
+        .markdown-body pre {
+            margin: .85em 0; padding: 11px; overflow: auto; border: 1px solid var(--border);
+            background: #121214; white-space: pre;
+        }
+        .markdown-body pre code { padding: 0; border: 0; background: transparent; color: #d9dde3; }
+        .markdown-body a { color: #85a9d6; text-decoration-color: #526b89; }
+        .markdown-body hr { border: 0; border-top: 1px solid var(--border); margin: 1.1em 0; }
+        .markdown-body table { width: 100%; border-collapse: collapse; margin: .85em 0; font-size: 12px; }
+        .markdown-body th, .markdown-body td { padding: 6px 8px; border: 1px solid var(--border); text-align: left; }
+        .markdown-body th { background: #171719; color: #e3e5e8; }
+        .author-compose { padding: 14px; border-top: 1px solid var(--border); background: #171717; }
+        .author-compose textarea { min-height: 86px; }
+        .author-compose-row { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; }
+        .button-row { display: flex; align-items: center; gap: 8px; }
+        .job-strip {
+            max-width: 820px; margin: 12px auto; padding: 10px 13px;
+            display: flex; justify-content: space-between; align-items: center;
+            background: var(--accent-soft); border: 1px solid var(--accent-border, #70461e);
+        }
+        .discovery-layout {
+            display: grid; grid-template-columns: minmax(0, 1fr) 360px;
+            gap: 14px; margin-top: 18px; align-items: start;
+        }
+        .quickstart-card { margin-top: 18px; }
+        .quickstart-card textarea { min-height: 72px; }
+        .discovery-panel {
+            background: var(--panel); border: 1px solid var(--border); border-radius: 4px;
+        }
+        .discovery-header { padding: 16px 18px; border-bottom: 1px solid var(--border); }
+        .discovery-header h2 { margin-bottom: 5px; }
+        .discovery-progress { height: 5px; background: #131313; margin-top: 10px; overflow: hidden; }
+        .discovery-progress span { display: block; height: 100%; background: var(--accent); }
+        .discovery-messages {
+            min-height: 410px; max-height: calc(100vh - 420px); overflow: auto;
+            padding: 18px; display: flex; flex-direction: column; gap: 13px;
+        }
+        .discovery-compose { border-top: 1px solid var(--border); padding: 13px; }
+        .discovery-compose textarea { min-height: 105px; }
+        .proposal-list { padding: 10px; display: grid; gap: 10px; max-height: calc(100vh - 230px); overflow: auto; }
+        .proposal-card { padding: 13px; background: #19191b; border: 1px solid var(--border); }
+        .proposal-card.pending { border-left: 2px solid var(--accent); }
+        .proposal-card.accepted { border-left: 2px solid var(--success); }
+        .change-summary { margin: 8px 0 10px; padding-left: 18px; color: #b9c2ce; font-size: 11px; line-height: 1.45; }
+        .change-summary li { margin: 4px 0; }
+        .revision-history { display: grid; gap: 5px; margin: 8px 0; font-size: 11px; color: #adb5c0; }
+        .proposal-card.rejected { opacity: .65; }
+        .proposal-card h3 { margin: 0 0 5px; font-size: 13px; }
+        .proposal-patch { padding: 8px 0; border-top: 1px solid var(--border); margin-top: 8px; }
+        .proposal-patch code { color: #9bb3d1; font-size: 10px; }
+        .proposal-actions { display: flex; justify-content: flex-end; gap: 7px; margin-top: 10px; }
+        details pre {
+            white-space: pre-wrap; overflow-wrap: anywhere; color: #abb8c8; font-size: 10px;
+            background: #111; padding: 8px; max-height: 220px; overflow: auto;
+        }
+        @media (max-width: 1050px) {
+            .layout { grid-template-columns: 230px 1fr; }
+            .inspector { display: none; }
+            .discovery-layout { grid-template-columns: 1fr; }
+        }
+        @media (max-width: 700px) {
+            header { grid-template-columns: 1fr auto; }
+            .status-row { display: none; }
+            .layout { grid-template-columns: 1fr; }
+            aside { display: none; }
+            .model-role { display: none; }
+            select { max-width: 160px; }
+            .document-layout { grid-template-columns: 1fr; }
+            .document-list { max-height: 260px; }
+        }
+    </style>
+</head>
+<body>
+<div id="app">
+    <header>
+        <div class="brand-row">
+            <div class="brand">ClawForge <small>v0.2</small></div>
+            <nav class="surface-tabs" aria-label="ClawForge surface">
+                <a class="surface-tab" href="/">Chat</a>
+                <a class="surface-tab active" href="/narrative">Narrative Studio</a>
+            </nav>
+        </div>
+        <div class="status-row"><span class="dot"></span><span>Narrative runtime connected</span></div>
+        <div class="header-actions">
+            <span class="model-role">Story default</span>
+            <select id="model-select" aria-label="Story default model">
+                <option value="">Daemon default</option>
+            </select>
+        </div>
+    </header>
+    <div class="layout">
+        <aside>
+            <div class="sidebar-title"><span>STORIES</span><span id="story-count">0</span></div>
+            <div id="stories"><div class="empty">Loading stories…</div></div>
+            <button class="new-story" id="new-story">+ New Story</button>
+            <div class="sidebar-title"><span>WORKSPACE</span></div>
+            <nav class="workspace-nav" id="workspace-nav"></nav>
+        </aside>
+        <main><div class="page" id="workspace"></div></main>
+        <section class="inspector">
+            <h2>Inspector</h2>
+            <div id="inspector-content"><p class="muted">Select or create a story.</p></div>
+        </section>
+    </div>
+</div>
+
+<dialog id="story-dialog">
+    <form id="story-form">
+        <h2>Create Story</h2>
+        <p>Start with a stable workspace. Discovery and blueprint records will be built inside it.</p>
+        <label for="story-title">Title</label>
+        <input id="story-title" required maxlength="200" autofocus>
+        <label for="story-premise">Premise</label>
+        <textarea id="story-premise" placeholder="What is the central story idea?"></textarea>
+        <label for="story-genre">Genre</label>
+        <input id="story-genre" placeholder="Fantasy, science fiction, mystery…">
+        <label><input id="story-quickstart" type="checkbox" checked style="width:auto"> Auto-design the complete provisional foundation</label>
+        <div class="error" id="form-error"></div>
+        <div class="form-actions">
+            <button type="button" class="secondary" id="cancel-story">Cancel</button>
+            <button class="primary" type="submit">Create Story</button>
+        </div>
+    </form>
+</dialog>
+
+<dialog id="node-dialog">
+    <form id="node-form">
+        <h2>Add Storyboard Node</h2>
+        <p>Volumes contain arcs or chapters; chapters contain scenes. The hierarchy remains queryable by the authoring loop.</p>
+        <label for="node-type">Type</label>
+        <select id="node-type">
+            <option value="volume">Volume</option>
+            <option value="arc">Arc</option>
+            <option value="chapter">Chapter</option>
+            <option value="scene">Scene</option>
+        </select>
+        <label for="node-parent">Parent</label>
+        <select id="node-parent"><option value="">Story root</option></select>
+        <label for="node-title">Title</label>
+        <input id="node-title" required maxlength="240">
+        <label for="node-purpose">Purpose</label>
+        <textarea id="node-purpose" placeholder="Why does this structural unit exist?"></textarea>
+        <label for="node-synopsis">Synopsis</label>
+        <textarea id="node-synopsis" placeholder="What roughly happens?"></textarea>
+        <div class="error" id="node-error"></div>
+        <div class="form-actions">
+            <button type="button" class="secondary" id="cancel-node">Cancel</button>
+            <button class="primary" type="submit">Add node</button>
+        </div>
+    </form>
+</dialog>
+
+<dialog id="prose-dialog">
+    <form id="prose-form">
+        <h2 id="prose-dialog-title">Edit passage</h2>
+        <input id="prose-operation" type="hidden">
+        <input id="prose-anchor" type="hidden">
+        <label for="prose-text">Prose</label>
+        <textarea id="prose-text" required></textarea>
+        <div class="error" id="prose-error"></div>
+        <div class="form-actions">
+            <button type="button" class="secondary" id="cancel-prose">Cancel</button>
+            <button class="primary" type="submit">Apply scoped patch</button>
+        </div>
+    </form>
+</dialog>
+
+<dialog id="revision-dialog">
+    <form id="revision-form">
+        <h2>AI revise chapter</h2>
+        <p>The reviser will walk the existing prose in small ranges. It preserves events and story facts while creating an immutable sequence of scoped revisions.</p>
+        <label for="revision-instruction">Revision direction</label>
+        <textarea id="revision-instruction" required>Make the prose plainer and more natural. Fix dialogue paragraphing, split overloaded comma-heavy sentences, remove decorative personification and stacked metaphors, and preserve every story beat.</textarea>
+        <div class="error" id="revision-error"></div>
+        <div class="form-actions">
+            <button type="button" class="secondary" id="cancel-revision">Cancel</button>
+            <button class="primary" type="submit">Start bounded revision</button>
+        </div>
+    </form>
+</dialog>
+
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script>
+(() => {
+    const apiBase = '/api/narrative/v1';
+    const workspaceNames = [
+        'Dashboard', 'Author Room', 'Discovery', 'Import & Sources', 'Blueprint',
+        'Manuscript', 'Docs & Plans', 'Characters', 'Relationships', 'World',
+        'Timeline', 'Arcs, Threads & Promises', 'Style, Voice & Craft', 'Review & Continuity'
+    ];
+    const state = {
+        stories: [],
+        story: null,
+        workspace: localStorage.getItem('clawforge.narrative.workspace') || 'Dashboard',
+        profile: null,
+        models: [],
+        records: [],
+        activeRecordId: null,
+        editingRecordId: null,
+        nodes: [],
+        selectedNodeId: null,
+        prose: null,
+        authorMessages: [],
+        discoveryMessages: [],
+        discoveryProposals: [],
+        discoveryChanges: [],
+        importSources: [],
+        jobs: [],
+        runningJobId: null
+    };
+    const $ = id => document.getElementById(id);
+
+    async function request(path, options = {}) {
+        const response = await fetch(path, options);
+        const data = response.status === 204 ? null : await response.json();
+        if (!response.ok) throw new Error(data?.error || `HTTP ${response.status}`);
+        return data;
+    }
+
+    async function loadStories() {
+        const data = await request(`${apiBase}/stories`);
+        state.stories = data.stories || [];
+        const remembered = localStorage.getItem('clawforge.narrative.story');
+        state.story = state.stories.find(story => story.id === remembered) || state.stories[0] || null;
+        renderStories();
+        renderNavigation();
+        await loadSelectedStory();
+    }
+
+    function renderStories() {
+        $('story-count').textContent = state.stories.length;
+        const container = $('stories');
+        container.replaceChildren();
+        if (!state.stories.length) {
+            const empty = document.createElement('div');
+            empty.className = 'empty';
+            empty.textContent = 'No story workspaces yet.';
+            container.appendChild(empty);
+            return;
+        }
+        for (const story of state.stories) {
+            const button = document.createElement('button');
+            button.className = `story-item${state.story?.id === story.id ? ' active' : ''}`;
+            const title = document.createElement('span');
+            title.className = 'story-title';
+            title.textContent = story.title;
+            const meta = document.createElement('span');
+            meta.className = 'story-meta';
+            meta.textContent = `${story.genre || 'Unclassified'} · v${story.active_version}`;
+            button.append(title, meta);
+            button.addEventListener('click', async () => {
+                state.story = story;
+                localStorage.setItem('clawforge.narrative.story', story.id);
+                renderStories();
+                await loadSelectedStory();
+            });
+            container.appendChild(button);
+        }
+    }
+
+    function renderNavigation() {
+        const nav = $('workspace-nav');
+        nav.replaceChildren();
+        for (const name of workspaceNames) {
+            const button = document.createElement('button');
+            button.className = `nav-item${state.workspace === name ? ' active' : ''}`;
+            button.textContent = name;
+            button.disabled = !state.story;
+            button.addEventListener('click', () => {
+                state.workspace = name;
+                localStorage.setItem('clawforge.narrative.workspace', name);
+                renderNavigation();
+                renderWorkspace();
+            });
+            nav.appendChild(button);
+        }
+    }
+
+    async function loadSelectedStory() {
+        state.profile = null;
+        state.editingRecordId = null;
+        if (state.story) {
+            localStorage.setItem('clawforge.narrative.story', state.story.id);
+            const [profile, recordData, nodeData, authorData, jobData, discoveryData, proposalData, changeData, importData] = await Promise.all([
+                request(`${apiBase}/stories/${state.story.id}/model-profile`),
+                request(`${apiBase}/stories/${state.story.id}/records`),
+                request(`${apiBase}/stories/${state.story.id}/nodes`),
+                request(`${apiBase}/stories/${state.story.id}/author-room/messages`),
+                request(`${apiBase}/stories/${state.story.id}/jobs`),
+                request(`${apiBase}/stories/${state.story.id}/discovery/messages`),
+                request(`${apiBase}/stories/${state.story.id}/discovery/proposals`),
+                request(`${apiBase}/stories/${state.story.id}/discovery/changes`),
+                request(`${apiBase}/stories/${state.story.id}/imports`)
+            ]);
+            state.profile = profile;
+            state.records = recordData.records || [];
+            state.nodes = nodeData.nodes || [];
+            state.authorMessages = authorData.messages || [];
+            state.discoveryMessages = discoveryData.messages || [];
+            state.discoveryProposals = proposalData.proposals || [];
+            state.discoveryChanges = changeData.changes || [];
+            state.importSources = importData.sources || [];
+            state.jobs = jobData.jobs || [];
+            const proseNodes = state.nodes.filter(node => node.node_type === 'chapter' || node.node_type === 'scene');
+            if (!proseNodes.some(node => node.id === state.selectedNodeId)) {
+                state.selectedNodeId = proseNodes[0]?.id || null;
+            }
+            state.prose = state.selectedNodeId
+                ? await request(`${apiBase}/stories/${state.story.id}/nodes/${state.selectedNodeId}/prose`)
+                : null;
+            if (!state.records.some(record => record.id === state.activeRecordId)) {
+                state.activeRecordId = state.records[0]?.id || null;
+            }
+        } else {
+            state.records = [];
+            state.activeRecordId = null;
+            state.nodes = [];
+            state.selectedNodeId = null;
+            state.prose = null;
+            state.authorMessages = [];
+            state.discoveryMessages = [];
+            state.discoveryProposals = [];
+            state.discoveryChanges = [];
+            state.importSources = [];
+            state.jobs = [];
+            state.runningJobId = null;
+        }
+        renderNavigation();
+        renderWorkspace();
+        renderInspector();
+        syncModelSelection();
+    }
+
+    function renderWorkspace() {
+        const target = $('workspace');
+        target.replaceChildren();
+        if (!state.story) {
+            target.innerHTML = `
+                <div class="eyebrow">Narrative Studio</div>
+                <h1>Build a story that remembers itself.</h1>
+                <p>Create an original story workspace or import an existing manuscript. Narrative Studio will keep plans, prose, canon, state, and documentation connected.</p>
+                <div class="cards">
+                    <article class="card"><h3>Create Story</h3><p>Begin with guided discovery, intent, and a volume contract.</p><button class="primary" id="welcome-create">Create Story</button></article>
+                    <article class="card"><h3>Import Manuscript</h3><p>Reconstruct candidate documentation from prose with evidence review.</p><button class="secondary" disabled>Importer coming next</button></article>
+                    <article class="card"><h3>Import Documentation</h3><p>Reconcile an existing story bible into typed records.</p><button class="secondary" disabled>Importer coming next</button></article>
+                </div>`;
+            $('welcome-create').addEventListener('click', openCreateDialog);
+            return;
+        }
+        if (state.workspace === 'Docs & Plans' ||
+            state.workspace === 'Style, Voice & Craft' ||
+            state.workspace === 'World' ||
+            state.workspace === 'Arcs, Threads & Promises' ||
+            state.workspace === 'Characters' ||
+            state.workspace === 'Relationships' ||
+            state.workspace === 'Timeline' ||
+            state.workspace === 'Review & Continuity') {
+            renderDocumentsWorkspace(target);
+            return;
+        }
+        if (state.workspace === 'Dashboard') {
+            renderDashboardWorkspace(target);
+            return;
+        }
+        if (state.workspace === 'Blueprint') {
+            renderBlueprintWorkspace(target);
+            return;
+        }
+        if (state.workspace === 'Manuscript') {
+            renderManuscriptWorkspace(target);
+            return;
+        }
+        if (state.workspace === 'Author Room') {
+            renderAuthorRoom(target);
+            return;
+        }
+        if (state.workspace === 'Discovery') {
+            renderDiscoveryWorkspace(target);
+            return;
+        }
+        if (state.workspace === 'Import & Sources') {
+            renderImportWorkspace(target);
+            return;
+        }
+        const descriptions = {
+            'Dashboard': 'Story progress, unresolved obligations, active jobs, and the next useful action.',
+            'Author Room': 'A normal story-aware conversation surface with approval-gated decision proposals.',
+            'Discovery': 'Clarify intent and build the living story brief before prose.',
+            'Import & Sources': 'Review manuscript evidence, reconstructed documentation, provenance, and conflicts.',
+            'Blueprint': 'Edit volumes, arcs, chapters, scenes, beats, and protected moments.',
+            'Manuscript': 'Read, edit, review, and run the passage-based writer loop.',
+            'Docs & Plans': 'Browse stable human projections over canonical typed records.'
+        };
+        target.innerHTML = `
+            <div class="eyebrow">${escapeHtml(state.story.genre || 'Narrative workspace')}</div>
+            <h1>${escapeHtml(state.workspace)}</h1>
+            <p>${escapeHtml(descriptions[state.workspace] || 'This workspace is part of the Narrative Studio implementation plan.')}</p>
+            <div class="cards">
+                <article class="card"><h3>${escapeHtml(state.story.title)}</h3><p>${escapeHtml(state.story.premise || 'No premise recorded yet.')}</p><span class="muted">Main branch · Story version ${state.story.active_version}</span></article>
+                <article class="card"><h3>Foundation status</h3><p>Story storage, model profile, shared navigation, and Narrative API are active.</p><span class="muted">Authoring jobs and document projections are the next implementation layer.</span></article>
+            </div>`;
+    }
+
+    const documentCatalog = {
+        StoryIdentity: ['Story Design', 'Story identity'],
+        StoryIntentProfile: ['Story Design', 'Intent & reader experience'],
+        StoryContract: ['Story Design', 'Story contract'],
+        StoryStructureRoot: ['Storyboard', 'Structure root'],
+        NarratorContract: ['Writing Contracts', 'Narrator & POV'],
+        StyleContract: ['Writing Contracts', 'Style & tone'],
+        InformationDeliveryContract: ['Writing Contracts', 'Information delivery'],
+        ComedyContract: ['Writing Contracts', 'Comedy'],
+        RelationalTextureContract: ['Writing Contracts', 'Romance & relational texture'],
+        QualityGateContract: ['Writing Contracts', 'Quality gate'],
+        EntityRegistry: ['People & World', 'Entity registry'],
+        WorldRuleRegistry: ['People & World', 'World rules'],
+        MasterTimeline: ['People & World', 'History & timeline'],
+        InformationRegistry: ['Information Design', 'Reader knowledge & secrets'],
+        ArcRegistry: ['Active Tracking', 'Arcs & threads'],
+        PromiseLedger: ['Active Tracking', 'Promises & payoffs'],
+        AuthorDecisionRegistry: ['Active Tracking', 'Author decisions'],
+        SourceRegistry: ['History & Sources', 'Sources & provenance'],
+        BranchRegistry: ['History & Sources', 'Branches'],
+        ChapterDocumentationUpdate: ['Observed Updates', 'Chapter documentation update']
+    };
+
+    function renderImportWorkspace(target) {
+        const importProposals = state.discoveryProposals.filter(
+            proposal => proposal.title === 'Imported source reconstruction'
+        );
+        target.innerHTML = `
+            <div class="eyebrow">${escapeHtml(state.story.title)}</div>
+            <h1>Import & Sources</h1>
+            <p>Use existing documentation and manuscript prose as evidence. The model reconstructs typed records as one approval-gated proposal; it never silently replaces canon.</p>
+            <div class="cards">
+                <article class="card">
+                    <h3>Reconstruct story documentation</h3>
+                    <p>Select Markdown or text files. They are analyzed in an isolated pass and are not added to ordinary conversation context.</p>
+                    <input id="import-evidence-files" type="file" accept=".md,.txt,text/markdown,text/plain" multiple>
+                </article>
+                <article class="card">
+                    <h3>Optional manuscript chapter</h3>
+                    <p>Import one chapter as accepted source prose. Markdown headings and paragraphs become addressable manuscript blocks.</p>
+                    <input id="import-manuscript-file" type="file" accept=".md,.txt,text/markdown,text/plain">
+                    <input id="import-manuscript-title" type="text" placeholder="Chapter title (defaults to filename)">
+                </article>
+            </div>
+            <div class="error" id="import-error"></div>
+            <div class="form-actions">
+                <span class="muted">Documentation changes remain pending until accepted in Discovery.</span>
+                <button class="primary" id="run-import">Analyze selected sources</button>
+            </div>
+            <h2 style="margin-top:28px">Indexed source library</h2>
+            <div class="cards" id="import-source-library"></div>
+            <h2 style="margin-top:28px">Import reconstructions</h2>
+            <div class="proposal-list" id="import-results"></div>`;
+        $('run-import').addEventListener('click', runSourceImport);
+        const sourceLibrary = $('import-source-library');
+        if (!state.importSources.length) {
+            sourceLibrary.innerHTML = '<div class="empty">No durable source files indexed yet.</div>';
+        } else {
+            for (const source of state.importSources) {
+                let byteCount = 0;
+                try { byteCount = JSON.parse(source.metadata_json).byte_count || 0; } catch {}
+                const card = document.createElement('article');
+                card.className = 'card';
+                card.innerHTML = `<h3>${escapeHtml(source.display_name)}</h3><p>${byteCount.toLocaleString()} bytes indexed for bounded retrieval.</p><span class="muted">${source.embedded_count || 0}/${source.chunk_count || 0} semantic chunks · ${escapeHtml(source.source_type)}</span>`;
+                sourceLibrary.appendChild(card);
+            }
+        }
+        const results = $('import-results');
+        if (!importProposals.length) {
+            results.innerHTML = '<div class="empty">No source reconstruction has been run yet.</div>';
+            return;
+        }
+        for (const proposal of importProposals) {
+            let patchCount = 0;
+            try { patchCount = JSON.parse(proposal.proposal_json).record_patches?.length || 0; } catch {}
+            const card = document.createElement('article');
+            card.className = 'proposal';
+            card.innerHTML = `
+                <h3>${escapeHtml(proposal.title)}</h3>
+                <span class="status ${escapeHtml(proposal.status)}">${escapeHtml(proposal.status)} · ${patchCount} typed document change(s)</span>
+                <p>${escapeHtml(proposal.decision)}</p>
+                <button class="secondary">Review in Discovery</button>`;
+            card.querySelector('button').addEventListener('click', () => {
+                state.workspace = 'Discovery';
+                localStorage.setItem('clawforge.narrative.workspace', state.workspace);
+                renderNavigation();
+                renderWorkspace();
+            });
+            results.appendChild(card);
+        }
+    }
+
+    async function runSourceImport() {
+        const errorTarget = $('import-error');
+        const button = $('run-import');
+        errorTarget.textContent = '';
+        const evidenceFiles = [...$('import-evidence-files').files];
+        const manuscriptFile = $('import-manuscript-file').files[0] || null;
+        const allEvidence = manuscriptFile && !evidenceFiles.some(file => file.name === manuscriptFile.name)
+            ? [...evidenceFiles, manuscriptFile]
+            : evidenceFiles;
+        if (!allEvidence.length) {
+            errorTarget.textContent = 'Select at least one documentation or manuscript source.';
+            return;
+        }
+        button.disabled = true;
+        button.textContent = 'Reconstructing typed documents…';
+        try {
+            const sourceParts = await Promise.all(allEvidence.map(async file =>
+                `===== SOURCE: ${file.name} =====\n\n${await file.text()}`
+            ));
+            const proposal = await request(`${apiBase}/stories/${state.story.id}/imports/analyze`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({source_bundle: sourceParts.join('\n\n')})
+            });
+            state.discoveryProposals.unshift(proposal);
+            const importData = await request(`${apiBase}/stories/${state.story.id}/imports`);
+            state.importSources = importData.sources || [];
+
+            if (manuscriptFile) {
+                const requestedTitle = $('import-manuscript-title').value.trim();
+                const title = requestedTitle || manuscriptFile.name.replace(/\.[^.]+$/, '').replaceAll('_', ' ');
+                if (state.nodes.some(node => node.node_type === 'chapter' && node.title === title)) {
+                    throw new Error(`Typed documents were reconstructed, but manuscript import stopped because “${title}” already exists.`);
+                }
+                const node = await request(`${apiBase}/stories/${state.story.id}/nodes`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        node_type: 'chapter',
+                        title,
+                        purpose: 'Imported manuscript chapter awaiting structural refinement.',
+                        synopsis: 'Imported source prose.'
+                    })
+                });
+                const prose = await request(`${apiBase}/stories/${state.story.id}/nodes/${node.id}/prose`, {
+                    method: 'PATCH',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        base_revision_id: null,
+                        operation: 'append',
+                        anchor_block_id: null,
+                        text: await manuscriptFile.text(),
+                        block_type: 'paragraph',
+                        author_source: `import:${manuscriptFile.name}`
+                    })
+                });
+                state.nodes.push(node);
+                state.selectedNodeId = node.id;
+                state.prose = prose;
+            }
+            renderWorkspace();
+            renderInspector();
+        } catch (error) {
+            errorTarget.textContent = error.message;
+            button.disabled = false;
+            button.textContent = 'Analyze selected sources';
+        }
+    }
+
+    function visibleRecords() {
+        const filters = {
+            'Style, Voice & Craft': new Set(['NarratorContract', 'StyleContract', 'InformationDeliveryContract', 'ComedyContract', 'RelationalTextureContract', 'QualityGateContract']),
+            'World': new Set(['EntityRegistry', 'WorldRuleRegistry', 'MasterTimeline']),
+            'Arcs, Threads & Promises': new Set(['ArcRegistry', 'PromiseLedger', 'InformationRegistry']),
+            'Characters': new Set(['EntityRegistry']),
+            'Relationships': new Set(['RelationalTextureContract', 'EntityRegistry']),
+            'Timeline': new Set(['MasterTimeline', 'StoryStructureRoot']),
+            'Review & Continuity': new Set(['QualityGateContract', 'InformationRegistry', 'PromiseLedger', 'AuthorDecisionRegistry', 'ChapterDocumentationUpdate'])
+        };
+        const filter = filters[state.workspace];
+        return filter ? state.records.filter(record => filter.has(record.record_type)) : state.records;
+    }
+
+    function renderDashboardWorkspace(target) {
+        const accepted = state.records.filter(record => record.lifecycle === 'accepted').length;
+        const pending = state.discoveryProposals.filter(proposal => proposal.status === 'pending');
+        const proseNodes = state.nodes.filter(node => node.node_type === 'chapter' || node.node_type === 'scene');
+        const activeJobs = state.jobs.filter(job => job.status !== 'complete');
+        target.innerHTML = `
+            <div class="eyebrow">${escapeHtml(state.story.genre || 'Narrative workspace')}</div>
+            <h1>${escapeHtml(state.story.title)}</h1>
+            <p>${escapeHtml(state.story.premise || 'No premise recorded yet.')}</p>
+            <div class="cards">
+                <article class="card"><h3>Documentation</h3><p>${accepted} of ${state.records.length} typed records accepted.</p><span class="muted">${pending.length} proposal(s) awaiting review</span></article>
+                <article class="card"><h3>Manuscript</h3><p>${proseNodes.length} chapter or scene node(s).</p><span class="muted">${state.prose?.word_count || 0} words in the selected section</span></article>
+                <article class="card"><h3>Agent work</h3><p>${activeJobs.length} active or paused writing job(s).</p><span class="muted">Story version ${state.story.active_version}</span></article>
+            </div>
+            <div class="form-actions">
+                <button class="secondary" id="dashboard-discovery">Continue Discovery</button>
+                <button class="primary" id="dashboard-manuscript">Open Manuscript</button>
+            </div>`;
+        $('dashboard-discovery').addEventListener('click', () => openWorkspace('Discovery'));
+        $('dashboard-manuscript').addEventListener('click', () => openWorkspace('Manuscript'));
+    }
+
+    function openWorkspace(name) {
+        state.workspace = name;
+        localStorage.setItem('clawforge.narrative.workspace', name);
+        renderNavigation();
+        renderWorkspace();
+    }
+
+    function renderDocumentsWorkspace(target) {
+        const records = visibleRecords();
+        if (!records.some(record => record.id === state.activeRecordId)) {
+            state.activeRecordId = records[0]?.id || null;
+        }
+        const active = records.find(record => record.id === state.activeRecordId);
+        const grouped = new Map();
+        for (const record of records) {
+            const [group] = documentCatalog[record.record_type] || ['Other'];
+            if (!grouped.has(group)) grouped.set(group, []);
+            grouped.get(group).push(record);
+        }
+        target.innerHTML = `
+            <div class="eyebrow">${escapeHtml(state.story.title)}</div>
+            <h1>${escapeHtml(state.workspace)}</h1>
+            <p>These are fixed projections over canonical typed records. Models update these record types; they do not invent a pile of Markdown files.</p>
+            <div class="document-layout">
+                <div class="document-list" id="document-list"></div>
+                <div class="document-editor" id="document-editor"></div>
+            </div>`;
+        const list = $('document-list');
+        for (const [group, groupRecords] of grouped) {
+            const heading = document.createElement('div');
+            heading.className = 'document-group';
+            heading.textContent = group;
+            list.appendChild(heading);
+            for (const record of groupRecords) {
+                const button = document.createElement('button');
+                button.className = `document-item${record.id === state.activeRecordId ? ' active' : ''}`;
+                button.innerHTML = `${escapeHtml(documentCatalog[record.record_type]?.[1] || record.record_type)}<small>${escapeHtml(record.lifecycle)} · r${record.revision}</small>`;
+                button.addEventListener('click', () => {
+                    state.activeRecordId = record.id;
+                    state.editingRecordId = null;
+                    renderWorkspace();
+                });
+                list.appendChild(button);
+            }
+        }
+        renderDocumentEditor(active);
+    }
+
+    function renderDocumentEditor(record) {
+        const editor = $('document-editor');
+        if (!record) {
+            editor.innerHTML = '<p class="muted">No document is available in this view.</p>';
+            return;
+        }
+        if (state.editingRecordId !== record.id) {
+            renderHumanDocument(record, editor);
+            return;
+        }
+        let formatted = record.value_json;
+        try { formatted = JSON.stringify(JSON.parse(record.value_json), null, 2); } catch {}
+        editor.innerHTML = `
+            <div class="document-heading">
+                <div>
+                    <h2>${escapeHtml(documentCatalog[record.record_type]?.[1] || record.record_type)}</h2>
+                    <div class="muted">Structured data editor · ${escapeHtml(record.record_type)} · r${record.revision}</div>
+                </div>
+                <button class="secondary" id="cancel-record-edit">Cancel</button>
+            </div>
+            <textarea id="record-value" spellcheck="false" aria-label="Document JSON">${escapeHtml(formatted)}</textarea>
+            <div class="error" id="record-error"></div>
+            <div class="editor-toolbar">
+                <select id="record-lifecycle" aria-label="Document lifecycle">
+                    ${['candidate','draft','accepted','superseded','rejected'].map(value =>
+                        `<option value="${value}"${record.lifecycle === value ? ' selected' : ''}>${value}</option>`
+                    ).join('')}
+                </select>
+                <button class="primary" id="save-record">Save document</button>
+            </div>`;
+        $('cancel-record-edit').addEventListener('click', () => {
+            state.editingRecordId = null;
+            renderDocumentEditor(record);
+        });
+        $('save-record').addEventListener('click', () => saveRecord(record));
+    }
+
+    function renderHumanDocument(record, editor) {
+        let value;
+        try {
+            value = JSON.parse(record.value_json);
+        } catch {
+            editor.innerHTML = `
+                <div class="document-heading">
+                    <div><h2>${escapeHtml(documentCatalog[record.record_type]?.[1] || record.record_type)}</h2></div>
+                    <button class="secondary" id="edit-record-json">Edit source</button>
+                </div>
+                <div class="document-view"><p>${escapeHtml(record.value_json)}</p></div>`;
+            $('edit-record-json').addEventListener('click', () => openRecordEditor(record));
+            return;
+        }
+        const reference = typeof value.id === 'string' ? value.id : record.id;
+        const body = Object.entries(value)
+            .filter(([key]) => key !== 'id')
+            .map(([key, child]) => renderDocumentSection(key, child))
+            .join('');
+        editor.innerHTML = `
+            <div class="document-heading">
+                <div>
+                    <h2>${escapeHtml(documentCatalog[record.record_type]?.[1] || record.record_type)}</h2>
+                    <div class="muted">${escapeHtml(record.record_type)} · revision ${record.revision}</div>
+                </div>
+                <div class="document-heading-actions">
+                    ${renderStatusTag(record.lifecycle)}
+                    <button class="secondary" id="edit-record-json">Edit structured data</button>
+                </div>
+            </div>
+            <div class="document-view">
+                ${body || '<p class="muted">This document has no authored content yet.</p>'}
+                <div class="doc-reference">Reference: ${escapeHtml(reference)}</div>
+            </div>`;
+        $('edit-record-json').addEventListener('click', () => openRecordEditor(record));
+    }
+
+    function openRecordEditor(record) {
+        state.editingRecordId = record.id;
+        renderDocumentEditor(record);
+    }
+
+    function renderDocumentSection(key, value) {
+        return `
+            <section class="doc-section">
+                <h3>${escapeHtml(humanizeDocumentKey(key))}</h3>
+                ${renderDocumentValue(value)}
+            </section>`;
+    }
+
+    function renderDocumentValue(value) {
+        if (value === null || value === undefined) return '<p class="muted">Not specified</p>';
+        if (Array.isArray(value)) {
+            if (!value.length) return '<p class="muted">None recorded</p>';
+            if (value.every(item => item === null || typeof item !== 'object')) {
+                return `<ul class="doc-list">${value.map(item => `<li>${escapeHtml(formatDocumentScalar(item))}</li>`).join('')}</ul>`;
+            }
+            return `<div class="doc-cards">${value.map((item, index) => renderDocumentCard(item, index)).join('')}</div>`;
+        }
+        if (typeof value === 'object') {
+            if (Object.prototype.hasOwnProperty.call(value, 'value')) {
+                return `
+                    ${renderDocumentValue(value.value)}
+                    ${value.status ? `<div style="margin-top:8px">${renderStatusTag(value.status)}</div>` : ''}`;
+            }
+            return renderDocumentFields(value);
+        }
+        return `<p class="doc-scalar">${escapeHtml(formatDocumentScalar(value))}</p>`;
+    }
+
+    function renderDocumentCard(item, index) {
+        if (!item || typeof item !== 'object') {
+            return `<article class="doc-card"><p>${escapeHtml(formatDocumentScalar(item))}</p></article>`;
+        }
+        const titleKey = ['title', 'name', 'time', 'act', 'decision', 'setup', 'text', 'situation']
+            .find(key => typeof item[key] === 'string' && item[key].trim());
+        const interactionTitle = typeof item.speaker === 'string' && item.speaker.trim() &&
+            typeof item.listener === 'string' && item.listener.trim()
+            ? `${item.speaker} → ${item.listener}`
+            : null;
+        const title = titleKey
+            ? item[titleKey]
+            : interactionTitle
+                ? interactionTitle
+            : Array.isArray(item.participants) && item.participants.length
+                ? item.participants.join(' ↔ ')
+            : item.day !== undefined
+                ? `Day ${item.day}`
+                : `Item ${index + 1}`;
+        const status = typeof item.status === 'string' ? item.status : null;
+        const fields = Object.entries(item).filter(([key]) =>
+            key !== titleKey && key !== 'status' && key !== 'id' &&
+            !(titleKey === undefined && key === 'day') &&
+            !(titleKey === undefined && key === 'participants') &&
+            !(interactionTitle && (key === 'speaker' || key === 'listener'))
+        );
+        const expandable = fields.length > 6;
+        const tag = expandable ? 'details' : 'article';
+        return `
+            <${tag} class="doc-card"${expandable && index === 0 ? ' open' : ''}>
+                <${expandable ? 'summary' : 'div'} class="doc-card-title">
+                    <strong>${escapeHtml(title)}</strong>
+                    ${status ? renderStatusTag(status) : ''}
+                </${expandable ? 'summary' : 'div'}>
+                ${fields.length ? `<div class="doc-fields">${fields.map(([key, child]) => renderDocumentField(key, child)).join('')}</div>` : ''}
+            </${tag}>`;
+    }
+
+    function renderDocumentFields(value) {
+        const fields = Object.entries(value).filter(([key]) => key !== 'id' && key !== 'status');
+        return `
+            ${value.status ? `<div style="margin-bottom:9px">${renderStatusTag(value.status)}</div>` : ''}
+            <div class="doc-fields">${fields.map(([key, child]) => renderDocumentField(key, child)).join('')}</div>`;
+    }
+
+    function renderDocumentField(key, value) {
+        return `
+            <div class="doc-field">
+                <div class="doc-field-label">${escapeHtml(humanizeDocumentKey(key))}</div>
+                <div>${renderDocumentValue(value)}</div>
+            </div>`;
+    }
+
+    function humanizeDocumentKey(key) {
+        const known = {
+            pov: 'POV',
+            primary_pov: 'Primary POV',
+            secondary_pov: 'Secondary POV',
+            id: 'Reference',
+            iia: 'IIA',
+            iib: 'IIB'
+        };
+        if (known[key]) return known[key];
+        return key
+            .replace(/_/g, ' ')
+            .replace(/\b\w/g, character => character.toUpperCase())
+            .replace(/\bPov\b/g, 'POV');
+    }
+
+    function formatDocumentScalar(value) {
+        if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+        return String(value).replace(/_/g, ' ');
+    }
+
+    function renderStatusTag(status) {
+        const normalized = String(status || 'unspecified');
+        const className = normalized.replace(/_/g, '-').replace(/[^a-z0-9-]/gi, '').toLowerCase();
+        return `<span class="status-tag ${className}">${escapeHtml(normalized.replace(/_/g, ' '))}</span>`;
+    }
+
+    async function saveRecord(record) {
+        const errorTarget = $('record-error');
+        errorTarget.textContent = '';
+        let normalized;
+        try {
+            const value = JSON.parse($('record-value').value);
+            if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error('Document root must be an object.');
+            normalized = JSON.stringify(value);
+        } catch (error) {
+            errorTarget.textContent = error.message;
+            return;
+        }
+        try {
+            const updated = await request(`${apiBase}/stories/${state.story.id}/records/${record.id}`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    value_json: normalized,
+                    lifecycle: $('record-lifecycle').value,
+                    expected_revision: record.revision
+                })
+            });
+            state.records = state.records.map(item => item.id === updated.id ? updated : item);
+            state.editingRecordId = null;
+            renderWorkspace();
+            renderInspector();
+        } catch (error) {
+            errorTarget.textContent = error.message;
+        }
+    }
+
+    function nodeDepth(node) {
+        let depth = 0;
+        let parentId = node.parent_id;
+        const seen = new Set();
+        while (parentId && !seen.has(parentId)) {
+            seen.add(parentId);
+            const parent = state.nodes.find(item => item.id === parentId);
+            if (!parent) break;
+            depth += 1;
+            parentId = parent.parent_id;
+        }
+        return Math.min(depth, 6);
+    }
+
+    function renderBlueprintWorkspace(target) {
+        target.innerHTML = `
+            <div class="eyebrow">${escapeHtml(state.story.title)}</div>
+            <h1>Blueprint</h1>
+            <p>Volumes, arcs, chapters, and scenes form the addressable storyboard. Beat plans and required document packages attach to these stable nodes.</p>
+            <div class="blueprint-toolbar"><button class="primary" id="add-node">+ Add node</button></div>
+            <div class="node-tree" id="node-tree"></div>`;
+        $('add-node').addEventListener('click', openNodeDialog);
+        const tree = $('node-tree');
+        if (!state.nodes.length) {
+            tree.innerHTML = '<div class="card"><h3>No structure yet</h3><p>Start with Volume 1, then add its arcs, chapters, and scenes.</p></div>';
+            return;
+        }
+        for (const node of state.nodes) {
+            const row = document.createElement('article');
+            row.className = 'node-row';
+            row.style.marginLeft = `${nodeDepth(node) * 22}px`;
+            row.innerHTML = `
+                <span class="node-type">${escapeHtml(node.node_type)}</span>
+                <div><strong>${escapeHtml(node.title)}</strong><p>${escapeHtml(node.purpose || node.synopsis || 'Purpose not documented yet.')}</p></div>
+                <span class="muted">${escapeHtml(node.lifecycle)} · r${node.revision}</span>`;
+            tree.appendChild(row);
+        }
+    }
+
+    function openNodeDialog() {
+        $('node-error').textContent = '';
+        const parent = $('node-parent');
+        parent.replaceChildren(new Option('Story root', ''));
+        for (const node of state.nodes) {
+            parent.appendChild(new Option(`${'—'.repeat(nodeDepth(node))} ${node.title} (${node.node_type})`, node.id));
+        }
+        $('node-dialog').showModal();
+        $('node-title').focus();
+    }
+
+    $('cancel-node').addEventListener('click', () => $('node-dialog').close());
+    $('node-form').addEventListener('submit', async event => {
+        event.preventDefault();
+        $('node-error').textContent = '';
+        try {
+            const node = await request(`${apiBase}/stories/${state.story.id}/nodes`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    node_type: $('node-type').value,
+                    parent_id: $('node-parent').value || null,
+                    title: $('node-title').value,
+                    purpose: $('node-purpose').value || null,
+                    synopsis: $('node-synopsis').value || null
+                })
+            });
+            state.nodes.push(node);
+            if (!state.selectedNodeId && (node.node_type === 'chapter' || node.node_type === 'scene')) {
+                state.selectedNodeId = node.id;
+                state.prose = await request(`${apiBase}/stories/${state.story.id}/nodes/${node.id}/prose`);
+            }
+            $('node-dialog').close();
+            event.target.reset();
+            renderWorkspace();
+        } catch (error) {
+            $('node-error').textContent = error.message;
+        }
+    });
+
+    async function selectManuscriptNode(nodeId) {
+        state.selectedNodeId = nodeId || null;
+        state.prose = nodeId
+            ? await request(`${apiBase}/stories/${state.story.id}/nodes/${nodeId}/prose`)
+            : null;
+        renderWorkspace();
+        renderInspector();
+    }
+
+    function renderManuscriptWorkspace(target) {
+        const proseNodes = state.nodes.filter(node => node.node_type === 'chapter' || node.node_type === 'scene');
+        const selectedNode = proseNodes.find(node => node.id === state.selectedNodeId);
+        const selectedJob = state.jobs.find(job => {
+            try { return JSON.parse(job.state_json).node_id === state.selectedNodeId && job.status !== 'complete'; }
+            catch { return false; }
+        });
+        const jobBusy = state.runningJobId === selectedJob?.id;
+        target.innerHTML = `
+            <div class="eyebrow">${escapeHtml(state.story.title)}</div>
+            <h1>Manuscript</h1>
+            <p>The readable manuscript and its editor share one surface. Every edit creates an immutable revision through a paragraph-scoped patch.</p>
+            <div class="manuscript-toolbar">
+                <select id="manuscript-node" aria-label="Chapter or scene">
+                    <option value="">Select a chapter or scene</option>
+                    ${proseNodes.map(node => `<option value="${node.id}"${node.id === state.selectedNodeId ? ' selected' : ''}>${escapeHtml(node.title)} · ${escapeHtml(node.node_type)}</option>`).join('')}
+                </select>
+                <span class="muted">${state.prose ? `${state.prose.word_count} words · ${state.prose.blocks.length} blocks` : 'No prose selected'}</span>
+                <div class="manuscript-actions">
+                    ${state.prose?.blocks.length && !selectedJob ? '<button class="secondary" id="sync-story-docs">Sync story docs</button>' : ''}
+                    ${state.prose?.blocks.length && !selectedJob ? '<button class="secondary" id="revise-section">AI revise chapter</button>' : ''}
+                    ${state.prose?.blocks.length && !selectedJob ? '<button class="secondary" id="rewrite-section">Rewrite from opening</button>' : ''}
+                    <button class="primary" id="write-section"${selectedNode ? '' : ' disabled'}>${jobBusy ? 'Writing passage…' : selectedJob ? 'Resume agent loop' : `Write ${selectedNode?.node_type || 'section'}`}</button>
+                </div>
+            </div>
+            ${selectedJob ? `<div class="job-strip"><span>Authoring job <strong>${escapeHtml(selectedJob.status)}</strong> · pass ${safeJobPass(selectedJob)}</span><span class="muted">${escapeHtml(selectedJob.id)}</span></div>` : ''}
+            <section class="prose-sheet" id="prose-sheet"></section>
+            ${selectedNode ? `
+                <div class="append-prose">
+                    <label for="append-text">Add the next paragraph</label>
+                    <textarea id="append-text" placeholder="Write a bounded passage here…"></textarea>
+                    <div class="error" id="append-error"></div>
+                    <div class="form-actions"><button class="primary" id="append-block">Append paragraph</button></div>
+                </div>` : ''}`;
+        $('manuscript-node').addEventListener('change', event => selectManuscriptNode(event.target.value).catch(showWorkspaceError));
+        if (selectedNode) {
+            const syncButton = $('sync-story-docs');
+            if (syncButton) syncButton.addEventListener('click', async () => {
+                syncButton.disabled = true;
+                syncButton.textContent = 'Syncing docs…';
+                try {
+                    await request(
+                        `${apiBase}/stories/${state.story.id}/nodes/${selectedNode.id}/documentation-sync`,
+                        { method: 'POST' }
+                    );
+                    state.records = (await request(`${apiBase}/stories/${state.story.id}/records`)).records;
+                    syncButton.textContent = 'Story docs synced';
+                    renderInspector();
+                } catch (error) {
+                    syncButton.disabled = false;
+                    syncButton.textContent = 'Sync story docs';
+                    showWorkspaceError(error);
+                }
+            });
+            $('write-section').addEventListener('click', () => {
+                if (selectedJob) continueWriterJob(selectedJob);
+                else startWriterJob(selectedNode.id, 'continue');
+            });
+            const rewriteButton = $('rewrite-section');
+            if (rewriteButton) rewriteButton.addEventListener('click', () => {
+                const sectionName = selectedNode.node_type === 'chapter' ? 'chapter' : 'scene';
+                if (!confirm(`Rewrite this ${sectionName} from its opening?\n\nThe current prose stays preserved in revision history, but the new writer loop becomes the readable version.`)) return;
+                startWriterJob(selectedNode.id, 'rewrite');
+            });
+            const reviseButton = $('revise-section');
+            if (reviseButton) reviseButton.addEventListener('click', () => {
+                $('revision-error').textContent = '';
+                $('revision-dialog').showModal();
+                $('revision-instruction').focus();
+            });
+        }
+        const sheet = $('prose-sheet');
+        if (!selectedNode) {
+            sheet.innerHTML = '<p class="muted">Add a chapter or scene in Blueprint, then select it here.</p>';
+            return;
+        }
+        if (!state.prose?.blocks.length) {
+            sheet.innerHTML = `<h2>${escapeHtml(selectedNode.title)}</h2><p class="muted">This section has no prose yet.</p>`;
+        } else {
+            const heading = document.createElement('h2');
+            heading.textContent = selectedNode.title;
+            sheet.appendChild(heading);
+            for (const block of state.prose.blocks) {
+                const element = document.createElement('div');
+                element.className = 'prose-block';
+                const paragraph = document.createElement(block.block_type === 'heading' ? 'h2' : 'p');
+                if (block.block_type === 'heading') paragraph.textContent = block.text;
+                else paragraph.innerHTML = renderInlineMarkdown(block.text);
+                const actions = document.createElement('div');
+                actions.className = 'prose-actions';
+                for (const [label, operation] of [['+', 'insert_after'], ['Edit', 'replace'], ['×', 'delete']]) {
+                    const button = document.createElement('button');
+                    button.className = 'icon-button';
+                    button.textContent = label;
+                    button.title = operation.replace('_', ' ');
+                    button.addEventListener('click', () => openProseDialog(operation, block));
+                    actions.appendChild(button);
+                }
+                element.append(paragraph, actions);
+                sheet.appendChild(element);
+            }
+        }
+        $('append-block').addEventListener('click', event => {
+            event.preventDefault();
+            applyProsePatch('append', null, $('append-text').value, $('append-error'));
+        });
+    }
+
+    function openProseDialog(operation, block) {
+        if (operation === 'delete') {
+            if (confirm('Delete this paragraph in a new manuscript revision?')) {
+                applyProsePatch(operation, block.id, null, null);
+            }
+            return;
+        }
+        $('prose-dialog-title').textContent = operation === 'replace' ? 'Edit paragraph' : 'Insert paragraph after';
+        $('prose-operation').value = operation;
+        $('prose-anchor').value = block.id;
+        $('prose-text').value = operation === 'replace' ? block.text : '';
+        $('prose-error').textContent = '';
+        $('prose-dialog').showModal();
+        $('prose-text').focus();
+    }
+
+    $('cancel-prose').addEventListener('click', () => $('prose-dialog').close());
+    $('cancel-revision').addEventListener('click', () => $('revision-dialog').close());
+    $('revision-form').addEventListener('submit', event => {
+        event.preventDefault();
+        const instruction = $('revision-instruction').value.trim();
+        if (!instruction) {
+            $('revision-error').textContent = 'Describe what the revision should improve.';
+            return;
+        }
+        $('revision-dialog').close();
+        startWriterJob(state.selectedNodeId, 'revise', instruction);
+    });
+    $('prose-form').addEventListener('submit', event => {
+        event.preventDefault();
+        applyProsePatch(
+            $('prose-operation').value,
+            $('prose-anchor').value || null,
+            $('prose-text').value,
+            $('prose-error')
+        ).then(() => $('prose-dialog').close());
+    });
+
+    async function applyProsePatch(operation, anchorBlockId, text, errorTarget) {
+        if (errorTarget) errorTarget.textContent = '';
+        try {
+            state.prose = await request(`${apiBase}/stories/${state.story.id}/nodes/${state.selectedNodeId}/prose`, {
+                method: 'PATCH',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    base_revision_id: state.prose?.revision_id || null,
+                    operation,
+                    anchor_block_id: anchorBlockId,
+                    text: text || null,
+                    block_type: 'paragraph',
+                    author_source: 'user'
+                })
+            });
+            state.story.active_version += 1;
+            const listed = state.stories.find(story => story.id === state.story.id);
+            if (listed) listed.active_version = state.story.active_version;
+            renderStories();
+            renderWorkspace();
+            renderInspector();
+        } catch (error) {
+            if (errorTarget) errorTarget.textContent = error.message;
+            else alert(error.message);
+            throw error;
+        }
+    }
+
+    function showWorkspaceError(error) {
+        $('workspace').innerHTML = `<h1>Unable to open manuscript</h1><p>${escapeHtml(error.message)}</p>`;
+    }
+
+    function safeJobPass(job) {
+        try { return JSON.parse(job.state_json).pass || 0; } catch { return 0; }
+    }
+
+    async function startWriterJob(nodeId, mode = 'continue', instruction = '') {
+        try {
+            const job = await request(`${apiBase}/stories/${state.story.id}/jobs`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({node_id: nodeId, mode, instruction})
+            });
+            state.jobs.unshift(job);
+            await continueWriterJob(job);
+        } catch (error) {
+            alert(error.message);
+        }
+    }
+
+    async function continueWriterJob(initialJob) {
+        let job = initialJob;
+        let qualityRetries = 0;
+        state.runningJobId = job.id;
+        renderWorkspace();
+        try {
+            while (job.status !== 'complete') {
+                try {
+                    job = await request(`${apiBase}/jobs/${job.id}/step`, {method: 'POST'});
+                    qualityRetries = 0;
+                } catch (error) {
+                    if (error.message.includes('fiction readability gate') && qualityRetries < 2) {
+                        qualityRetries += 1;
+                        const refreshed = await request(`${apiBase}/stories/${state.story.id}/jobs`);
+                        state.jobs = refreshed.jobs || state.jobs;
+                        job = state.jobs.find(item => item.id === job.id) || job;
+                        continue;
+                    }
+                    throw error;
+                }
+                state.jobs = state.jobs.map(item => item.id === job.id ? job : item);
+                state.prose = await request(`${apiBase}/stories/${state.story.id}/nodes/${state.selectedNodeId}/prose`);
+                state.story.active_version += 1;
+                const listed = state.stories.find(story => story.id === state.story.id);
+                if (listed) listed.active_version = state.story.active_version;
+                renderStories();
+                renderWorkspace();
+                if (job.status === 'paused') break;
+                await new Promise(resolve => setTimeout(resolve, 30));
+            }
+        } catch (error) {
+            alert(error.message);
+            const refreshed = await request(`${apiBase}/stories/${state.story.id}/jobs`).catch(() => null);
+            if (refreshed) state.jobs = refreshed.jobs || state.jobs;
+        } finally {
+            state.runningJobId = null;
+            renderWorkspace();
+            renderInspector();
+        }
+    }
+
+    function renderAuthorRoom(target) {
+        target.innerHTML = `
+            <div class="eyebrow">${escapeHtml(state.story.title)}</div>
+            <h1>Author Room</h1>
+            <p>Talk normally with a collaborator who receives the story identity, typed documents, and a bounded recent conversation—not the full manuscript or ordinary ClawForge chat history.</p>
+            <div class="author-room">
+                <div class="author-messages" id="author-messages"></div>
+                <form class="author-compose" id="author-compose">
+                    <textarea id="author-input" placeholder="Ask a question, explore an arc, or clarify what you want…"></textarea>
+                    <div class="error" id="author-error"></div>
+                    <div class="author-compose-row">
+                        <span class="muted">Conversation cannot silently change canon. Decision proposals will remain approval-gated.</span>
+                        <button class="primary" id="author-send">Send</button>
+                    </div>
+                </form>
+            </div>`;
+        const messages = $('author-messages');
+        if (!state.authorMessages.length) {
+            messages.innerHTML = '<div class="empty">Start by describing what you want to decide, or ask the collaborator what is still missing.</div>';
+        } else {
+            for (const message of state.authorMessages) {
+                const element = document.createElement('article');
+                element.className = `author-message ${message.role}`;
+                const meta = document.createElement('div');
+                meta.className = 'author-message-meta';
+                meta.textContent = message.role === 'user'
+                    ? 'You'
+                    : `Narrative collaborator${message.model_used ? ` · ${message.model_used}` : ''}`;
+                const content = document.createElement('div');
+                if (message.role === 'assistant') {
+                    content.className = 'markdown-body';
+                    content.innerHTML = renderMarkdown(message.content);
+                } else {
+                    content.textContent = message.content;
+                }
+                element.append(meta, content);
+                messages.appendChild(element);
+            }
+            messages.scrollTop = messages.scrollHeight;
+        }
+        $('author-compose').addEventListener('submit', sendAuthorTurn);
+    }
+
+    async function sendAuthorTurn(event) {
+        event.preventDefault();
+        const input = $('author-input');
+        const text = input.value.trim();
+        if (!text) return;
+        const errorTarget = $('author-error');
+        const send = $('author-send');
+        errorTarget.textContent = '';
+        send.disabled = true;
+        send.textContent = 'Thinking…';
+        state.authorMessages.push({
+            id: `local-${Date.now()}`,
+            role: 'user',
+            content: text,
+            model_used: null
+        });
+        renderAuthorRoom($('workspace'));
+        $('author-send').disabled = true;
+        $('author-send').textContent = 'Thinking…';
+        try {
+            const assistant = await request(`${apiBase}/stories/${state.story.id}/author-room/turn`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({message: text})
+            });
+            state.authorMessages = state.authorMessages.filter(message => !String(message.id).startsWith('local-'));
+            const refreshed = await request(`${apiBase}/stories/${state.story.id}/author-room/messages`);
+            state.authorMessages = refreshed.messages || [assistant];
+            renderWorkspace();
+        } catch (error) {
+            state.authorMessages = state.authorMessages.filter(message => !String(message.id).startsWith('local-'));
+            renderAuthorRoom($('workspace'));
+            $('author-error').textContent = error.message;
+        }
+    }
+
+    const discoveryRecordTypes = [
+        'StoryIdentity', 'StoryIntentProfile', 'StoryContract', 'StoryStructureRoot',
+        'NarratorContract', 'StyleContract', 'InformationDeliveryContract',
+        'ComedyContract', 'RelationalTextureContract', 'QualityGateContract'
+    ];
+
+    function discoveryCoverage() {
+        const complete = state.records.filter(record =>
+            discoveryRecordTypes.includes(record.record_type) &&
+            record.lifecycle === 'accepted' &&
+            record.value_json !== '{}'
+        ).length;
+        return {complete, total: discoveryRecordTypes.length};
+    }
+
+    function renderDiscoveryWorkspace(target) {
+        const coverage = discoveryCoverage();
+        const percent = Math.round((coverage.complete / coverage.total) * 100);
+        const pendingCount = state.discoveryChanges.filter(change => change.status === 'pending').length;
+        const hasQuickstart = state.discoveryMessages.some(message =>
+            message.role === 'user' && message.content.startsWith('Quickstart premise:'));
+        target.innerHTML = `
+            <div class="eyebrow">${escapeHtml(state.story.title)}</div>
+            <h1>Guided Discovery</h1>
+            <p>The model interviews you in focused batches, helps expose tradeoffs, and proposes typed story documents. Nothing becomes accepted documentation until you approve it.</p>
+            <section class="card quickstart-card">
+                <h2>Quickstart Architect</h2>
+                <p>Give the architect one premise. It will invent a complete, internally consistent provisional foundation across all 19 story documents before writing prose.</p>
+                <textarea id="quickstart-premise" placeholder="A gravity mage negates the gravity of everything his hands touch…">${escapeHtml(state.story.premise || '')}</textarea>
+                <div class="error" id="quickstart-error"></div>
+                <div class="author-compose-row">
+                    <span class="muted">Invented choices remain provisional and revision-tracked.</span>
+                    <div class="button-row">
+                        ${hasQuickstart && pendingCount ? `<button class="secondary" id="quickstart-accept">Accept all ${pendingCount} current documents</button>` : ''}
+                        <button class="primary" id="quickstart-design">${hasQuickstart ? 'Redesign from premise' : 'Design complete foundation'}</button>
+                    </div>
+                </div>
+            </section>
+            <div class="discovery-layout">
+                <section class="discovery-panel">
+                    <div class="discovery-header">
+                        <h2>Story interview</h2>
+                        <span class="muted">${coverage.complete} of ${coverage.total} foundational documents accepted</span>
+                        <div class="discovery-progress"><span style="width:${percent}%"></span></div>
+                    </div>
+                    <div class="discovery-messages" id="discovery-messages"></div>
+                    <form class="discovery-compose" id="discovery-compose">
+                        <textarea id="discovery-input" placeholder="Answer the current questions in your own words…"></textarea>
+                        <div class="error" id="discovery-error"></div>
+                        <div class="author-compose-row">
+                            <span class="muted">Answers can stay provisional until you are ready.</span>
+                            <div class="button-row">
+                                ${state.discoveryMessages.length ? '<button class="secondary" type="button" id="discovery-help">Help me decide</button>' : ''}
+                                <button class="primary" id="discovery-send">${state.discoveryMessages.length ? 'Answer & continue' : 'Start guided discovery'}</button>
+                            </div>
+                        </div>
+                    </form>
+                </section>
+                <aside class="discovery-panel" style="display:block;position:static;border-right:1px solid var(--border)">
+                    <div class="discovery-header"><h2>Proposed document changes</h2><span class="muted">Review before they become authorial decisions.</span></div>
+                    <div class="proposal-list" id="discovery-proposals"></div>
+                </aside>
+            </div>`;
+        renderDiscoveryMessages();
+        renderDiscoveryProposals();
+        $('quickstart-design').addEventListener('click', runQuickstartArchitect);
+        if ($('quickstart-accept')) $('quickstart-accept').addEventListener('click', acceptQuickstartFoundation);
+        $('discovery-compose').addEventListener('submit', sendDiscoveryTurn);
+        if ($('discovery-help')) $('discovery-help').addEventListener('click', requestDecisionWorkshop);
+    }
+
+    function renderDiscoveryMessages() {
+        const container = $('discovery-messages');
+        if (!state.discoveryMessages.length) {
+            container.innerHTML = `
+                <div class="card">
+                    <h3>Begin with intent, not paperwork</h3>
+                    <p>The first turn asks about the experience you want, the destination of the first volume, and the story elements you already care about. Later questions narrow structure, voice, relationships, comedy, information delivery, and pacing.</p>
+                </div>`;
+            return;
+        }
+        for (const message of state.discoveryMessages) {
+            const element = document.createElement('article');
+            element.className = `author-message ${message.role}`;
+            const meta = document.createElement('div');
+            meta.className = 'author-message-meta';
+            meta.textContent = message.role === 'user' ? 'Your answer' : 'Discovery director';
+            const content = document.createElement('div');
+            if (message.role === 'assistant') {
+                content.className = 'markdown-body';
+                content.innerHTML = renderMarkdown(message.content);
+            } else {
+                content.textContent = message.content;
+            }
+            element.append(meta, content);
+            container.appendChild(element);
+        }
+        container.scrollTop = container.scrollHeight;
+    }
+
+    function renderDiscoveryProposals() {
+        const container = $('discovery-proposals');
+        const active = state.discoveryChanges.filter(change => change.status === 'pending');
+        if (!active.length) {
+            container.innerHTML = '<div class="empty">Document proposals will appear here as your answers become specific enough.</div>';
+            return;
+        }
+        for (const change of active) {
+            const history = state.discoveryChanges
+                .filter(item => item.record_type === change.record_type && item.id !== change.id)
+                .sort((a, b) => b.revision - a.revision);
+            let formatted = change.value_json;
+            try { formatted = JSON.stringify(JSON.parse(change.value_json), null, 2); } catch {}
+            const diff = describeJsonChanges(change.accepted_value_json, change.value_json);
+            const card = document.createElement('article');
+            card.className = 'proposal-card pending';
+            card.innerHTML = `
+                <h3>${escapeHtml(documentCatalog[change.record_type]?.[1] || change.record_type)}</h3>
+                <span class="muted">pending revision ${change.revision}${history.length ? ` · ${history.length} earlier revision(s)` : ''}</span>
+                <p class="muted">${escapeHtml(change.rationale || '')}</p>
+                <details open>
+                    <summary class="muted">Changes from accepted document</summary>
+                    <ul class="change-summary">${diff.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>
+                </details>
+                <details><summary class="muted">Inspect complete proposed record</summary><pre>${escapeHtml(formatted)}</pre></details>
+                ${history.length ? `
+                    <details><summary class="muted">Revision history (${history.length})</summary>
+                        <div class="revision-history">${history.map(item => `
+                            <div><strong>r${item.revision}</strong> · ${escapeHtml(item.status)}
+                            <span class="muted"> · ${new Date(item.created_at * 1000).toLocaleString()}</span></div>
+                        `).join('')}</div>
+                    </details>` : ''}
+                <div class="proposal-actions">
+                    <button class="secondary reject-proposal">Reject this revision</button>
+                    <button class="primary accept-proposal">Accept document</button>
+                </div>`;
+            card.querySelector('.accept-proposal').addEventListener('click', () => decideDiscoveryDocumentChange(change.id, true));
+            card.querySelector('.reject-proposal').addEventListener('click', () => decideDiscoveryDocumentChange(change.id, false));
+            container.appendChild(card);
+        }
+    }
+
+    function describeJsonChanges(beforeJson, afterJson) {
+        let before = {}, after = {};
+        try { before = JSON.parse(beforeJson || '{}'); } catch {}
+        try { after = JSON.parse(afterJson || '{}'); } catch {}
+        const changes = [];
+        const walk = (oldValue, newValue, path) => {
+            if (changes.length >= 12) return;
+            if (JSON.stringify(oldValue) === JSON.stringify(newValue)) return;
+            const oldObject = oldValue && typeof oldValue === 'object' && !Array.isArray(oldValue);
+            const newObject = newValue && typeof newValue === 'object' && !Array.isArray(newValue);
+            if (oldObject && newObject) {
+                for (const key of new Set([...Object.keys(oldValue), ...Object.keys(newValue)]))
+                    walk(oldValue[key], newValue[key], path ? `${path}.${key}` : key);
+                return;
+            }
+            const compact = value => {
+                if (value === undefined) return '(not set)';
+                const text = typeof value === 'string' ? value : JSON.stringify(value);
+                return text.length > 90 ? `${text.slice(0, 87)}…` : text;
+            };
+            changes.push(`${path || 'document'}: ${compact(oldValue)} → ${compact(newValue)}`);
+        };
+        walk(before, after, '');
+        if (!changes.length) changes.push('No field-level difference from the accepted document.');
+        else if (changes.length >= 12) changes.push('Additional changes are available in the complete record.');
+        return changes;
+    }
+
+    async function sendDiscoveryTurn(event) {
+        event.preventDefault();
+        const input = $('discovery-input');
+        const message = input.value.trim() || (state.discoveryMessages.length
+            ? ''
+            : 'Begin guided discovery. Ask me the highest-value opening questions before proposing any documentation.');
+        if (!message) {
+            $('discovery-error').textContent = 'Answer the current questions before continuing.';
+            return;
+        }
+        await submitDiscoveryMessage(message, 'Thinking…');
+    }
+
+    async function requestDecisionWorkshop() {
+        const input = $('discovery-input');
+        const notes = input.value.trim();
+        const message = [
+            'I am not ready to lock the current decisions yet. Help me decide by turning them into a decision workshop.',
+            'Use the imported story evidence. Give me a few genuinely viable directions with brief story-specific examples, explain their downstream consequences, and recommend the best fit.',
+            'Treat any preference I express as provisional unless I explicitly confirm it.',
+            notes ? `What I know or suspect so far: ${notes}` : ''
+        ].filter(Boolean).join('\n\n');
+        await submitDiscoveryMessage(message, 'Building options…');
+    }
+
+    async function runQuickstartArchitect() {
+        const premise = $('quickstart-premise').value.trim();
+        if (!premise) {
+            $('quickstart-error').textContent = 'Enter a basic premise first.';
+            return;
+        }
+        const button = $('quickstart-design');
+        button.disabled = true;
+        button.textContent = 'Architecting 19 documents…';
+        $('quickstart-error').textContent = '';
+        try {
+            await request(`${apiBase}/stories/${state.story.id}/quickstart/design`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({premise})
+            });
+            await loadSelectedStory();
+        } catch (error) {
+            button.disabled = false;
+            button.textContent = 'Design complete foundation';
+            $('quickstart-error').textContent = error.message;
+        }
+    }
+
+    async function acceptQuickstartFoundation() {
+        const button = $('quickstart-accept');
+        button.disabled = true;
+        button.textContent = 'Accepting foundation…';
+        $('quickstart-error').textContent = '';
+        try {
+            const result = await request(`${apiBase}/stories/${state.story.id}/quickstart/accept`, {method: 'POST'});
+            state.selectedNodeId = result.chapter_id;
+            state.workspace = 'Manuscript';
+            localStorage.setItem('clawforge.narrative.workspace', state.workspace);
+            await loadSelectedStory();
+        } catch (error) {
+            button.disabled = false;
+            button.textContent = 'Accept current foundation';
+            $('quickstart-error').textContent = error.message;
+        }
+    }
+
+    async function submitDiscoveryMessage(message, busyLabel) {
+        const input = $('discovery-input');
+        const button = $('discovery-send');
+        const helpButton = $('discovery-help');
+        button.disabled = true;
+        button.textContent = busyLabel;
+        if (helpButton) helpButton.disabled = true;
+        $('discovery-error').textContent = '';
+        try {
+            await request(`${apiBase}/stories/${state.story.id}/discovery/turn`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({message})
+            });
+            const [messages, proposals, changes] = await Promise.all([
+                request(`${apiBase}/stories/${state.story.id}/discovery/messages`),
+                request(`${apiBase}/stories/${state.story.id}/discovery/proposals`),
+                request(`${apiBase}/stories/${state.story.id}/discovery/changes`)
+            ]);
+            state.discoveryMessages = messages.messages || [];
+            state.discoveryProposals = proposals.proposals || [];
+            state.discoveryChanges = changes.changes || [];
+            renderWorkspace();
+        } catch (error) {
+            button.disabled = false;
+            button.textContent = state.discoveryMessages.length ? 'Answer & continue' : 'Start guided discovery';
+            if (helpButton) helpButton.disabled = false;
+            $('discovery-error').textContent = error.message;
+        }
+    }
+
+    async function decideDiscoveryProposal(proposalId, accept) {
+        try {
+            await request(`${apiBase}/stories/${state.story.id}/discovery/proposals/${proposalId}/${accept ? 'accept' : 'reject'}`, {
+                method: 'POST'
+            });
+            const [recordData, proposalData] = await Promise.all([
+                request(`${apiBase}/stories/${state.story.id}/records`),
+                request(`${apiBase}/stories/${state.story.id}/discovery/proposals`)
+            ]);
+            state.records = recordData.records || [];
+            state.discoveryProposals = proposalData.proposals || [];
+            renderWorkspace();
+            renderInspector();
+        } catch (error) {
+            alert(error.message);
+        }
+    }
+
+    async function decideDiscoveryDocumentChange(changeId, accept) {
+        try {
+            await request(`${apiBase}/stories/${state.story.id}/discovery/changes/${changeId}/${accept ? 'accept' : 'reject'}`, {
+                method: 'POST'
+            });
+            const [recordData, changeData] = await Promise.all([
+                request(`${apiBase}/stories/${state.story.id}/records`),
+                request(`${apiBase}/stories/${state.story.id}/discovery/changes`)
+            ]);
+            state.records = recordData.records || [];
+            state.discoveryChanges = changeData.changes || [];
+            renderWorkspace();
+            renderInspector();
+        } catch (error) {
+            alert(error.message);
+        }
+    }
+
+    function renderInspector() {
+        const container = $('inspector-content');
+        if (!state.story) {
+            container.innerHTML = '<p class="muted">Select or create a story.</p>';
+            return;
+        }
+        container.innerHTML = `
+            <div class="inspector-section">
+                <div class="kv"><span>Story</span><strong>${escapeHtml(state.story.title)}</strong></div>
+                <div class="kv"><span>Branch</span><span>Main</span></div>
+                <div class="kv"><span>Version</span><span>${state.story.active_version}</span></div>
+                <div class="kv"><span>Workspace</span><span>${escapeHtml(state.workspace)}</span></div>
+            </div>
+            <div class="inspector-section">
+                <h2>Model profile</h2>
+                <div class="kv"><span>Default</span><span>${escapeHtml(state.profile?.default_model || 'Daemon default')}</span></div>
+                <div class="kv"><span>Revision</span><span>${state.profile?.revision || 1}</span></div>
+            </div>`;
+    }
+
+    async function loadModels() {
+        try {
+            const data = await request('/api/models');
+            state.models = data.providers || [];
+            const select = $('model-select');
+            select.replaceChildren(new Option('Daemon default', ''));
+            for (const provider of state.models) {
+                const group = document.createElement('optgroup');
+                group.label = provider.name;
+                for (const item of provider.models || []) {
+                    const model = typeof item === 'string' ? { id: item } : item;
+                    const label = model.id.includes(':') ? model.id.slice(model.id.indexOf(':') + 1) : model.id;
+                    group.appendChild(new Option(label, model.id));
+                }
+                select.appendChild(group);
+            }
+            syncModelSelection();
+        } catch (error) {
+            console.error(error);
+        }
+    }
+
+    function syncModelSelection() {
+        $('model-select').value = state.profile?.default_model || '';
+    }
+
+    $('model-select').addEventListener('change', async event => {
+        if (!state.story || !state.profile) return;
+        try {
+            state.profile = await request(`${apiBase}/stories/${state.story.id}/model-profile`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    default_model: event.target.value || null,
+                    role_overrides_json: state.profile.role_overrides_json || '{}',
+                    expected_revision: state.profile.revision
+                })
+            });
+            renderInspector();
+        } catch (error) {
+            alert(error.message);
+            syncModelSelection();
+        }
+    });
+
+    function openCreateDialog() {
+        $('form-error').textContent = '';
+        $('story-dialog').showModal();
+        $('story-title').focus();
+    }
+    $('new-story').addEventListener('click', openCreateDialog);
+    $('cancel-story').addEventListener('click', () => $('story-dialog').close());
+    $('story-form').addEventListener('submit', async event => {
+        event.preventDefault();
+        $('form-error').textContent = '';
+        try {
+            const premise = $('story-premise').value;
+            const quickstart = $('story-quickstart').checked && premise.trim().length > 0;
+            const story = await request(`${apiBase}/stories`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    title: $('story-title').value,
+                    premise: premise || null,
+                    genre: $('story-genre').value || null,
+                    default_model: $('model-select').value || null
+                })
+            });
+            $('story-dialog').close();
+            event.target.reset();
+            state.stories.unshift(story);
+            state.story = story;
+            state.workspace = quickstart ? 'Discovery' : 'Dashboard';
+            renderStories();
+            await loadSelectedStory();
+            if (quickstart) {
+                $('quickstart-premise').value = premise;
+                await runQuickstartArchitect();
+            }
+        } catch (error) {
+            $('form-error').textContent = error.message;
+        }
+    });
+
+    function escapeHtml(value) {
+        return String(value).replace(/[&<>"']/g, character => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        })[character]);
+    }
+
+    function renderMarkdown(value) {
+        const source = escapeHtml(String(value || ''));
+        if (typeof marked === 'undefined') return source.replace(/\n/g, '<br>');
+        let html;
+        try {
+            html = marked.parse(source, {breaks: true, gfm: true});
+        } catch {
+            return source.replace(/\n/g, '<br>');
+        }
+        const template = document.createElement('template');
+        template.innerHTML = html;
+        for (const anchor of template.content.querySelectorAll('a')) {
+            const href = anchor.getAttribute('href') || '';
+            if (!/^(https?:|mailto:|#|\/)/i.test(href)) {
+                anchor.removeAttribute('href');
+                continue;
+            }
+            if (/^https?:/i.test(href)) {
+                anchor.target = '_blank';
+                anchor.rel = 'noopener noreferrer';
+            }
+        }
+        for (const image of template.content.querySelectorAll('img')) {
+            const src = image.getAttribute('src') || '';
+            if (!/^https?:/i.test(src)) image.remove();
+            else {
+                image.loading = 'lazy';
+                image.referrerPolicy = 'no-referrer';
+            }
+        }
+        return template.innerHTML;
+    }
+
+    function renderInlineMarkdown(value) {
+        const source = escapeHtml(String(value || ''));
+        if (typeof marked === 'undefined' || typeof marked.parseInline !== 'function') {
+            return source;
+        }
+        let html;
+        try {
+            html = marked.parseInline(source, {gfm: true});
+        } catch {
+            return source;
+        }
+        const template = document.createElement('template');
+        template.innerHTML = html;
+        for (const anchor of template.content.querySelectorAll('a')) {
+            const href = anchor.getAttribute('href') || '';
+            if (!/^(https?:|mailto:|#|\/)/i.test(href)) {
+                anchor.replaceWith(document.createTextNode(anchor.textContent || ''));
+                continue;
+            }
+            if (/^https?:/i.test(href)) {
+                anchor.target = '_blank';
+                anchor.rel = 'noopener noreferrer';
+            }
+        }
+        for (const image of template.content.querySelectorAll('img')) {
+            image.replaceWith(document.createTextNode(image.alt || ''));
+        }
+        return template.innerHTML;
+    }
+
+    Promise.all([loadModels(), loadStories()]).catch(error => {
+        $('workspace').innerHTML = `<h1>Narrative Studio failed to load</h1><p>${escapeHtml(error.message)}</p>`;
+    });
+})();
+</script>
+</body>
+</html>

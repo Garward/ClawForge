@@ -12,7 +12,7 @@ pub const definition = registry.ToolDefinition{
         " Supports: +, -, *, /, **, %, round, sqrt, min, max, abs, ceil, floor, log, pi, e." ++
         " Weight units: g, kg, oz, lb, mg. Volume: ml, l, fl_oz, cup, tbsp, tsp, gal. Temp: c, f, k.",
     .input_schema_json =
-        \\{"type":"object","properties":{"expression":{"type":"string","description":"A math expression to evaluate, e.g. '22.86 / 150' or 'round(3.14, 1)'"},"expressions":{"type":"array","items":{"type":"string"},"description":"Batch: list of expressions to evaluate at once"},"convert":{"type":"number","description":"Value to convert between units"},"from":{"type":"string","description":"Source unit for conversion"},"to":{"type":"string","description":"Target unit for conversion"},"sort":{"type":"array","items":{"type":"object"},"description":"List of objects to sort"},"by":{"type":"string","description":"Key to sort by"},"order":{"type":"string","description":"Sort order: 'asc' or 'desc'"},"label":{"type":"string","description":"Optional label for the result"}}}
+    \\{"type":"object","properties":{"expression":{"type":"string","description":"A math expression to evaluate, e.g. '22.86 / 150' or 'round(3.14, 1)'"},"expressions":{"type":"array","items":{"type":"string"},"description":"Batch: list of expressions to evaluate at once"},"convert":{"type":"number","description":"Value to convert between units"},"from":{"type":"string","description":"Source unit for conversion"},"to":{"type":"string","description":"Target unit for conversion"},"sort":{"type":"array","items":{"type":"object"},"description":"List of objects to sort"},"by":{"type":"string","description":"Key to sort by"},"order":{"type":"string","description":"Sort order: 'asc' or 'desc'"},"label":{"type":"string","description":"Optional label for the result"}}}
     ,
     .requires_confirmation = false,
     .handler = &execute,
@@ -37,7 +37,7 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
         return .{ .content = "Failed to resolve calc script", .is_error = true };
     defer allocator.free(script);
 
-    const result = std.process.Child.run(.{
+    const result = common.process.run(.{
         .allocator = allocator,
         .argv = &.{ python, script, input_str },
         .max_output_bytes = 64 * 1024,

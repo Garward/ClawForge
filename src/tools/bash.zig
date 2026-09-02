@@ -1,14 +1,17 @@
 const std = @import("std");
 const json = std.json;
+const common = @import("common");
 const registry = @import("registry.zig");
 
 pub const definition = registry.ToolDefinition{
     .name = "bash",
     .description = "Execute a shell command. For running builds, git, ls, grep, and system utilities ONLY. " ++
-        "Use dedicated tools first for code understanding and modification: file_read for reading, file_diff for edits, file_write for new files, zig_test for compiler diagnostics. " ++
+        "Use dedicated tools first for code understanding and modification: file_find for locating paths, file_read for reading, file_diff for edits, file_write for new files, zig_test for compiler diagnostics. " ++
         "Use bash for builds, searches, git, and system utilities when a dedicated tool does not fit. " ++
         "Do NOT use bash as a substitute for normal file reading or file editing. " ++
-        "File write commands (cat >, echo >, sed -i) are blocked — use the dedicated file tools instead.",
+        "File write commands (cat >, echo >, sed -i, Python/Node/Ruby/Perl file-writing scripts) are blocked. " ++
+        "Do not generate long heredocs or scripts to create/edit files: they will be rejected after wasting tokens. " ++
+        "Use file_write for new files and file_diff for edits.",
     .input_schema_json =
     \\{"type":"object","properties":{"command":{"type":"string","description":"The bash command to execute"}},"required":["command"]}
     ,
@@ -28,10 +31,9 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
         return .{ .content = "Missing 'command' parameter", .is_error = true };
     };
 
-    // Block self-curling — deadlocks the single-threaded server
-    if (std.mem.indexOf(u8, command, "127.0.0.1:8081") != null or
-        std.mem.indexOf(u8, command, "localhost:8081") != null)
-    {
+    // Block actual self-HTTP calls. Do not block code generation that merely
+    // writes the local ClawForge URL into a source file or README.
+    if (isSelfHttpCommand(allocator, command)) {
         return .{
             .content = "BLOCKED: Cannot HTTP request your own server during a conversation (deadlock). Use sqlite3 to query the database directly: sqlite3 \"$CLAWFORGE_ROOT/data/workspace.db\" \"<SQL>\"",
             .model_content = "BLOCKED: Local self-HTTP request rejected to avoid deadlock. Query the SQLite DB directly instead.",
@@ -64,8 +66,16 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
         };
     }
 
+    if (isScriptedFileWriteCommand(allocator, command)) {
+        return .{
+            .content = "BLOCKED: This bash command appears to use a scripting language to create or edit files. Use file_write for new files or file_diff for edits. Bash is for builds, git, searches, and system utilities only.",
+            .model_content = "BLOCKED: Scripted file writes through bash are disabled. Use file_write/file_diff instead.",
+            .is_error = true,
+        };
+    }
+
     // Execute with 30s timeout
-    const result = std.process.Child.run(.{
+    const result = common.process.run(.{
         .allocator = allocator,
         .argv = &.{ "/usr/bin/timeout", "30", "/bin/bash", "-c", command },
         .max_output_bytes = 1024 * 1024, // 1MB limit
@@ -105,4 +115,87 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
             .is_error = false,
         };
     }
+}
+
+fn isSelfHttpCommand(allocator: std.mem.Allocator, command: []const u8) bool {
+    const lower = std.ascii.allocLowerString(allocator, command) catch command;
+    defer if (lower.ptr != command.ptr) allocator.free(lower);
+
+    const has_self_target = std.mem.indexOf(u8, lower, "127.0.0.1:8081") != null or
+        std.mem.indexOf(u8, lower, "localhost:8081") != null or
+        std.mem.indexOf(u8, lower, "0.0.0.0:8081") != null or
+        std.mem.indexOf(u8, lower, "/dev/tcp/127.0.0.1/8081") != null or
+        std.mem.indexOf(u8, lower, "/dev/tcp/localhost/8081") != null;
+    if (!has_self_target) return false;
+
+    return containsShellWord(lower, "curl") or
+        containsShellWord(lower, "wget") or
+        containsShellWord(lower, "http") or
+        containsShellWord(lower, "https") or
+        containsShellWord(lower, "xh") or
+        containsShellWord(lower, "websocat") or
+        containsShellWord(lower, "nc") or
+        containsShellWord(lower, "netcat") or
+        containsShellWord(lower, "telnet") or
+        std.mem.indexOf(u8, lower, "/dev/tcp/127.0.0.1/8081") != null or
+        std.mem.indexOf(u8, lower, "/dev/tcp/localhost/8081") != null;
+}
+
+fn isScriptedFileWriteCommand(allocator: std.mem.Allocator, command: []const u8) bool {
+    const lower = std.ascii.allocLowerString(allocator, command) catch command;
+    defer if (lower.ptr != command.ptr) allocator.free(lower);
+
+    const has_script_runner = containsShellWord(lower, "python") or
+        containsShellWord(lower, "python3") or
+        containsShellWord(lower, "node") or
+        containsShellWord(lower, "ruby") or
+        containsShellWord(lower, "perl");
+    if (!has_script_runner) return false;
+
+    if (std.mem.indexOf(u8, lower, ".write_text(") != null or
+        std.mem.indexOf(u8, lower, ".write_bytes(") != null or
+        std.mem.indexOf(u8, lower, ".write(") != null or
+        std.mem.indexOf(u8, lower, "writefile") != null or
+        std.mem.indexOf(u8, lower, "writefilesync") != null or
+        std.mem.indexOf(u8, lower, "copyfile") != null or
+        std.mem.indexOf(u8, lower, "shutil.copy") != null)
+    {
+        return true;
+    }
+
+    const opens_for_write = std.mem.indexOf(u8, lower, "open(") != null and
+        (std.mem.indexOf(u8, lower, ",'w") != null or
+            std.mem.indexOf(u8, lower, ", 'w") != null or
+            std.mem.indexOf(u8, lower, ",\"w") != null or
+            std.mem.indexOf(u8, lower, ", \"w") != null or
+            std.mem.indexOf(u8, lower, "mode='w") != null or
+            std.mem.indexOf(u8, lower, "mode=\"w") != null or
+            std.mem.indexOf(u8, lower, ",'a") != null or
+            std.mem.indexOf(u8, lower, ", 'a") != null or
+            std.mem.indexOf(u8, lower, ",\"a") != null or
+            std.mem.indexOf(u8, lower, ", \"a") != null or
+            std.mem.indexOf(u8, lower, "mode='a") != null or
+            std.mem.indexOf(u8, lower, "mode=\"a") != null);
+    if (opens_for_write) return true;
+
+    return false;
+}
+
+fn containsShellWord(haystack: []const u8, word: []const u8) bool {
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, start, word)) |idx| {
+        const before_ok = idx == 0 or isShellWordBoundary(haystack[idx - 1]);
+        const end = idx + word.len;
+        const after_ok = end >= haystack.len or isShellWordBoundary(haystack[end]);
+        if (before_ok and after_ok) return true;
+        start = idx + word.len;
+    }
+    return false;
+}
+
+fn isShellWordBoundary(c: u8) bool {
+    return std.ascii.isWhitespace(c) or switch (c) {
+        ';', '&', '|', '(', ')', '{', '}', '[', ']', '<', '>', '"', '\'', '`' => true,
+        else => false,
+    };
 }

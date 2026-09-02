@@ -3,6 +3,7 @@ const json = std.json;
 const common = @import("common");
 const api_messages = @import("api").messages;
 const bash = @import("bash.zig");
+const file_find = @import("file_find.zig");
 const file_read = @import("file_read.zig");
 const file_write = @import("file_write.zig");
 const file_diff = @import("file_diff.zig");
@@ -11,8 +12,10 @@ const amazon_search = @import("amazon_search.zig");
 const calc = @import("calc.zig");
 const introspect = @import("introspect.zig");
 const meme_tool = @import("meme_tool.zig");
+const playwright_mcp = @import("playwright_mcp.zig");
 const rebuild = @import("rebuild.zig");
 const research_tool = @import("research_tool.zig");
+const visual_audit = @import("visual_audit.zig");
 
 /// plan — special tool. Execution is intercepted by the engine (it needs
 /// session context for plan persistence) so this definition has no handler.
@@ -20,17 +23,32 @@ const research_tool = @import("research_tool.zig");
 /// during any multi-step work. This is not optional.
 pub const plan_def = ToolDefinition{
     .name = "plan",
-    .description =
-        "Plan tracker for multi-step work. SKIP THIS for simple questions — if you can answer " ++
-        "with file_read, introspect, calc, research, or safe bash (ls, git log, etc.), just do " ++
+    .description = "Plan tracker for multi-step work. SKIP THIS for simple questions — if you can answer " ++
+        "with file_find, file_read, introspect, calc, research, or safe bash (ls, git log, etc.), just do " ++
         "it directly. REQUIRED before mutating tools (file_write, file_diff, summon_subagent, " ++
         "or destructive bash commands). " ++
         "Operations: 'create' (goal + steps — unblocks heavy tools), 'update' (mark steps " ++
         "done, add notes with findings), 'view' (show plan), 'clear' (remove when done). " ++
+        "If the user asks to make/create/replace/start a plan, call operation='create'; " ++
+        "do not fake a daemon plan by writing a markdown plan file. " ++
         "Do NOT hallucinate results — only mark done when genuinely complete. " ++
         "Subagents can view/update the plan too, so steps get marked done in real time.",
     .input_schema_json =
-        \\{"type":"object","properties":{"operation":{"type":"string","enum":["create","update","view","clear"],"description":"Plan operation to perform."},"goal":{"type":"string","description":"High-level goal for the plan. Required for 'create'."},"steps":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer","description":"Step number (1-based)."},"description":{"type":"string","description":"What this step does."},"status":{"type":"string","enum":["pending","in_progress","done","skipped"],"description":"Step status."},"notes":{"type":"string","description":"Findings, discoveries, or warnings from execution. Subagents SHOULD populate this so subsequent steps inherit context (e.g. 'config is at /etc/foo not /opt/foo', 'API v2 changed the auth header format')."}},"required":["id","description","status"]},"description":"Steps for 'create', or step updates for 'update'. For 'update', only include steps that changed."}},"required":["operation"]}
+    \\{"type":"object","properties":{"operation":{"type":"string","enum":["create","update","view","clear"],"description":"Plan operation to perform."},"goal":{"type":"string","description":"High-level goal for the plan. Required for 'create'."},"steps":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer","description":"Step number (1-based)."},"description":{"type":"string","description":"What this step does."},"status":{"type":"string","enum":["pending","in_progress","done","skipped"],"description":"Step status."},"notes":{"type":"string","description":"Findings, discoveries, or warnings from execution. Subagents SHOULD populate this so subsequent steps inherit context (e.g. 'config is at /etc/foo not /opt/foo', 'API v2 changed the auth header format')."}},"required":["id","description","status"]},"description":"Steps for 'create', or step updates for 'update'. For 'update', only include steps that changed."}},"required":["operation"]}
+    ,
+    .requires_confirmation = false,
+    .handler = null,
+};
+
+/// vision_read — special tool. Execution is intercepted by the engine because
+/// it needs the daemon's configured vision pipeline and artifact cache.
+pub const vision_read_def = ToolDefinition{
+    .name = "vision_read",
+    .description = "Describe/OCR a local screenshot or image path using the daemon vision pipeline. " ++
+        "Use this after playwright_mcp or visual_audit returns screenshot paths, or when you need to inspect an image already on disk. " ++
+        "Accepts absolute paths, ~/ paths, or paths relative to the session working directory. Returns cached results when the image was already analyzed.",
+    .input_schema_json =
+    \\{"type":"object","properties":{"path":{"type":"string","description":"Path to an image/screenshot file. Absolute, ~/..., or relative to the session working directory."},"mime":{"type":"string","description":"Optional MIME type. Inferred from extension when omitted."},"name":{"type":"string","description":"Optional display name for artifact logs."}},"required":["path"]}
     ,
     .requires_confirmation = false,
     .handler = null,
@@ -40,14 +58,13 @@ pub const plan_def = ToolDefinition{
 /// (it needs worker pool + session context) so this definition has no handler.
 ///
 /// Takes a STRUCTURED BRIEF, not a free-form task. The dispatcher is expected
-/// to do enough recon (file_read, bash grep, introspect) to fill target_files,
+/// to do enough recon (file_find, file_read, bash grep, introspect) to fill target_files,
 /// known_facts, and acceptance before delegating. Subagents inherit none of
 /// the dispatcher's conversation context, so whatever isn't in the brief is
 /// invisible to them.
 pub const summon_subagent_def = ToolDefinition{
     .name = "summon_subagent",
-    .description =
-        "Spawn a background subagent. Two modes:\n" ++
+    .description = "Spawn a background subagent. Two modes:\n" ++
         "\n" ++
         "  mode='explore' — READ-ONLY research agent. Investigates a question and returns a " ++
         "structured 3-layer brief (executive map + structured facts + pinned evidence). Use " ++
@@ -59,7 +76,7 @@ pub const summon_subagent_def = ToolDefinition{
         "  mode='execute' (default) — the worker that does real changes (multi-file edits, " ++
         "builds, destructive shell). Requires a full brief: task + target_files + acceptance. " ++
         "Do NOT use execute mode for single-file edits or simple reads — handle those yourself " ++
-        "inline with file_read, file_diff, bash, introspect. The worker will treat the brief as " ++
+        "inline with file_find, file_read, file_diff, bash, introspect. The worker will treat the brief as " ++
         "ground truth, read target files first, make the smallest viable change, and verify " ++
         "acceptance before reporting done.\n" ++
         "\n" ++
@@ -71,7 +88,7 @@ pub const summon_subagent_def = ToolDefinition{
         "Tool failures are treated as no-data, not success. Returns a job ID; the user (for " ++
         "execute) or you (for explore) receives the result automatically when it completes.",
     .input_schema_json =
-        \\{"type":"object","properties":{"mode":{"type":"string","enum":["execute","explore"],"description":"'execute' (default) = worker that makes changes. 'explore' = read-only research agent that returns a structured 3-layer brief."},"task":{"type":"string","description":"For execute: one-sentence goal (the end state). For explore: the question to investigate (e.g. 'How does the dispatcher wire summon_subagent results back to Discord?')."},"context":{"type":"string","description":"Why this matters / the user's actual words. The subagent does not see chat history."},"target_files":{"type":"array","items":{"type":"string"},"description":"For execute: files the subagent will read or modify (REQUIRED non-empty for execute unless pure-discovery). For explore: hint paths to focus recon on (optional)."},"known_facts":{"type":"array","items":{"type":"string"},"description":"Findings the subagent should NOT re-derive. Paste relevant lines from a prior explore subagent's brief here. e.g. 'handleSummonSubagent is at engine.zig:1868'."},"acceptance":{"type":"string","description":"For execute (REQUIRED): concrete testable stop condition. e.g. 'zig build succeeds AND new function visible in engine.zig'. Not used by explore."},"constraints":{"type":"array","items":{"type":"string"},"description":"Things the subagent must NOT do. e.g. 'do not modify discord_adapter.zig'."},"out_of_scope":{"type":"array","items":{"type":"string"},"description":"Related work to resist. Stops scope creep."},"model":{"type":"string","description":"Optional model id override. Inherits parent's model by default."},"wait":{"type":"boolean","description":"If true, block this tool call until the subagent completes and return its full result as the tool_result (useful for in-turn chaining). Default false."},"chain":{"type":"boolean","description":"Explore only. If true (default for explore), after the subagent returns the worker automatically runs a dispatcher continuation turn that ingests the brief and generates the user-facing reply (summary, or auto-summon of execute). The polling adapter sees the continuation's reply, not the raw JSON. Ignored when wait=true or mode=execute."}},"required":["task"]}
+    \\{"type":"object","properties":{"mode":{"type":"string","enum":["execute","explore"],"description":"'execute' (default) = worker that makes changes. 'explore' = read-only research agent that returns a structured 3-layer brief."},"task":{"type":"string","description":"For execute: one-sentence goal (the end state). For explore: the question to investigate (e.g. 'How does the dispatcher wire summon_subagent results back to Discord?')."},"context":{"type":"string","description":"Why this matters / the user's actual words. The subagent does not see chat history."},"target_files":{"type":"array","items":{"type":"string"},"description":"For execute: files the subagent will read or modify (REQUIRED non-empty for execute unless pure-discovery). For explore: hint paths to focus recon on (optional)."},"known_facts":{"type":"array","items":{"type":"string"},"description":"Findings the subagent should NOT re-derive. Paste relevant lines from a prior explore subagent's brief here. e.g. 'handleSummonSubagent is at engine.zig:1868'."},"acceptance":{"type":"string","description":"For execute (REQUIRED): concrete testable stop condition. e.g. 'zig build succeeds AND new function visible in engine.zig'. Not used by explore."},"constraints":{"type":"array","items":{"type":"string"},"description":"Things the subagent must NOT do. e.g. 'do not modify discord_adapter.zig'."},"out_of_scope":{"type":"array","items":{"type":"string"},"description":"Related work to resist. Stops scope creep."},"model":{"type":"string","description":"Optional model id override. Inherits parent's model by default."},"wait":{"type":"boolean","description":"If true, a foreground caller waits for the full result. Calls already running on the daemon's background worker are always converted to async so they cannot deadlock their own queue. Default false."},"chain":{"type":"boolean","description":"Explore only. If true (default for explore), after the subagent returns the worker automatically runs a dispatcher continuation turn that ingests the brief and generates the user-facing reply (summary, or auto-summon of execute). The polling adapter sees the continuation's reply, not the raw JSON. Ignored when a synchronous wait is effective or mode=execute."}},"required":["task"]}
     ,
     .requires_confirmation = false,
     .handler = null,
@@ -82,15 +99,14 @@ pub const summon_subagent_def = ToolDefinition{
 /// (filtered out for subagents like summon_subagent).
 pub const subagent_inspect_def = ToolDefinition{
     .name = "subagent_inspect",
-    .description =
-        "Inspect a background subagent spawned via summon_subagent. " ++
+    .description = "Inspect a background subagent spawned via summon_subagent. " ++
         "depth='summary' (1-line status — same as the auto-injected Active Subagents layer), " ++
         "'full' (final result text if complete, otherwise current status + tool count), " ++
         "or 'tools' (history of tool_use/tool_result events). Read-only — does not stop or " ++
         "interrupt the subagent. Job IDs come from the Active Subagents layer or the " ++
         "return value of summon_subagent.",
     .input_schema_json =
-        \\{"type":"object","properties":{"job_id":{"type":"string","description":"36-char UUID of the subagent job."},"depth":{"type":"string","enum":["summary","full","tools"],"description":"Detail level. Default 'summary'."}},"required":["job_id"]}
+    \\{"type":"object","properties":{"job_id":{"type":"string","description":"36-char UUID of the subagent job."},"depth":{"type":"string","enum":["summary","full","tools"],"description":"Detail level. Default 'summary'."}},"required":["job_id"]}
     ,
     .requires_confirmation = false,
     .handler = null,
@@ -99,14 +115,13 @@ pub const subagent_inspect_def = ToolDefinition{
 /// subagent_stop — engine-intercepted. Cooperative stop at next round boundary.
 pub const subagent_stop_def = ToolDefinition{
     .name = "subagent_stop",
-    .description =
-        "Stop a running subagent at its next round boundary. The subagent emits its " ++
+    .description = "Stop a running subagent at its next round boundary. The subagent emits its " ++
         "accumulated state as the final result and the job is marked completed-with-stop. " ++
         "Cooperative — does NOT interrupt an in-flight API call. Use when a subagent is stuck, " ++
         "off-track, or you want to lock in partial results. Retrieve them via " ++
         "subagent_inspect(depth='full') after the stop takes effect.",
     .input_schema_json =
-        \\{"type":"object","properties":{"job_id":{"type":"string","description":"36-char UUID of the subagent job."},"reason":{"type":"string","description":"Brief explanation of why you're stopping it (becomes part of the final result and visible in inspect)."}},"required":["job_id","reason"]}
+    \\{"type":"object","properties":{"job_id":{"type":"string","description":"36-char UUID of the subagent job."},"reason":{"type":"string","description":"Brief explanation of why you're stopping it (becomes part of the final result and visible in inspect)."}},"required":["job_id","reason"]}
     ,
     .requires_confirmation = false,
     .handler = null,
@@ -115,14 +130,13 @@ pub const subagent_stop_def = ToolDefinition{
 /// subagent_redirect — engine-intercepted. Injects a new instruction at next round.
 pub const subagent_redirect_def = ToolDefinition{
     .name = "subagent_redirect",
-    .description =
-        "Redirect a running subagent mid-flight by queueing a new instruction. The subagent " ++
+    .description = "Redirect a running subagent mid-flight by queueing a new instruction. The subagent " ++
         "receives '[REDIRECT from dispatcher]: <message>' as a user-role message at its next " ++
         "round boundary and continues with accumulated state intact. Does NOT interrupt an " ++
         "in-flight API call. Use to pivot scope, narrow focus, or correct course without losing " ++
         "the subagent's tool history.",
     .input_schema_json =
-        \\{"type":"object","properties":{"job_id":{"type":"string","description":"36-char UUID of the subagent job."},"new_instruction":{"type":"string","description":"The redirect message. Be concrete: what to do differently, what to focus on or skip."}},"required":["job_id","new_instruction"]}
+    \\{"type":"object","properties":{"job_id":{"type":"string","description":"36-char UUID of the subagent job."},"new_instruction":{"type":"string","description":"The redirect message. Be concrete: what to do differently, what to focus on or skip."}},"required":["job_id","new_instruction"]}
     ,
     .requires_confirmation = false,
     .handler = null,
@@ -158,7 +172,7 @@ pub const ToolRegistry = struct {
     /// Serializes mutations and reads across threads. Both the main engine
     /// and the background-chat engine share a single registry, and the user
     /// can toggle tool enablement while a subagent is mid-tool-loop.
-    mutex: std.Thread.Mutex = .{},
+    mutex: common.sync.Mutex = .{},
     /// When true, requiresConfirmation() returns false for every tool so
     /// subagents can run mutating tools without prompting the user.
     /// Toggled at runtime via /api/tools/autoapprove and the /autoapprove
@@ -180,6 +194,7 @@ pub const ToolRegistry = struct {
 
     pub fn registerDefaults(self: *ToolRegistry) !void {
         try self.register(bash.definition);
+        try self.register(file_find.definition);
         try self.register(file_read.definition);
         try self.register(file_write.definition);
         try self.register(amazon_search.definition);
@@ -188,9 +203,12 @@ pub const ToolRegistry = struct {
         try self.register(calc.definition);
         try self.register(introspect.definition);
         try self.register(meme_tool.definition);
+        try self.register(playwright_mcp.definition);
         try self.register(rebuild.definition);
         try self.register(research_tool.definition);
+        try self.register(visual_audit.definition);
         try self.register(plan_def);
+        try self.register(vision_read_def);
         try self.register(summon_subagent_def);
         try self.register(subagent_inspect_def);
         try self.register(subagent_stop_def);
@@ -384,7 +402,7 @@ pub const ToolRegistry = struct {
         defer if (interpreter_owned) |p| self.allocator.free(p);
         const interpreter: []const u8 = if (is_bash) "/bin/bash" else (interpreter_owned orelse "python3");
 
-        const result = std.process.Child.run(.{
+        const result = common.process.run(.{
             .allocator = self.allocator,
             .argv = &.{ "/usr/bin/timeout", "30", interpreter, script_path, input_str },
             .max_output_bytes = 512 * 1024,

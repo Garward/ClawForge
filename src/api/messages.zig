@@ -15,11 +15,26 @@ pub fn appendJsonEscaped(out: *std.ArrayList(u8), a: std.mem.Allocator, data: []
         const b = data[i];
         if (b < 0x80) {
             switch (b) {
-                '"' => { out.append(a, '\\') catch {}; out.append(a, '"') catch {}; },
-                '\\' => { out.append(a, '\\') catch {}; out.append(a, '\\') catch {}; },
-                '\n' => { out.append(a, '\\') catch {}; out.append(a, 'n') catch {}; },
-                '\r' => { out.append(a, '\\') catch {}; out.append(a, 'r') catch {}; },
-                '\t' => { out.append(a, '\\') catch {}; out.append(a, 't') catch {}; },
+                '"' => {
+                    out.append(a, '\\') catch {};
+                    out.append(a, '"') catch {};
+                },
+                '\\' => {
+                    out.append(a, '\\') catch {};
+                    out.append(a, '\\') catch {};
+                },
+                '\n' => {
+                    out.append(a, '\\') catch {};
+                    out.append(a, 'n') catch {};
+                },
+                '\r' => {
+                    out.append(a, '\\') catch {};
+                    out.append(a, 'r') catch {};
+                },
+                '\t' => {
+                    out.append(a, '\\') catch {};
+                    out.append(a, 't') catch {};
+                },
                 else => {
                     if (b < 0x20) {
                         var buf: [8]u8 = undefined;
@@ -36,10 +51,7 @@ pub fn appendJsonEscaped(out: *std.ArrayList(u8), a: std.mem.Allocator, data: []
             i += 1;
             continue;
         }
-        const seq_len: usize = if (b & 0b11100000 == 0b11000000) 2
-            else if (b & 0b11110000 == 0b11100000) 3
-            else if (b & 0b11111000 == 0b11110000) 4
-            else 0;
+        const seq_len: usize = if (b & 0b11100000 == 0b11000000) 2 else if (b & 0b11110000 == 0b11100000) 3 else if (b & 0b11111000 == 0b11110000) 4 else 0;
         if (seq_len == 0 or i + seq_len > data.len) {
             out.appendSlice(a, REPLACEMENT) catch {};
             i += 1;
@@ -60,14 +72,14 @@ pub fn appendJsonEscaped(out: *std.ArrayList(u8), a: std.mem.Allocator, data: []
         }
         const cp: u32 = switch (seq_len) {
             2 => (@as(u32, b & 0x1F) << 6) |
-                 @as(u32, data[i + 1] & 0x3F),
+                @as(u32, data[i + 1] & 0x3F),
             3 => (@as(u32, b & 0x0F) << 12) |
-                 (@as(u32, data[i + 1] & 0x3F) << 6) |
-                 @as(u32, data[i + 2] & 0x3F),
+                (@as(u32, data[i + 1] & 0x3F) << 6) |
+                @as(u32, data[i + 2] & 0x3F),
             4 => (@as(u32, b & 0x07) << 18) |
-                 (@as(u32, data[i + 1] & 0x3F) << 12) |
-                 (@as(u32, data[i + 2] & 0x3F) << 6) |
-                 @as(u32, data[i + 3] & 0x3F),
+                (@as(u32, data[i + 1] & 0x3F) << 12) |
+                (@as(u32, data[i + 2] & 0x3F) << 6) |
+                @as(u32, data[i + 3] & 0x3F),
             else => unreachable,
         };
         const min_cp: u32 = switch (seq_len) {
@@ -158,7 +170,7 @@ pub const MessageRequest = struct {
     /// Serialize request to JSON
     /// is_oauth: If true, use array-based system prompt with Claude Code identity prepended
     pub fn toJson(self: *const MessageRequest, allocator: std.mem.Allocator, is_oauth: bool) ![]u8 {
-        var out: std.ArrayList(u8) = .{};
+        var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
 
         // Pre-allocate reasonable capacity

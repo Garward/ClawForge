@@ -3,6 +3,7 @@ const common = @import("common");
 const posix = std.posix;
 
 pub const Display = struct {
+    io: std.Io,
     stdout_fd: posix.fd_t,
     is_tty: bool,
     color_enabled: bool,
@@ -18,12 +19,12 @@ pub const Display = struct {
     const BLUE = "\x1b[34m";
     const CYAN = "\x1b[36m";
 
-    pub fn init(config: *const common.Config) Display {
+    pub fn init(config: *const common.Config, io: std.Io) Display {
         const stdout_fd = posix.STDOUT_FILENO;
-        const stdout_file = std.fs.File{ .handle = stdout_fd };
-        const is_tty = stdout_file.isTty();
+        const is_tty = std.Io.File.stdout().isTty(io) catch false;
 
         return .{
+            .io = io,
             .stdout_fd = stdout_fd,
             .is_tty = is_tty,
             .color_enabled = is_tty and config.display.color_output,
@@ -33,12 +34,7 @@ pub const Display = struct {
     }
 
     pub fn write(self: *Display, data: []const u8) !void {
-        var written: usize = 0;
-        while (written < data.len) {
-            written += posix.write(self.stdout_fd, data[written..]) catch |err| {
-                return err;
-            };
-        }
+        try std.Io.File.stdout().writeStreamingAll(self.io, data);
     }
 
     fn print(self: *Display, comptime fmt: []const u8, args: anytype) !void {

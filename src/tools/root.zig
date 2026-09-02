@@ -1,13 +1,16 @@
 pub const registry = @import("registry.zig");
 pub const bash = @import("bash.zig");
+pub const file_find = @import("file_find.zig");
 pub const file_read = @import("file_read.zig");
 pub const file_write = @import("file_write.zig");
 pub const amazon_search = @import("amazon_search.zig");
 pub const calc = @import("calc.zig");
 pub const introspect = @import("introspect.zig");
+pub const playwright_mcp = @import("playwright_mcp.zig");
 pub const sandbox = @import("sandbox.zig");
 pub const generator = @import("generator.zig");
 pub const research_tool = @import("research_tool.zig");
+pub const visual_audit = @import("visual_audit.zig");
 
 pub const ToolRegistry = registry.ToolRegistry;
 pub const ToolDefinition = registry.ToolDefinition;

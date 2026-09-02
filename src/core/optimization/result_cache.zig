@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("common");
 
 /// TTL cache for deterministic tool results. Avoids re-executing identical
 /// tool calls within a session (e.g. reading the same file twice, running
@@ -44,7 +45,7 @@ pub const ResultCache = struct {
             return null;
         };
 
-        const now = std.time.milliTimestamp();
+        const now = common.sync.milliTimestamp();
         if (now - entry_ptr.timestamp > self.max_age_ms) {
             // Expired — remove and miss
             self.allocator.free(entry_ptr.result);
@@ -73,7 +74,7 @@ pub const ResultCache = struct {
             self.allocator.free(existing.result);
             existing.* = .{
                 .result = try self.allocator.dupe(u8, result),
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = common.sync.milliTimestamp(),
                 .hit_count = 0,
             };
             return;
@@ -81,7 +82,7 @@ pub const ResultCache = struct {
 
         try self.cache.put(key, .{
             .result = try self.allocator.dupe(u8, result),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = common.sync.milliTimestamp(),
             .hit_count = 0,
         });
     }
@@ -102,7 +103,7 @@ pub const ResultCache = struct {
     }
 
     fn cleanExpired(self: *ResultCache) void {
-        const now = std.time.milliTimestamp();
+        const now = common.sync.milliTimestamp();
         // Collect keys to remove (can't mutate during iteration)
         var remove_buf: [64]u64 = undefined;
         var remove_count: usize = 0;

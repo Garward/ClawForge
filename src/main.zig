@@ -4,17 +4,101 @@ const api = @import("api");
 const tools = @import("tools");
 const storage = @import("storage");
 const core = @import("core");
+const inference = @import("inference");
+const narrative = @import("narrative");
 const workers = @import("workers");
 const adapters = @import("adapters");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+const NarrativeEmbeddingBridge = struct {
+    allocator: std.mem.Allocator,
+    embedder: *workers.Embedder,
+    worker_pool: *workers.WorkerPool,
+    search_store: storage.EmbeddingStore,
+
+    fn gateway(self: *NarrativeEmbeddingBridge) narrative.embedding.Gateway {
+        return .{
+            .ptr = self,
+            .enqueue_fn = enqueue,
+            .search_fn = search,
+        };
+    }
+
+    fn enqueue(
+        ptr: *anyopaque,
+        source_type: []const u8,
+        source_id: i64,
+        text: []const u8,
+        context_header: ?[]const u8,
+    ) void {
+        const self: *NarrativeEmbeddingBridge = @ptrCast(@alignCast(ptr));
+        self.worker_pool.enqueueEmbed(
+            source_type,
+            source_id,
+            text,
+            context_header,
+        );
+    }
+
+    fn search(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        source_type: []const u8,
+        query: []const u8,
+        limit: usize,
+    ) ![]narrative.embedding.SemanticResult {
+        const self: *NarrativeEmbeddingBridge = @ptrCast(@alignCast(ptr));
+        const query_vector = try self.embedder.embedQuery(query);
+        defer self.allocator.free(query_vector);
+        const stored_results = try self.search_store.vectorSearchBySourceType(
+            source_type,
+            query_vector,
+            100,
+            limit,
+        );
+        defer {
+            for (stored_results) |result| {
+                self.allocator.free(@constCast(result.source_type));
+                self.allocator.free(@constCast(result.chunk_text));
+            }
+            if (stored_results.len > 0) self.allocator.free(stored_results);
+        }
+        const results = try allocator.alloc(
+            narrative.embedding.SemanticResult,
+            stored_results.len,
+        );
+        errdefer allocator.free(results);
+        for (stored_results, 0..) |result, index| {
+            results[index] = .{
+                .text = try allocator.dupe(u8, result.chunk_text),
+                .score = result.score,
+            };
+        }
+        return results;
+    }
+};
+
+pub fn main(init: std.process.Init) !void {
+    common.config.setProcessRuntime(init.environ_map, init.io);
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     // Load configuration
     var config = try common.Config.load(allocator, null);
     defer config.deinit();
+
+    // Session defaults belong to the provider routing configuration, not the
+    // legacy Anthropic client configuration. Keep the provider prefix so web,
+    // Discord, and background workers resolve the same regular model.
+    const session_default_model = if (config.routing.enabled)
+        try std.fmt.allocPrint(
+            allocator,
+            "{s}:{s}",
+            .{ config.routing.default_provider, config.routing.default_model },
+        )
+    else
+        config.api.default_model;
+    defer if (config.routing.enabled) allocator.free(session_default_model);
 
     // Get socket path
     const socket_path = try common.config.getSocketPath(allocator, &config);
@@ -26,9 +110,9 @@ pub fn main() !void {
     const auth_profiles_path = try common.config.resolveProjectPath(allocator, config.auth.profiles_path);
     defer allocator.free(auth_profiles_path);
 
-    var auth_store = common.AuthProfileStore.load(allocator, auth_profiles_path) catch |err| blk: {
+    var auth_store = common.AuthProfileStore.load(allocator, init.io, auth_profiles_path) catch |err| blk: {
         std.log.warn("Failed to load auth profiles: {}, starting fresh", .{err});
-        break :blk common.AuthProfileStore.init(allocator);
+        break :blk common.AuthProfileStore.init(allocator, init.io);
     };
     defer auth_store.deinit();
 
@@ -67,6 +151,19 @@ pub fn main() !void {
     try storage.runMigrations(&database.conn);
     std.log.info("Database initialized", .{});
 
+    // Narrative Studio owns its schema and orchestration behind a narrow
+    // service boundary. It shares the daemon database and model catalog, but
+    // does not add story-specific branches to the general-purpose engine.
+    var narrative_runtime = try narrative.Runtime.init(
+        allocator,
+        &database.conn,
+        session_default_model,
+    );
+    defer narrative_runtime.deinit();
+    try narrative_runtime.start();
+    defer narrative_runtime.stop();
+    std.log.info("Narrative Studio initialized", .{});
+
     // Reserve capacity up front so openConnection() can't reallocate extra_conns
     // after pointers have been handed out to worker threads. Existing workers
     // (summarize, extract, embed) plus the background-chat engine need 4 slots;
@@ -78,7 +175,7 @@ pub fn main() !void {
     const cli_ns_id = try ns.ensurePath("default/cli");
 
     // Initialize stores
-    var session_store = storage.SessionStore.init(&database.conn, allocator, cli_ns_id, config.api.default_model);
+    var session_store = storage.SessionStore.init(&database.conn, allocator, cli_ns_id, session_default_model);
     var message_store = storage.MessageStore.init(&database.conn, allocator);
     var project_store = storage.ProjectStore.init(&database.conn, allocator, cli_ns_id);
     var summary_store = storage.SummaryStore.init(&database.conn, allocator, cli_ns_id);
@@ -117,6 +214,7 @@ pub fn main() !void {
             config.ollama.base_url,
             config.ollama.default_model,
             config.ollama.num_ctx,
+            config.ollama.model_contexts,
         );
         provider_registry.register("ollama", ollama_client.?.provider()) catch {};
         std.log.info(
@@ -197,6 +295,12 @@ pub fn main() !void {
 
     // Default provider = whatever "default" tier maps to
     const default_provider = provider_registry.getForTier("default") orelse anthropic_prov;
+    var narrative_inference = inference.RegistryGateway.init(
+        allocator,
+        &provider_registry,
+        default_provider,
+    );
+    narrative_runtime.setInferenceGateway(narrative_inference.gateway());
 
     // Initialize the core engine (shared by all adapters)
     var engine = core.Engine.init(
@@ -254,6 +358,7 @@ pub fn main() !void {
 
     // Skills store — uses main DB connection (read-heavy, no worker needed)
     var skill_store = storage.SkillStore.init(&database.conn, allocator, cli_ns_id);
+    try skill_store.ensureBuiltinSkills();
     engine.setSkillStore(&skill_store);
 
     // ================================================================
@@ -265,7 +370,7 @@ pub fn main() !void {
     // and the worker pool (internally mutexed queues).
     // ================================================================
     const bg_chat_conn = try database.openConnection();
-    var bg_session_store = storage.SessionStore.init(bg_chat_conn, allocator, cli_ns_id, config.api.default_model);
+    var bg_session_store = storage.SessionStore.init(bg_chat_conn, allocator, cli_ns_id, session_default_model);
     var bg_message_store = storage.MessageStore.init(bg_chat_conn, allocator);
     var bg_project_store = storage.ProjectStore.init(bg_chat_conn, allocator, cli_ns_id);
     var bg_summary_store = storage.SummaryStore.init(bg_chat_conn, allocator, cli_ns_id);
@@ -302,6 +407,7 @@ pub fn main() !void {
         &config.vision,
         &api_client,
         &artifact_store,
+        config.ollama.base_url,
     );
     defer main_vision.deinit();
     engine.setVisionPipeline(&main_vision);
@@ -311,6 +417,7 @@ pub fn main() !void {
         &config.vision,
         &api_client,
         &bg_artifact_store,
+        config.ollama.base_url,
     );
     defer bg_vision.deinit();
     bg_engine.setVisionPipeline(&bg_vision);
@@ -334,6 +441,18 @@ pub fn main() !void {
     // SQLite connection and per-turn state are isolated from the web thread.
     worker_pool.setBackgroundChatContext(@ptrCast(&bg_engine), &core.Engine.backgroundChatCallback);
     worker_pool.start();
+    const narrative_embedding_store = storage.EmbeddingStore.init(
+        &database.conn,
+        allocator,
+        cli_ns_id,
+    );
+    var narrative_embedding_bridge = NarrativeEmbeddingBridge{
+        .allocator = allocator,
+        .embedder = &embedder_worker,
+        .worker_pool = &worker_pool,
+        .search_store = narrative_embedding_store,
+    };
+    narrative_runtime.setEmbeddingGateway(narrative_embedding_bridge.gateway());
     engine.setToolGenerator(&tool_gen);
     bg_engine.setToolGenerator(&tool_gen);
 
@@ -365,13 +484,14 @@ pub fn main() !void {
     // Web Adapter (secondary — runs on spawned thread)
     var web: ?adapters.WebAdapter = null;
     var web_thread: ?std.Thread = null;
-    
+
     var discord: ?adapters.DiscordAdapter = null;
     var discord_thread: ?std.Thread = null;
 
     if (config.web.enabled) {
         var wa = adapters.WebAdapter.init(allocator, &config, &engine);
         wa.setBgEngine(&bg_engine);
+        wa.setNarrativeService(narrative_runtime.service());
         wa.adapter().start() catch |err| {
             std.log.err("Failed to start web adapter: {}", .{err});
         };
@@ -424,7 +544,7 @@ pub fn main() !void {
         var web_ptr: ?*adapters.WebAdapter = null;
         var discord_ptr: ?*adapters.DiscordAdapter = null;
 
-        fn handle(_: c_int) callconv(std.builtin.CallingConvention.c) void {
+        fn handle(_: std.posix.SIG) callconv(std.builtin.CallingConvention.c) void {
             if (cli_ptr) |c| c.running = false;
             if (web_ptr) |w| w.running = false;
             if (discord_ptr) |d| d.running.store(false, .release);
@@ -480,7 +600,7 @@ fn runDiscordAdapter(da: *adapters.DiscordAdapter) void {
 /// missing $HOME.
 fn expandTilde(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     if (path.len == 0 or path[0] != '~') return @constCast(path);
-    const home = std.posix.getenv("HOME") orelse return @constCast(path);
+    const home = common.config.getEnvVar("HOME") orelse return @constCast(path);
     if (path.len == 1) return allocator.dupe(u8, home);
     if (path[1] != '/') return @constCast(path);
     return std.fmt.allocPrint(allocator, "{s}{s}", .{ home, path[1..] });

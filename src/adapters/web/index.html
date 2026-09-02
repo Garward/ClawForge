@@ -165,6 +165,33 @@
         }
         #logo span { color: var(--text-muted); font-weight: 400; }
 
+        .surface-tabs {
+            display: flex;
+            align-items: center;
+            gap: 2px;
+            margin-left: 8px;
+            padding-left: 12px;
+            border-left: 1px solid var(--border-primary);
+        }
+        .surface-tab {
+            color: var(--text-muted);
+            padding: 5px 9px;
+            border: 1px solid transparent;
+            border-radius: var(--radius);
+            font-size: 12px;
+            line-height: 1;
+        }
+        .surface-tab:hover {
+            color: var(--text-primary);
+            border-color: var(--border-primary);
+            background: var(--bg-hover);
+        }
+        .surface-tab.active {
+            color: var(--accent-hover);
+            border-color: var(--accent-border);
+            background: var(--accent-subtle);
+        }
+
         #header-center {
             font-size: 12px;
             color: var(--text-muted);
@@ -701,6 +728,43 @@
         }
         .subagent-job-header .job-label { color: var(--accent-primary); font-weight: 600; }
         .subagent-job-header .job-status { margin-left: auto; }
+        .subagent-job .job-actions {
+            margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .subagent-job .job-action-btn {
+            padding: 3px 8px;
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius);
+            background: var(--bg-code);
+            color: var(--text-secondary);
+            font-size: 11px;
+            cursor: pointer;
+        }
+        .subagent-job .job-action-btn:hover { color: var(--text-primary); border-color: var(--accent-border); }
+        .subagent-job .job-action-btn.danger { color: var(--error); }
+        .subagent-job .job-steer {
+            margin-top: 8px;
+            padding: 8px;
+            background: var(--bg-code);
+            border-radius: var(--radius);
+            display: none;
+        }
+        .subagent-job .job-steer textarea {
+            width: 100%;
+            min-height: 64px;
+            resize: vertical;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            border: 1px solid var(--border-primary);
+            border-radius: var(--radius);
+            padding: 6px;
+            font: 12px var(--font-sans);
+            box-sizing: border-box;
+        }
+        .subagent-job .job-steer-actions { margin-top: 6px; display: flex; gap: 8px; }
         .subagent-job .job-confirm {
             margin-top: 8px;
             padding: 8px;
@@ -736,6 +800,8 @@
         }
         .tool-event.tool-use { border-left-color: var(--accent-primary); }
         .tool-event.tool-result { border-left-color: var(--success); }
+        .tool-event.tool-wait { border-left-color: var(--warning); }
+        .tool-event.tool-model { border-left-color: var(--accent-hover); }
         .tool-event.tool-error { border-left-color: var(--error); }
         .tool-event-header {
             display: flex;
@@ -1124,6 +1190,10 @@
         <div id="header-left">
             <button id="sidebar-toggle" title="Toggle sidebar">&#9776;</button>
             <div id="logo">ClawForge <span>v0.2</span></div>
+            <nav class="surface-tabs" aria-label="ClawForge workspace">
+                <a class="surface-tab active" href="/">Chat</a>
+                <a class="surface-tab" href="/narrative">Narrative Studio</a>
+            </nav>
         </div>
         <div id="header-center">
             <div id="status-dot"></div>
@@ -1279,6 +1349,20 @@
                 </label>
                 <span id="auto-approve-status" style="font-size:11px;color:var(--text-dim);"></span>
             </div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+                <label style="font-size:12px;color:var(--text-secondary);cursor:pointer;display:flex;align-items:center;gap:6px;">
+                    <input type="checkbox" id="compact-tools-toggle" style="accent-color:var(--accent-primary);">
+                    Compact tool schemas
+                </label>
+                <span id="compact-tools-status" style="font-size:11px;color:var(--text-dim);"></span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+                <label style="font-size:12px;color:var(--text-secondary);cursor:pointer;display:flex;align-items:center;gap:6px;">
+                    <input type="checkbox" id="plans-required-toggle" style="accent-color:var(--accent-primary);">
+                    Require plans
+                </label>
+                <span id="plans-required-status" style="font-size:11px;color:var(--text-dim);"></span>
+            </div>
             <div id="tools-list">
                 <div style="font-size: 12px; color: var(--text-dim);">Loading...</div>
             </div>
@@ -1325,7 +1409,12 @@
             lastModel: null,
             modelOverride: '',
             toolsEnabled: {},
+            compactToolSchemas: null,
+            plansRequired: null,
             pendingAttachments: [],  // [{path, mime, name, localUrl}]
+            activeJobIds: new Set(),
+            activeJobPolls: new Set(),
+            streamAbort: null,
         };
 
         /* ============================
@@ -1466,6 +1555,60 @@
             } catch (e) { throw new Error('Failed to fetch ' + path); }
             if (!res.ok) throw new Error('API error: ' + res.status);
             return res.json();
+        }
+
+        const ACTIVE_JOBS_KEY = 'clawforge.activeJobs.v1';
+
+        function loadActiveJobs() {
+            try {
+                const parsed = JSON.parse(localStorage.getItem(ACTIVE_JOBS_KEY) || '[]');
+                return Array.isArray(parsed) ? parsed.filter(j => j && j.job_id) : [];
+            } catch (_) {
+                return [];
+            }
+        }
+
+        function saveActiveJobs(jobs) {
+            localStorage.setItem(ACTIVE_JOBS_KEY, JSON.stringify(jobs));
+        }
+
+        function rememberActiveJob(jobId, sessionId) {
+            const jobs = loadActiveJobs().filter(j => j.job_id !== jobId);
+            jobs.push({ job_id: jobId, session_id: sessionId || state.currentSession || null, created_at: Date.now() });
+            saveActiveJobs(jobs);
+            state.activeJobIds.add(jobId);
+        }
+
+        function forgetActiveJob(jobId) {
+            saveActiveJobs(loadActiveJobs().filter(j => j.job_id !== jobId));
+            state.activeJobIds.delete(jobId);
+            state.activeJobPolls.delete(jobId);
+        }
+
+        async function resumeActiveJobsForSession(sessionId) {
+            const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+            const jobs = loadActiveJobs().filter(j => !j.created_at || j.created_at >= cutoff);
+            if (jobs.length !== loadActiveJobs().length) saveActiveJobs(jobs);
+            jobs
+                .filter(j => !j.session_id || j.session_id === sessionId)
+                .forEach(j => startJobPolling([j.job_id], {
+                    persist: false,
+                    label: 'Reconnecting task',
+                    sessionId: j.session_id || sessionId,
+                }));
+            try {
+                const active = await apiPost('/api/background/active', { session_id: sessionId });
+                ((active && active.jobs) || []).forEach(j => {
+                    rememberActiveJob(j.job_id, j.session_id || sessionId);
+                    startJobPolling([j.job_id], {
+                        persist: false,
+                        label: j.status === 'queued' ? 'Queued task' : 'Recovered task',
+                        sessionId: j.session_id || sessionId,
+                    });
+                });
+            } catch (e) {
+                console.warn('[Job] Active job restore failed', e);
+            }
         }
 
         /* ============================
@@ -1655,6 +1798,7 @@
             renderSessions();
             resetTokenTotals();
             await loadSessionMessages(id);
+            await resumeActiveJobsForSession(id);
             // Close sidebar on mobile
             dom.sidebar.classList.remove('open');
         }
@@ -2250,15 +2394,18 @@
         /* ============================
            Subagent Job Polling
            ============================ */
-        function startJobPolling(jobIds) {
+        function startJobPolling(jobIds, options = {}) {
             if (!jobIds || jobIds.length === 0) return;
             for (const jobId of jobIds) {
+                if (!jobId || state.activeJobPolls.has(jobId)) continue;
                 console.log('[Job] Starting poll for', jobId.slice(0, 8));
-                pollAndDeliver(jobId);
+                if (options.persist !== false) rememberActiveJob(jobId, options.sessionId || state.currentSession);
+                pollAndDeliver(jobId, options);
             }
         }
 
-        async function pollAndDeliver(jobId) {
+        async function pollAndDeliver(jobId, options = {}) {
+            state.activeJobPolls.add(jobId);
             const shortId = jobId.slice(0, 8);
 
             // Create a job indicator element in the chat
@@ -2275,15 +2422,45 @@
             const indicator = document.createElement('div');
             indicator.className = 'subagent-job';
             indicator.id = 'job-' + jobId;
+            const jobLabel = options.label || 'Task';
             indicator.innerHTML =
                 '<div class="subagent-job-header">' +
-                    '<span class="job-label">&#9881; Subagent ' + shortId + '</span>' +
-                    '<div class="tool-status running">' +
-                        '<span class="tool-status-label">working\u2026</span>' +
-                        '<span class="tool-status-dot"></span>' +
+                    '<span class="job-label">&#9881; ' + escapeHtml(jobLabel) + ' ' + shortId + '</span>' +
+                    '<div class="job-actions">' +
+                        '<button class="job-action-btn btn-steer" title="Add a steering note to the running task">Steer</button>' +
+                        '<button class="job-action-btn danger btn-cancel" title="Cancel this task at the next safe boundary">Cancel</button>' +
+                        '<div class="tool-status running">' +
+                            '<span class="tool-status-label">working\u2026</span>' +
+                            '<span class="tool-status-dot"></span>' +
+                        '</div>' +
                     '</div>' +
                 '</div>';
             contentEl.appendChild(indicator);
+
+            const steerEl = document.createElement('div');
+            steerEl.className = 'job-steer';
+            steerEl.innerHTML =
+                '<textarea placeholder="Add a steering note for this running task"></textarea>' +
+                '<div class="job-steer-actions">' +
+                    '<button class="job-action-btn btn-send-steer">Send note</button>' +
+                    '<button class="job-action-btn btn-close-steer">Close</button>' +
+                '</div>';
+            indicator.appendChild(steerEl);
+
+            indicator.querySelector('.btn-steer').addEventListener('click', () => {
+                steerEl.style.display = steerEl.style.display === 'block' ? 'none' : 'block';
+                const ta = steerEl.querySelector('textarea');
+                if (steerEl.style.display === 'block' && ta) ta.focus();
+            });
+            indicator.querySelector('.btn-close-steer').addEventListener('click', () => {
+                steerEl.style.display = 'none';
+            });
+            indicator.querySelector('.btn-send-steer').addEventListener('click', async () => {
+                await sendJobSteering(jobId, indicator, steerEl);
+            });
+            indicator.querySelector('.btn-cancel').addEventListener('click', async () => {
+                await cancelJob(jobId, indicator, textZone);
+            });
 
             // Tool events container
             const toolEventsEl = document.createElement('div');
@@ -2300,7 +2477,7 @@
 
             const shownConfirmations = new Set();
             let eventCursor = 0;
-            const maxIterations = 400; // 400 * 3s = 20 min
+            const maxIterations = 14400; // 14400 * 2s = 8 hours
 
             for (let i = 0; i < maxIterations; i++) {
                 await new Promise(r => setTimeout(r, 2000));
@@ -2324,12 +2501,32 @@
                     for (const evt of result.tool_events) {
                         const evtEl = document.createElement('div');
                         const isError = evt.is_error;
-                        evtEl.className = 'tool-event ' + (isError ? 'tool-error' : evt.type === 'tool_use' ? 'tool-use' : 'tool-result');
+                        const eventClass = isError
+                            ? 'tool-error'
+                            : evt.type === 'tool_use'
+                                ? 'tool-use'
+                                : evt.type === 'model_text'
+                                    ? 'tool-model'
+                                : evt.type === 'model_wait'
+                                    ? 'tool-wait'
+                                    : evt.type === 'control'
+                                        ? 'tool-wait'
+                                    : 'tool-result';
+                        const eventLabel = evt.type === 'tool_use'
+                            ? 'call'
+                            : evt.type === 'model_text'
+                                ? 'note'
+                            : evt.type === 'model_wait'
+                                ? 'waiting'
+                                : evt.type === 'control'
+                                    ? 'control'
+                                : 'result';
+                        evtEl.className = 'tool-event ' + eventClass;
 
                         const headerEl = document.createElement('div');
                         headerEl.className = 'tool-event-header';
                         headerEl.innerHTML =
-                            '<span class="tool-event-type">' + (evt.type === 'tool_use' ? 'call' : 'result') + '</span>' +
+                            '<span class="tool-event-type">' + eventLabel + '</span>' +
                             '<span class="tool-event-name">' + escapeHtml(evt.tool) + '</span>';
                         evtEl.appendChild(headerEl);
 
@@ -2365,6 +2562,10 @@
                         shownConfirmations.add(conf.tool_id);
                         showToolConfirmation(indicator, jobId, conf);
                     }
+                    if (conf) {
+                        const statusLabel = indicator.querySelector('.tool-status-label');
+                        if (statusLabel) statusLabel.textContent = 'waiting for approval';
+                    }
                     continue;
                 }
 
@@ -2375,6 +2576,7 @@
                 if (status === 'completed') {
                     statusEl.classList.add('done');
                     statusEl.querySelector('.tool-status-label').textContent = 'done';
+                    disableJobControls(indicator);
 
                     const raw = result.text || '';
                     // Strip tool_calls XML for display
@@ -2402,15 +2604,48 @@
                 } else if (status === 'failed') {
                     statusEl.classList.add('error');
                     statusEl.querySelector('.tool-status-label').textContent = 'failed';
+                    disableJobControls(indicator);
                     textZone.innerHTML = '<span style="color: var(--error);">' +
                         escapeHtml(result.text || 'Unknown error') + '</span>';
                 } else if (status === 'cancelled') {
                     statusEl.classList.add('error');
                     statusEl.querySelector('.tool-status-label').textContent = 'cancelled';
+                    disableJobControls(indicator);
                     textZone.innerHTML = '<span style="color: var(--text-muted);">Job cancelled.</span>';
+                } else if (status === 'interrupted') {
+                    statusEl.classList.add('error');
+                    statusEl.querySelector('.tool-status-label').textContent = 'interrupted';
+                    disableJobControls(indicator);
+                    const label = indicator.querySelector('.job-label');
+                    if (label) label.textContent = '\u26a0 Interrupted task ' + shortId;
+                    const steerBtn = indicator.querySelector('.btn-steer');
+                    const cancelBtn = indicator.querySelector('.btn-cancel');
+                    if (steerBtn) steerBtn.remove();
+                    if (cancelBtn) cancelBtn.remove();
+                    textZone.innerHTML = '<span style="color: var(--text-muted);">' +
+                        'The daemon restarted before this task completed. Its session plan and recorded tool output are still available.' +
+                        '</span>';
+
+                    const resumeBtn = document.createElement('button');
+                    resumeBtn.className = 'job-action-btn btn-resume';
+                    resumeBtn.textContent = 'Resume';
+                    resumeBtn.title = 'Continue this task from its persisted session state';
+                    resumeBtn.addEventListener('click', async () => {
+                        await resumeInterruptedJob(
+                            jobId,
+                            options.sessionId || state.currentSession,
+                            indicator,
+                            textZone,
+                            resumeBtn
+                        );
+                    });
+                    const actions = indicator.querySelector('.job-actions');
+                    if (actions) actions.insertBefore(resumeBtn, statusEl);
                 }
 
                 scrollToBottom();
+                forgetActiveJob(jobId);
+                loadSessions();
                 return;
             }
 
@@ -2419,8 +2654,126 @@
             statusEl.classList.remove('running');
             statusEl.classList.add('error');
             statusEl.querySelector('.tool-status-label').textContent = 'timeout';
-            textZone.innerHTML = '<span style="color: var(--error);">Subagent timed out after 20 minutes.</span>';
+            disableJobControls(indicator);
+            textZone.innerHTML = '<span style="color: var(--error);">Task timed out after 8 hours.</span>';
+            forgetActiveJob(jobId);
+            state.activeJobPolls.delete(jobId);
             scrollToBottom();
+        }
+
+        async function resumeInterruptedJob(oldJobId, sessionId, indicator, textZone, resumeBtn) {
+            const statusEl = indicator.querySelector('.tool-status');
+            const statusLabel = statusEl ? statusEl.querySelector('.tool-status-label') : null;
+            resumeBtn.disabled = true;
+            if (statusLabel) statusLabel.textContent = 'resuming\u2026';
+
+            try {
+                if (!sessionId) throw new Error('The interrupted task has no session to resume');
+
+                const chatBody = {
+                    message: 'Resume the task interrupted by the daemon restart. Use the active plan, conversation history, and persisted tool-call results from this session. Continue from the last completed work; do not redo verified research unless needed. Finish the original request and provide the user-facing result.',
+                    session_id: sessionId,
+                };
+                applyChatOptions(chatBody);
+                if (state.modelOverride) chatBody.model_override = state.modelOverride;
+
+                const data = await apiPost('/api/chat/background', chatBody);
+                if (!data || !data.job_id) {
+                    throw new Error((data && data.error) || 'Resume did not return a job id');
+                }
+
+                if (statusEl) {
+                    statusEl.classList.remove('error');
+                    statusEl.classList.add('done');
+                }
+                if (statusLabel) statusLabel.textContent = 'resumed';
+                resumeBtn.remove();
+                textZone.innerHTML = '<span style="color: var(--success);">Resumed as task ' +
+                    escapeHtml(data.job_id.slice(0, 8)) + '.</span>';
+                forgetActiveJob(oldJobId);
+                startJobPolling([data.job_id], {
+                    label: 'Resumed task',
+                    sessionId: data.session_id || sessionId,
+                });
+            } catch (e) {
+                resumeBtn.disabled = false;
+                if (statusLabel) statusLabel.textContent = 'interrupted';
+                textZone.innerHTML = '<span style="color: var(--error);">Resume failed: ' +
+                    escapeHtml(e.message) + '</span>';
+            }
+        }
+
+        function disableJobControls(indicator) {
+            indicator.querySelectorAll('.job-action-btn').forEach(btn => {
+                btn.disabled = true;
+                btn.style.opacity = '0.55';
+                btn.style.cursor = 'default';
+            });
+            const steerEl = indicator.querySelector('.job-steer');
+            if (steerEl) steerEl.style.display = 'none';
+        }
+
+        async function cancelJob(jobId, indicator, textZone) {
+            const statusLabel = indicator.querySelector('.tool-status-label');
+            const btn = indicator.querySelector('.btn-cancel');
+            if (btn) btn.disabled = true;
+            if (statusLabel) statusLabel.textContent = 'cancelling\u2026';
+            try {
+                const res = await fetch('/api/background/cancel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ job_id: jobId }),
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok || data.ok === false) {
+                    if (statusLabel) statusLabel.textContent = 'working\u2026';
+                    if (btn) btn.disabled = false;
+                    textZone.innerHTML = '<span style="color: var(--error);">Cancel failed: ' +
+                        escapeHtml(data.error || ('HTTP ' + res.status)) + '</span>';
+                    return;
+                }
+                textZone.innerHTML = '<span style="color: var(--text-muted);">Cancel requested. The daemon will stop at the next safe boundary.</span>';
+            } catch (e) {
+                if (statusLabel) statusLabel.textContent = 'working\u2026';
+                if (btn) btn.disabled = false;
+                textZone.innerHTML = '<span style="color: var(--error);">Cancel failed: ' + escapeHtml(e.message) + '</span>';
+            }
+        }
+
+        async function sendJobSteering(jobId, indicator, steerEl) {
+            const textarea = steerEl.querySelector('textarea');
+            const note = textarea ? textarea.value.trim() : '';
+            if (!note) return;
+            const btn = steerEl.querySelector('.btn-send-steer');
+            if (btn) btn.disabled = true;
+            try {
+                const res = await fetch('/api/background/steer', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ job_id: jobId, message: note }),
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok || data.ok === false) {
+                    const msg = document.createElement('div');
+                    msg.style.color = 'var(--error)';
+                    msg.style.marginTop = '6px';
+                    msg.textContent = 'Steer failed: ' + (data.error || ('HTTP ' + res.status));
+                    steerEl.appendChild(msg);
+                    return;
+                }
+                if (textarea) textarea.value = '';
+                steerEl.style.display = 'none';
+                const statusLabel = indicator.querySelector('.tool-status-label');
+                if (statusLabel) statusLabel.textContent = 'steering queued\u2026';
+            } catch (e) {
+                const msg = document.createElement('div');
+                msg.style.color = 'var(--error)';
+                msg.style.marginTop = '6px';
+                msg.textContent = 'Steer failed: ' + e.message;
+                steerEl.appendChild(msg);
+            } finally {
+                if (btn) btn.disabled = false;
+            }
         }
 
         function showToolConfirmation(indicator, jobId, conf) {
@@ -2491,155 +2844,55 @@
             scrollToBottom();
         }
 
-        async function sendStreaming(message) {
-            const msgEl = createStreamingMessage();
+        async function sendStreaming(message, attachments = readyAttachments()) {
             state.isStreaming = true;
-            state.streamAbort = new AbortController();
 
             try {
-                console.log('[SSE] Starting stream request...');
+                console.log('[Job] Enqueueing resumable chat...');
                 const chatBody = { message };
+                applyChatOptions(chatBody);
                 if (state.modelOverride) chatBody.model_override = state.modelOverride;
-                if (state.pendingAttachments.length > 0) {
-                    chatBody.attachments = state.pendingAttachments.map(a => ({ path: a.path, mime: a.mime, name: a.name }));
+                if (attachments.length > 0) {
+                    chatBody.attachments = attachments.map(a => ({ path: a.path, mime: a.mime, name: a.name }));
                 }
-                const res = await fetch('/api/chat/stream', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(chatBody),
-                    signal: state.streamAbort.signal,
+                const data = await apiPost('/api/chat/background', chatBody);
+                if (!data || !data.job_id) {
+                    throw new Error((data && data.error) || 'Background job did not return an id');
+                }
+                if (!state.currentSession && data.session_id) {
+                    state.currentSession = data.session_id;
+                }
+                startJobPolling([data.job_id], {
+                    label: 'Task',
+                    sessionId: data.session_id || state.currentSession,
                 });
 
-                console.log('[SSE] Response status:', res.status, 'ok:', res.ok);
-                if (!res.ok) {
-                    throw new Error('Stream request failed: ' + res.status);
-                }
-
-                const reader = res.body.getReader();
-                const decoder = new TextDecoder();
-                let buffer = '';
-
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) { console.log('[SSE] Stream done'); break; }
-
-                    const chunk = decoder.decode(value, { stream: true });
-                    console.log('[SSE] Chunk:', chunk.length, 'bytes');
-                    buffer += chunk;
-                    const lines = buffer.split('\n');
-                    buffer = lines.pop(); // keep incomplete line
-
-                    for (const line of lines) {
-                        if (!line.startsWith('data: ')) continue;
-                        const jsonStr = line.slice(6).trim();
-                        if (!jsonStr || jsonStr === '[DONE]') continue;
-
-                        try {
-                            const event = JSON.parse(jsonStr);
-                            console.log('[SSE] Event:', event.type);
-
-                            switch (event.type) {
-                                case 'text':
-                                    appendStreamDelta(msgEl, event.text);
-                                    break;
-                                case 'tool_use':
-                                    addToolCallIndicator(msgEl, event.tool_name, event.tool_id, event.input);
-                                    break;
-                                case 'tool_result':
-                                    resolveToolCall(msgEl, event.tool_id, event.is_error, event.result);
-                                    break;
-                                case 'done':
-                                    state.lastModel = event.model;
-                                    finalizeStreamingMessage(msgEl, event.model, event.input_tokens, event.output_tokens, event.cache_read_tokens, event.cache_creation_tokens);
-                                    addTokens(event.input_tokens, event.output_tokens, event.context_tokens);
-                                    if (event.spawned_jobs && event.spawned_jobs.length > 0) {
-                                        startJobPolling(event.spawned_jobs);
-                                    }
-                                    break;
-                                case 'error':
-                                    const contentEl = msgEl.querySelector('.msg-content');
-                                    contentEl.classList.remove('streaming-cursor');
-                                    contentEl.innerHTML += '<p style="color: var(--error);">Error: ' + escapeHtml(event.message || 'Unknown error') + '</p>';
-                                    break;
-                            }
-                        } catch (parseErr) {
-                            console.warn('[SSE] Parse error:', parseErr, 'line:', line);
-                        }
-                    }
-                }
-
-                // Handle case where stream ends without a done event
-                if (document.getElementById('streaming-msg')) {
-                    finalizeStreamingMessage(msgEl, null, 0, 0);
-                }
-
             } catch (e) {
-                if (e.name === 'AbortError') {
-                    // User clicked stop — finalize with whatever we have
-                    finalizeStreamingMessage(msgEl, state.lastModel, 0, 0);
-                } else {
-                    const contentEl = msgEl.querySelector('.msg-content');
-                    const textZone = contentEl ? contentEl.querySelector('.stream-text-zone') : null;
-                    if (textZone) textZone.classList.remove('streaming-cursor');
-                    if (!contentEl.dataset.rawText) {
-                        if (textZone) textZone.innerHTML = '<span style="color: var(--error);">Stream error: ' + escapeHtml(e.message) + '</span>';
-                    } else {
-                        // Keep the text we have, just note the interruption
-                        finalizeStreamingMessage(msgEl, null, 0, 0);
-                    }
-                    msgEl.id = '';
-                }
+                appendMessage('assistant', 'Error: ' + e.message);
             } finally {
                 state.isStreaming = false;
                 state.streamAbort = null;
             }
         }
 
+        function applyChatOptions(chatBody) {
+            if (state.compactToolSchemas !== null) {
+                chatBody.compact_tool_schemas = !!state.compactToolSchemas;
+            }
+            if (state.plansRequired !== null) {
+                chatBody.plans_required = !!state.plansRequired;
+            }
+            chatBody.adapter_context =
+                'You are running from the web adapter. The daemon owns this task; the browser may refresh or disconnect. ' +
+                'Continue working from daemon state and return a clear final result for the active session. ' +
+                'When useful before tool calls, include at most one short user-visible progress sentence so the user can steer you. Do not include private reasoning.';
+        }
+
         /* ============================
            Non-streaming Chat
            ============================ */
-        async function sendNonStreaming(message) {
-            // Show loading
-            const loadEl = document.createElement('div');
-            loadEl.className = 'msg msg-assistant';
-            loadEl.innerHTML = '<div class="msg-loading"><div class="spinner"></div> Thinking...</div>';
-            dom.messagesEl.appendChild(loadEl);
-            scrollToBottom();
-
-            try {
-                const chatBody = { message };
-                if (state.modelOverride) chatBody.model_override = state.modelOverride;
-                if (state.pendingAttachments.length > 0) {
-                    chatBody.attachments = state.pendingAttachments.map(a => ({ path: a.path, mime: a.mime, name: a.name }));
-                }
-                const res = await fetch('/api/chat', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(chatBody),
-                });
-
-                const data = await res.json();
-                loadEl.remove();
-
-                if (data.error) {
-                    appendMessage('assistant', 'Error: ' + data.error);
-                } else {
-                    state.lastModel = data.model;
-                    const tokens = data.usage ? { input: data.usage.input_tokens, output: data.usage.output_tokens, context: data.usage.context_tokens, cache_read: data.usage.cache_read_tokens || 0, cache_creation: data.usage.cache_creation_tokens || 0 } : null;
-                    appendMessage('assistant', data.text || '(No response)', {
-                        tokens: tokens,
-                        model: data.model,
-                    });
-                    if (tokens) addTokens(tokens.input, tokens.output, tokens.context);
-                    // Poll spawned subagent jobs
-                    if (data.spawned_jobs && data.spawned_jobs.length > 0) {
-                        startJobPolling(data.spawned_jobs);
-                    }
-                }
-            } catch (e) {
-                loadEl.remove();
-                appendMessage('assistant', 'Error: ' + e.message);
-            }
+        async function sendNonStreaming(message, attachments = readyAttachments()) {
+            await sendStreaming(message, attachments);
         }
 
         /* ============================
@@ -2666,6 +2919,22 @@
             const message = dom.input.value.trim();
             if (!message && state.pendingAttachments.length === 0) return;
 
+            if (state.pendingAttachments.some(a => a.uploading)) {
+                state.isSending = true;
+                dom.sendBtn.disabled = true;
+                dom.sendBtn.textContent = 'Uploading...';
+                try {
+                    await waitForAttachmentUploads();
+                } finally {
+                    state.isSending = false;
+                    dom.sendBtn.disabled = false;
+                    dom.sendBtn.textContent = 'Send';
+                }
+            }
+
+            const attachments = readyAttachments();
+            if (!message && attachments.length === 0) return;
+
             dom.input.value = '';
             dom.input.style.height = 'auto';
             state.isSending = true;
@@ -2673,15 +2942,15 @@
             dom.sendBtn.classList.add('stop-mode');
             dom.sendBtn.disabled = false;
 
-            appendMessage('user', message, { attachments: state.pendingAttachments });
+            appendMessage('user', message, { attachments });
 
             const useStream = dom.useStreaming.checked;
 
             try {
                 if (useStream) {
-                    await sendStreaming(message);
+                    await sendStreaming(message, attachments);
                 } else {
-                    await sendNonStreaming(message);
+                    await sendNonStreaming(message, attachments);
                 }
                 loadSessions();
             } catch (e) {
@@ -2760,6 +3029,28 @@
                 URL.revokeObjectURL(localUrl);
             }
             renderAttachmentPreviews();
+        }
+
+        function readyAttachments() {
+            return state.pendingAttachments.filter(a => !a.uploading && a.path);
+        }
+
+        function waitForAttachmentUploads(timeoutMs = 15000) {
+            const started = Date.now();
+            return new Promise((resolve) => {
+                const tick = () => {
+                    if (!state.pendingAttachments.some(a => a.uploading)) {
+                        resolve();
+                        return;
+                    }
+                    if (Date.now() - started >= timeoutMs) {
+                        resolve();
+                        return;
+                    }
+                    setTimeout(tick, 100);
+                };
+                tick();
+            });
         }
 
         function fileToBase64(file) {
@@ -3157,6 +3448,70 @@
                     console.error('Failed to toggle auto-approve:', e);
                     toggle.checked = !enabled;
                 }
+            });
+        })();
+
+        // Compact tool schema toggle
+        (async function initCompactToolSchemas() {
+            const toggle = document.getElementById('compact-tools-toggle');
+            const statusEl = document.getElementById('compact-tools-status');
+            if (!toggle) return;
+
+            let enabled = false;
+            const stored = localStorage.getItem('clawforge.compactToolSchemas');
+            if (stored === 'true' || stored === 'false') {
+                enabled = stored === 'true';
+            } else {
+                try {
+                    const settings = await apiGet('/api/tools/settings');
+                    enabled = !!settings.compact_tool_schemas;
+                } catch (e) {
+                    enabled = false;
+                }
+            }
+
+            state.compactToolSchemas = enabled;
+            toggle.checked = enabled;
+            statusEl.textContent = enabled ? 'ON' : '';
+            statusEl.style.color = enabled ? 'var(--success)' : 'var(--text-dim)';
+
+            toggle.addEventListener('change', () => {
+                state.compactToolSchemas = toggle.checked;
+                localStorage.setItem('clawforge.compactToolSchemas', toggle.checked ? 'true' : 'false');
+                statusEl.textContent = toggle.checked ? 'ON' : '';
+                statusEl.style.color = toggle.checked ? 'var(--success)' : 'var(--text-dim)';
+            });
+        })();
+
+        // Plan requirement toggle
+        (async function initPlansRequired() {
+            const toggle = document.getElementById('plans-required-toggle');
+            const statusEl = document.getElementById('plans-required-status');
+            if (!toggle) return;
+
+            let enabled = true;
+            const stored = localStorage.getItem('clawforge.plansRequired');
+            if (stored === 'true' || stored === 'false') {
+                enabled = stored === 'true';
+            } else {
+                try {
+                    const settings = await apiGet('/api/tools/settings');
+                    enabled = settings.plans_required !== false;
+                } catch (e) {
+                    enabled = true;
+                }
+            }
+
+            state.plansRequired = enabled;
+            toggle.checked = enabled;
+            statusEl.textContent = enabled ? 'ON' : 'OFF';
+            statusEl.style.color = enabled ? 'var(--success)' : 'var(--warning)';
+
+            toggle.addEventListener('change', () => {
+                state.plansRequired = toggle.checked;
+                localStorage.setItem('clawforge.plansRequired', toggle.checked ? 'true' : 'false');
+                statusEl.textContent = toggle.checked ? 'ON' : 'OFF';
+                statusEl.style.color = toggle.checked ? 'var(--success)' : 'var(--warning)';
             });
         })();
 

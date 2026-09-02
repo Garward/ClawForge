@@ -1,15 +1,19 @@
 # Zig build artifacts
-zig-cache/
-zig-out/
+/zig-cache/
+/zig-out/
+/.zig-cache/
+/.zig-global-cache/
 *.o
-.zig-cache/
 
 # Compiled binaries
 router
 zig_api_test
 
 # Data directory (contains database)
-data/
+/data/
+*.db
+*.db-shm
+*.db-wal
 
 # Secrets
 .env
@@ -23,7 +27,13 @@ config/personas/*
 # Temporary files
 *.tmp
 *.temp
+*.backup
+*.backup.*
 .codex
+/.agents/
+/.claude/
+/.playwright-mcp/
+/narrative-*.png
 
 # IDE/Editor files
 .vscode/
@@ -36,6 +46,10 @@ config/personas/*
 __pycache__/
 *.pyc
 *.pyo
+/.venv/
+
+# Release output
+/dist/
 
 # Logs
 *.log

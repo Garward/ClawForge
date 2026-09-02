@@ -12,8 +12,24 @@
     "log_level": "info",
     "max_clients": 5
   },
+  "web": {
+    "enabled": true,
+    "port": 8081,
+    "host": "127.0.0.1",
+    "compact_tool_schemas": true,
+    "plans_required": true
+  },
+  "routing": {
+    "enabled": true,
+    "fast_model": "gpt-5.6-luna",
+    "default_model": "gpt-5.6-sol",
+    "smart_model": "gpt-5.6-sol",
+    "fast_provider": "codex",
+    "default_provider": "codex",
+    "smart_provider": "codex"
+  },
   "tools": {
-    "enabled": ["bash", "file_read", "file_write", "file_diff", "amazon_search", "calc", "introspect", "meme_tool", "rebuild", "zig_test", "research_tool", "summon_subagent", "subagent_inspect", "subagent_stop", "subagent_redirect", "discord_history"],
+    "enabled": ["bash", "file_find", "file_read", "file_write", "file_diff", "amazon_search", "calc", "introspect", "meme_tool", "playwright_mcp", "vision_read", "rebuild", "zig_test", "research_tool", "visual_audit", "summon_subagent", "subagent_inspect", "subagent_stop", "subagent_redirect", "discord_history"],
     "bash_require_confirmation": true,
     "bash_timeout_ms": 30000,
     "file_write_require_confirmation": true
@@ -28,13 +44,45 @@
     "enabled": true,
     "token_file": "",
     "guild_id": "",
-    "channel_id": ""
+    "channel_id": "",
+    "compact_tool_schemas": false,
+    "plans_required": true,
+    "attachment_spool": "data/discord_attachments",
+    "max_attachment_bytes": 26214400,
+    "max_attachment_count": 10,
+    "attachment_retention_seconds": 86400
   },
   "ollama": {
     "enabled": true,
     "base_url": "http://127.0.0.1:11434",
-    "default_model": "qwen3:4b",
-    "num_ctx": 49152
+    "default_model": "qwen2.5-coder:14b",
+    "num_ctx": 49152,
+    "model_contexts": [
+      {
+        "model": "qwen2.5-coder:14b",
+        "num_ctx": 32768
+      },
+      {
+        "model": "qwen2.5:14b",
+        "num_ctx": 32768
+      },
+      {
+        "model": "qwen3:4b",
+        "num_ctx": 49152
+      },
+      {
+        "model": "qwen3-coder:30b-a3b-q4_K_M",
+        "num_ctx": 16384
+      },
+      {
+        "model": "hf.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M",
+        "num_ctx": 16384
+      },
+      {
+        "model": "qwen3:30b",
+        "num_ctx": 16384
+      }
+    ]
   },
   "openrouter": {
     "enabled": true,
@@ -42,11 +90,11 @@
   },
   "codex": {
     "enabled": true,
-    "default_model": "codex"
+    "default_model": "gpt-5.6-sol"
   },
   "vision": {
     "enabled": true,
-    "model": "claude-haiku-4-5-20251001",
+    "model": "ollama:qwen2.5vl:7b",
     "max_image_bytes": 10485760,
     "max_images_per_turn": 2,
     "max_output_tokens": 512,

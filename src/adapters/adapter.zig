@@ -50,7 +50,7 @@ pub const Adapter = struct {
 
 /// Register an adapter in the database. Idempotent.
 pub fn registerAdapter(conn: *storage.Connection, adapter: Adapter) void {
-    const now = std.time.timestamp();
+    const now = common.sync.timestamp();
     var stmt = conn.prepare(
         "INSERT OR REPLACE INTO adapter_registry (adapter_name, display_name, version, registered_at, updated_at) VALUES (?, ?, ?, ?, ?)",
     ) catch return;

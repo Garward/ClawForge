@@ -18,7 +18,7 @@ pub const DaemonConfig = struct {
 };
 
 pub const ToolsConfig = struct {
-    enabled: []const []const u8 = &.{ "bash", "file_read", "file_write", "amazon_search" },
+    enabled: []const []const u8 = &.{ "bash", "file_find", "file_read", "file_write", "amazon_search", "playwright_mcp", "vision_read" },
     bash_require_confirmation: bool = true,
     bash_timeout_ms: u32 = 30000,
     file_write_require_confirmation: bool = true,
@@ -40,6 +40,8 @@ pub const WebConfig = struct {
     enabled: bool = true,
     port: u16 = 8081,
     host: []const u8 = "127.0.0.1",
+    compact_tool_schemas: bool = false,
+    plans_required: bool = true,
 };
 
 pub const RoutingConfig = struct {
@@ -54,10 +56,15 @@ pub const RoutingConfig = struct {
     smart_provider: []const u8 = "anthropic",
 };
 
+pub const OllamaModelContext = struct {
+    model: []const u8,
+    num_ctx: u32,
+};
+
 pub const OllamaConfig = struct {
     enabled: bool = false,
     base_url: []const u8 = "http://127.0.0.1:11434",
-    default_model: []const u8 = "qwen3:4b",
+    default_model: []const u8 = "qwen2.5-coder:14b",
     /// Maximum context window size the Ollama provider is allowed to use
     /// per-request as `options.num_ctx`. This is a VRAM ceiling — the
     /// provider will automatically scale the actual context DOWN to fit
@@ -68,19 +75,21 @@ pub const OllamaConfig = struct {
     /// file supports, silently truncating longer inputs. This setting
     /// overrides that per request.
     ///
-    /// Pick based on VRAM budget on your GPU:
-    ///   - 32768:  minimum for agentic loops; fits on any 16 GB+ card
-    ///             with a 30B q4 MoE model, tight headroom
-    ///   - 49152:  sweet spot on 20-24 GB — enough for ClawForge's
-    ///             compaction thresholds (200K chars trigger, 100K post)
-    ///             plus system prompt + tool defs + output headroom
-    ///   - 65536:  tight on 24 GB (KV cache ~6 GB + 19 GB weights); may
-    ///             spill to RAM if anything else is using the GPU
-    ///   - 131072+: requires 48 GB+ VRAM in practice; qwen3's native 256K
-    ///              ceiling isn't usable locally without workstation GPUs
+    /// This is the fallback cap. Prefer `model_contexts` for models with
+    /// different VRAM behavior; a 4B long-context model and a 14B coder
+    /// model should not be forced through the same ceiling.
+    ///
+    /// Practical local caps on a 20 GB RX 7900-class card:
+    ///   - 32768:  stable target for 14B Q4 coder models
+    ///   - 49152:  useful ceiling for small long-context models
+    ///   - 65536+: use only after benchmarking the exact model
     ///
     /// Raise this for long agent sessions; lower it for small-model chat.
     num_ctx: u32 = 49152,
+    /// Optional per-model context ceilings. Entries may use either bare
+    /// Ollama names such as "qwen2.5-coder:14b" or provider-prefixed names
+    /// such as "ollama:qwen2.5-coder:14b".
+    model_contexts: []const OllamaModelContext = &.{},
 };
 
 pub const ContextConfig = struct {
@@ -122,15 +131,22 @@ pub const DiscordConfig = struct {
     token_file: []const u8 = "",
     guild_id: []const u8 = "",
     channel_id: []const u8 = "",
+    compact_tool_schemas: bool = false,
+    plans_required: bool = true,
+    attachment_spool: []const u8 = "data/discord_attachments",
+    max_attachment_bytes: u32 = 25 * 1024 * 1024,
+    max_attachment_count: u8 = 10,
+    attachment_retention_seconds: u32 = 86400,
 };
 
 pub const VisionConfig = struct {
     /// Enable image analysis for attachments. If false, attachments are
     /// stored but no vision call is made.
     enabled: bool = true,
-    /// Model used for the vision call. Haiku is the budget default.
+    /// Model used for the vision call. Provider-prefixed models such as
+    /// "ollama:qwen2.5vl:7b" run locally and are unloaded after each call.
     /// Runtime overridable via /api/vision.
-    model: []const u8 = "claude-haiku-4-5-20251001",
+    model: []const u8 = "ollama:qwen2.5vl:7b",
     /// Cap per-image bytes to bound vision input cost. Images larger
     /// than this are skipped with an explanatory description.
     max_image_bytes: u32 = 10 * 1024 * 1024, // 10 MB
@@ -214,16 +230,18 @@ pub const Config = struct {
         const resolved_path = try resolveProjectPath(allocator, config_path orelse "config/config.json");
         defer allocator.free(resolved_path);
 
-        const file = fs.cwd().openFile(resolved_path, .{}) catch |err| {
+        const io = process_io orelse return error.ProcessRuntimeNotInitialized;
+        var file = std.Io.Dir.openFileAbsolute(io, resolved_path, .{}) catch |err| {
             if (err == error.FileNotFound) {
                 std.log.info("Config file not found at {s}, using defaults", .{resolved_path});
                 return Config.defaults();
             }
             return err;
         };
-        defer file.close();
+        defer file.close(io);
+        var file_reader = file.reader(io, &.{});
 
-        const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+        const content = try file_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
         defer allocator.free(content);
 
         const parsed = try json.parseFromSlice(ConfigData, allocator, content, .{
@@ -251,16 +269,45 @@ pub const Config = struct {
     }
 };
 
+var process_environ: ?*const std.process.Environ.Map = null;
+var process_io: ?std.Io = null;
+
+pub fn setProcessRuntime(environ: *const std.process.Environ.Map, io: std.Io) void {
+    process_environ = environ;
+    process_io = io;
+}
+
+/// Process-wide Io used by long-lived synchronization and filesystem helpers.
+/// Tests receive Zig's test Io automatically.
+pub fn runtimeIo() std.Io {
+    if (process_io) |io| return io;
+    if (@import("builtin").is_test) return std.testing.io;
+    @panic("ClawForge process runtime was not initialized");
+}
+
+pub fn getEnvVar(key: []const u8) ?[]const u8 {
+    const environ = process_environ orelse return null;
+    return environ.get(key);
+}
+
+pub fn getEnvVarOwned(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
+    const environ = process_environ orelse return error.EnvironmentVariableNotFound;
+    const value = environ.get(key) orelse return error.EnvironmentVariableNotFound;
+    return allocator.dupe(u8, value);
+}
+
 /// Get the project root directory.
 /// Priority: CLAWFORGE_ROOT env var, else derived from exe path (exe_dir/../..).
 /// Caller owns returned memory.
 pub fn getProjectRoot(allocator: std.mem.Allocator) ![]const u8 {
-    if (std.process.getEnvVarOwned(allocator, "CLAWFORGE_ROOT")) |v| {
+    if (getEnvVarOwned(allocator, "CLAWFORGE_ROOT")) |v| {
         return v;
     } else |_| {}
 
-    const exe_dir = try std.fs.selfExeDirPathAlloc(allocator);
-    defer allocator.free(exe_dir);
+    const io = process_io orelse return error.ProcessRuntimeNotInitialized;
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_len = try std.Io.Dir.readLinkAbsolute(io, "/proc/self/exe", &exe_buf);
+    const exe_dir = std.fs.path.dirname(exe_buf[0..exe_len]) orelse return error.InvalidExecutablePath;
     const parent1 = std.fs.path.dirname(exe_dir) orelse exe_dir;
     const root = std.fs.path.dirname(parent1) orelse parent1;
     return try allocator.dupe(u8, root);
@@ -278,14 +325,14 @@ pub fn resolveProjectPath(allocator: std.mem.Allocator, path: []const u8) ![]con
 
 /// Path to the SQLite workspace DB.
 pub fn getDbPath(allocator: std.mem.Allocator) ![]const u8 {
-    if (std.process.getEnvVarOwned(allocator, "CLAWFORGE_DB")) |v| return v else |_| {}
+    if (getEnvVarOwned(allocator, "CLAWFORGE_DB")) |v| return v else |_| {}
     return resolveProjectPath(allocator, "data/workspace.db");
 }
 
 /// Path to python interpreter used for tool scripts.
 /// Priority: CLAWFORGE_PYTHON env, then .env CLAWFORGE_PYTHON, then "python3" on PATH.
 pub fn getPython(allocator: std.mem.Allocator) ![]const u8 {
-    if (std.process.getEnvVarOwned(allocator, "CLAWFORGE_PYTHON")) |v| return v else |_| {}
+    if (getEnvVarOwned(allocator, "CLAWFORGE_PYTHON")) |v| return v else |_| {}
     if (loadEnvKey(allocator, "CLAWFORGE_PYTHON")) |v| return v else |_| {}
     return try allocator.dupe(u8, "python3");
 }
@@ -300,10 +347,12 @@ pub fn getToolScript(allocator: std.mem.Allocator, name: []const u8) ![]const u8
 pub fn loadApiKey(allocator: std.mem.Allocator, token_path: []const u8) ![]const u8 {
     const resolved = try resolveProjectPath(allocator, token_path);
     defer allocator.free(resolved);
-    const file = try fs.openFileAbsolute(resolved, .{});
-    defer file.close();
+    const io = runtimeIo();
+    var file = try std.Io.Dir.openFileAbsolute(io, resolved, .{});
+    defer file.close(io);
+    var file_reader = file.reader(io, &.{});
 
-    const content = try file.readToEndAlloc(allocator, 1024);
+    const content = try file_reader.interface.allocRemaining(allocator, .limited(1024));
     // Trim whitespace and newlines
     const trimmed = std.mem.trim(u8, content, &std.ascii.whitespace);
 
@@ -321,10 +370,12 @@ pub fn loadEnvKey(allocator: std.mem.Allocator, env_var: []const u8) ![]const u8
     const env_path = try resolveProjectPath(allocator, ".env");
     defer allocator.free(env_path);
 
-    const file = try fs.openFileAbsolute(env_path, .{});
-    defer file.close();
+    const io = runtimeIo();
+    var file = try std.Io.Dir.openFileAbsolute(io, env_path, .{});
+    defer file.close(io);
+    var file_reader = file.reader(io, &.{});
 
-    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    const content = try file_reader.interface.allocRemaining(allocator, .limited(64 * 1024));
     defer allocator.free(content);
 
     var lines = std.mem.splitScalar(u8, content, '\n');

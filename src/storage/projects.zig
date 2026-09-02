@@ -13,7 +13,7 @@ pub const ProjectStore = struct {
     }
 
     pub fn createProject(self: *ProjectStore, name: []const u8, description: ?[]const u8) !ProjectInfo {
-        const now = std.time.timestamp();
+        const now = common.sync.timestamp();
         var stmt = try self.conn.prepare(
             "INSERT INTO projects (namespace_id, name, description, status, rolling_state, metadata, created_at, updated_at) VALUES (?, ?, ?, 'active', '{}', '{}', ?, ?)",
         );
@@ -109,7 +109,7 @@ pub const ProjectStore = struct {
         defer stmt.deinit();
         try stmt.bindOptionalText(1, summary);
         try stmt.bindOptionalText(2, state);
-        try stmt.bindInt64(3, std.time.timestamp());
+        try stmt.bindInt64(3, common.sync.timestamp());
         try stmt.bindInt64(4, project_id);
         try stmt.exec();
     }
@@ -138,7 +138,7 @@ pub const ProjectStore = struct {
         );
         defer stmt.deinit();
         try stmt.bindInt64(1, project_id);
-        try stmt.bindInt64(2, std.time.timestamp());
+        try stmt.bindInt64(2, common.sync.timestamp());
         try stmt.bindText(3, session_id);
         try stmt.exec();
     }
@@ -149,7 +149,7 @@ pub const ProjectStore = struct {
             "UPDATE sessions SET project_id = NULL, updated_at = ? WHERE id = ?",
         );
         defer stmt.deinit();
-        try stmt.bindInt64(1, std.time.timestamp());
+        try stmt.bindInt64(1, common.sync.timestamp());
         try stmt.bindText(2, session_id);
         try stmt.exec();
     }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const common = @import("common");
 const db_mod = @import("db.zig");
 
 /// Skill — a reusable instruction template with trigger matching.
@@ -42,8 +43,33 @@ pub const SkillStore = struct {
         return .{ .conn = conn, .allocator = allocator, .namespace_id = namespace_id };
     }
 
+    /// Add built-in operational guidance without replacing user-created skills.
+    pub fn ensureBuiltinSkills(self: *SkillStore) !void {
+        const now = common.sync.timestamp();
+        var stmt = try self.conn.prepare(
+            "INSERT OR IGNORE INTO skills " ++
+                "(namespace_id, name, category, trigger_type, trigger_value, instruction, priority, enabled, created_at, updated_at) " ++
+                "VALUES (?, 'ClawForge operations', 'operations', 'keyword', ?, ?, 30, 1, ?, ?)",
+        );
+        defer stmt.deinit();
+        try stmt.bindInt64(1, self.namespace_id);
+        try stmt.bindText(2, "clawforge,clawforged,clawforge-update,clawforge-active,workspace.db");
+        try stmt.bindText(3,
+            \\For ClawForge operational questions, first distinguish the Git source checkout from the active runtime. Source deployments default to a sibling ClawForge-active directory; release installs default to ${XDG_DATA_HOME:-$HOME/.local/share}/clawforge. Confirm actual paths from CLAWFORGE_ROOT, CLAWFORGE_DB, CLAWFORGE_DAEMON, the running process, or .env instead of assuming.
+            \\
+            \\The active root owns mutable state: .env contains secrets and machine paths; config/config.json contains provider, routing, adapter, and tool settings; config/personas contains personas; data/workspace.db contains sessions, messages, knowledge, projects, and skills; data/auth-profiles.json and token files are sensitive. Never replace these during an update. Back up .env, config, and data before destructive maintenance or database repair.
+            \\
+            \\From source, use scripts/deploy.sh --build, then restart the active tree. A build failure must leave the active runtime unchanged. From an installed release, use clawforge-update; it downloads the latest versioned archive, verifies its SHA-256 checksum, preserves runtime data/config, and restarts only if already running. restart.sh clean deletes messages and sessions and requires explicit user intent.
+            \\
+            \\The clawforged Zig daemon owns the model providers, agent loop, tools, workers, SQLite storage, web UI, and socket server. The clawforge binary is the CLI. The Discord adapter launches bridges/discord_bridge.py with the active .venv. For failures, check /tmp/clawforge.log, /tmp/clawforge_rebuild.log, the configured paths, and http://127.0.0.1:8081/api/status.
+        );
+        try stmt.bindInt64(4, now);
+        try stmt.bindInt64(5, now);
+        try stmt.exec();
+    }
+
     pub fn create(self: *SkillStore, params: CreateParams) !i64 {
-        const now = std.time.timestamp();
+        const now = common.sync.timestamp();
         var stmt = try self.conn.prepare(
             "INSERT INTO skills (namespace_id, name, category, trigger_type, trigger_value, " ++
                 "instruction, priority, enabled, created_at, updated_at) " ++
@@ -74,7 +100,7 @@ pub const SkillStore = struct {
     }
 
     pub fn setEnabled(self: *SkillStore, id: i64, enabled: bool) !void {
-        const now = std.time.timestamp();
+        const now = common.sync.timestamp();
         var stmt = try self.conn.prepare("UPDATE skills SET enabled = ?, updated_at = ? WHERE id = ? AND namespace_id = ?");
         defer stmt.deinit();
         try stmt.bindInt64(1, if (enabled) 1 else 0);

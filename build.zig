@@ -44,6 +44,18 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Shared provider-neutral inference contracts. Chat and Narrative both
+    // depend on this module; Narrative deliberately does not import core.Engine.
+    const inference_mod = b.createModule(.{
+        .root_source_file = b.path("src/inference/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "common", .module = common_mod },
+            .{ .name = "api", .module = api_mod },
+        },
+    });
+
     // Workers module: background processing (summarizer, extractor)
     const workers_mod = b.createModule(.{
         .root_source_file = b.path("src/workers/root.zig"),
@@ -67,6 +79,20 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tools", .module = tools_mod },
             .{ .name = "storage", .module = storage_mod },
             .{ .name = "workers", .module = workers_mod },
+            .{ .name = "inference", .module = inference_mod },
+        },
+    });
+
+    // Narrative Studio is a standalone application subsystem. It shares
+    // inference and storage primitives but never imports the chat Engine.
+    const narrative_mod = b.createModule(.{
+        .root_source_file = b.path("src/narrative/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "common", .module = common_mod },
+            .{ .name = "storage", .module = storage_mod },
+            .{ .name = "inference", .module = inference_mod },
         },
     });
 
@@ -79,6 +105,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "common", .module = common_mod },
             .{ .name = "core", .module = core_mod },
             .{ .name = "storage", .module = storage_mod },
+            .{ .name = "narrative", .module = narrative_mod },
         },
     });
 
@@ -116,6 +143,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "daemon", .module = daemon_mod },
             .{ .name = "adapters", .module = adapters_mod },
             .{ .name = "workers", .module = workers_mod },
+            .{ .name = "inference", .module = inference_mod },
+            .{ .name = "narrative", .module = narrative_mod },
         },
     });
 
@@ -215,6 +244,44 @@ pub fn build(b: *std.Build) void {
         .root_module = storage_test_mod,
     });
 
+    const workers_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/workers/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "common", .module = common_mod },
+            .{ .name = "api", .module = api_mod },
+            .{ .name = "storage", .module = storage_mod },
+        },
+    });
+
+    const workers_tests = b.addTest(.{
+        .root_module = workers_test_mod,
+    });
+
+    const inference_tests = b.addTest(.{
+        .root_module = inference_mod,
+    });
+
+    const narrative_tests = b.addTest(.{
+        .root_module = narrative_mod,
+    });
+
+    const tools_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "common", .module = common_mod },
+            .{ .name = "api", .module = api_mod },
+            .{ .name = "storage", .module = storage_mod },
+        },
+    });
+
+    const tools_tests = b.addTest(.{
+        .root_module = tools_test_mod,
+    });
+
     // SIMD tests
     const simd_test_mod = b.createModule(.{
         .root_source_file = b.path("src/common/simd.zig"),
@@ -230,6 +297,10 @@ pub fn build(b: *std.Build) void {
     const run_api_tests = b.addRunArtifact(api_tests);
     const run_router_tests = b.addRunArtifact(router_tests);
     const run_storage_tests = b.addRunArtifact(storage_tests);
+    const run_workers_tests = b.addRunArtifact(workers_tests);
+    const run_inference_tests = b.addRunArtifact(inference_tests);
+    const run_narrative_tests = b.addRunArtifact(narrative_tests);
+    const run_tools_tests = b.addRunArtifact(tools_tests);
     const run_simd_tests = b.addRunArtifact(simd_tests);
 
     const test_step = b.step("test", "Run unit tests");
@@ -237,5 +308,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_api_tests.step);
     test_step.dependOn(&run_router_tests.step);
     test_step.dependOn(&run_storage_tests.step);
+    test_step.dependOn(&run_workers_tests.step);
+    test_step.dependOn(&run_inference_tests.step);
+    test_step.dependOn(&run_narrative_tests.step);
+    test_step.dependOn(&run_tools_tests.step);
     test_step.dependOn(&run_simd_tests.step);
 }

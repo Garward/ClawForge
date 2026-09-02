@@ -1,8 +1,10 @@
 const std = @import("std");
 const common = @import("common");
 const core = @import("core");
+const narrative = @import("narrative");
 const storage = @import("storage");
 const adapter_mod = @import("adapter.zig");
+const narrative_controller = @import("web/narrative_controller.zig");
 
 /// Web adapter: HTTP server with JSON API and SSE streaming.
 /// Serves the web UI at / and API at /api/*.
@@ -14,7 +16,10 @@ pub const WebAdapter = struct {
     /// (e.g., /api/vision POST) are applied to both engines so subagents
     /// inherit the user's runtime choices.
     bg_engine: ?*core.Engine = null,
-    server: ?std.net.Server,
+    /// Narrative Studio stays behind its own service boundary rather than
+    /// adding story-specific orchestration to the general chat adapter.
+    narrative_service: ?*narrative.Service = null,
+    server: ?common.net.Server,
     running: bool,
 
     pub fn init(
@@ -27,6 +32,7 @@ pub const WebAdapter = struct {
             .config = config,
             .engine = engine_ptr,
             .bg_engine = null,
+            .narrative_service = null,
             .server = null,
             .running = false,
         };
@@ -36,6 +42,10 @@ pub const WebAdapter = struct {
     /// config endpoints update both engines at once.
     pub fn setBgEngine(self: *WebAdapter, bg: *core.Engine) void {
         self.bg_engine = bg;
+    }
+
+    pub fn setNarrativeService(self: *WebAdapter, service: *narrative.Service) void {
+        self.narrative_service = service;
     }
 
     pub fn adapter(self: *WebAdapter) adapter_mod.Adapter {
@@ -55,7 +65,7 @@ pub const WebAdapter = struct {
     fn start(ptr: *anyopaque) !void {
         const self: *WebAdapter = @ptrCast(@alignCast(ptr));
 
-        const address = std.net.Address.parseIp4(self.config.web.host, self.config.web.port) catch {
+        const address = common.net.Address.parseIp4(self.config.web.host, self.config.web.port) catch {
             std.log.err("Invalid web server address: {s}:{d}", .{ self.config.web.host, self.config.web.port });
             return error.InvalidAddress;
         };
@@ -108,7 +118,7 @@ pub const WebAdapter = struct {
 
     // -- HTTP handling (same as daemon/web.zig, refactored here) --
 
-    fn handleConnection(self: *WebAdapter, conn: std.net.Server.Connection) !void {
+    fn handleConnection(self: *WebAdapter, conn: common.net.Server.Connection) !void {
         defer conn.stream.close();
 
         // Read headers (first chunk — headers always fit in 8KB)
@@ -183,13 +193,30 @@ pub const WebAdapter = struct {
         return 0;
     }
 
-    fn dispatchRequest(self: *WebAdapter, stream: std.net.Stream, method: []const u8, path: []const u8, body: []const u8) !void {
-        if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) {
+    fn dispatchRequest(self: *WebAdapter, stream: common.net.Stream, method: []const u8, path: []const u8, body: []const u8) !void {
+        if (narrative_controller.Controller.handles(path)) {
+            if (self.narrative_service) |service| {
+                var controller = narrative_controller.Controller{
+                    .allocator = self.allocator,
+                    .service = service,
+                };
+                try controller.handle(stream, method, path, body);
+            } else {
+                try self.sendHttp(
+                    stream,
+                    "503 Service Unavailable",
+                    "application/json",
+                    "{\"error\":\"Narrative Studio is unavailable\"}",
+                );
+            }
+        } else if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) {
             try self.serveIndex(stream);
         } else if (std.mem.eql(u8, path, "/api/chat/stream")) {
             try self.handleApiChatStream(stream, method, body);
         } else if (std.mem.eql(u8, path, "/api/chat/background")) {
             try self.handleApiChatBackground(stream, method, body);
+        } else if (std.mem.eql(u8, path, "/api/background/active")) {
+            try self.handleApiBackgroundActive(stream, method, body);
         } else if (std.mem.startsWith(u8, path, "/api/background")) {
             try self.handleApiBackground(stream, method, path, body);
         } else if (std.mem.startsWith(u8, path, "/api/chat")) {
@@ -206,6 +233,8 @@ pub const WebAdapter = struct {
             try self.handleApiProjects(stream);
         } else if (std.mem.startsWith(u8, path, "/api/tools/register")) {
             try self.handleApiToolRegister(stream, body);
+        } else if (std.mem.eql(u8, path, "/api/tools/settings")) {
+            try self.handleApiToolSettings(stream, method);
         } else if (std.mem.eql(u8, path, "/api/tools/autoapprove")) {
             try self.handleApiToolAutoApprove(stream, method, body);
         } else if (std.mem.eql(u8, path, "/api/tools")) {
@@ -227,10 +256,11 @@ pub const WebAdapter = struct {
         }
     }
 
-    fn sendHttp(self: *WebAdapter, stream: std.net.Stream, status: []const u8, content_type: []const u8, http_body: []const u8) !void {
+    fn sendHttp(self: *WebAdapter, stream: common.net.Stream, status: []const u8, content_type: []const u8, http_body: []const u8) !void {
         _ = self;
         var header_buf: [512]u8 = undefined;
-        const header = std.fmt.bufPrint(&header_buf,
+        const header = std.fmt.bufPrint(
+            &header_buf,
             "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
             .{ status, content_type, http_body.len },
         ) catch return;
@@ -238,12 +268,12 @@ pub const WebAdapter = struct {
         _ = stream.write(http_body) catch return;
     }
 
-    fn serveIndex(self: *WebAdapter, stream: std.net.Stream) !void {
+    fn serveIndex(self: *WebAdapter, stream: common.net.Stream) !void {
         const html = @embedFile("web/index.html");
         try self.sendHttp(stream, "200 OK", "text/html; charset=utf-8", html);
     }
 
-    fn handleApiChat(self: *WebAdapter, stream: std.net.Stream, method: []const u8, body: []const u8) !void {
+    fn handleApiChat(self: *WebAdapter, stream: common.net.Stream, method: []const u8, body: []const u8) !void {
         if (!std.mem.eql(u8, method, "POST")) {
             try self.sendHttp(stream, "405 Method Not Allowed", "text/plain", "Method Not Allowed");
             return;
@@ -263,6 +293,14 @@ pub const WebAdapter = struct {
         };
 
         const no_tools = if (parsed.value.object.get("no_tools")) |v| (v == .bool and v.bool) else false;
+        const compact_tool_schemas = if (parsed.value.object.get("compact_tool_schemas")) |v|
+            (v == .bool and v.bool)
+        else
+            self.config.web.compact_tool_schemas;
+        const plans_required = if (parsed.value.object.get("plans_required")) |v|
+            (v == .bool and v.bool)
+        else
+            self.config.web.plans_required;
         const session_id = if (parsed.value.object.get("session_id")) |v| (if (v == .string) v.string else null) else null;
         const model_override = if (parsed.value.object.get("model_override")) |v| (if (v == .string) v.string else null) else null;
         const allowed_tools = if (parsed.value.object.get("allowed_tools")) |v| (if (v == .string) v.string else null) else null;
@@ -275,15 +313,18 @@ pub const WebAdapter = struct {
             .session_id = session_id,
             .model_override = model_override,
             .no_tools = no_tools,
+            .compact_tool_schemas = compact_tool_schemas,
+            .plans_required = plans_required,
             .allowed_tools = allowed_tools,
             .adapter_context = adapter_context,
             .attachments = attachments,
+            .background = true,
         } }, null, null);
 
         switch (result) {
             .chat => |chat| {
                 // Dynamic buffer: text can be arbitrarily large
-                var json_out: std.ArrayList(u8) = .{};
+                var json_out: std.ArrayList(u8) = .empty;
                 defer json_out.deinit(self.allocator);
 
                 // Reserve estimated capacity: text + JSON overhead
@@ -346,13 +387,22 @@ pub const WebAdapter = struct {
                         const err_json = std.fmt.bufPrint(&err_buf, "{{\"error\":\"{s}\"}}", .{err.message}) catch "{\"error\":\"Internal error\"}";
                         try self.sendHttp(stream, "500 Internal Server Error", "application/json", err_json);
                     },
+                    .background_queued => |bg| {
+                        var out: [512]u8 = undefined;
+                        const json_resp = std.fmt.bufPrint(
+                            &out,
+                            "{{\"ok\":true,\"text\":\"Queued in ClawForge as background job {s}.\",\"spawned_jobs\":[\"{s}\"],\"session_id\":\"{s}\"}}",
+                            .{ bg.job_id, bg.job_id, bg.session_id },
+                        ) catch "{\"ok\":true,\"text\":\"Queued in ClawForge.\",\"spawned_jobs\":[]}";
+                        try self.sendHttp(stream, "200 OK", "application/json", json_resp);
+                    },
                     else => try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Unexpected response\"}"),
                 }
             },
         }
     }
 
-    fn handleApiChatBackground(self: *WebAdapter, stream: std.net.Stream, method: []const u8, body: []const u8) !void {
+    fn handleApiChatBackground(self: *WebAdapter, stream: common.net.Stream, method: []const u8, body: []const u8) !void {
         if (!std.mem.eql(u8, method, "POST")) {
             try self.sendHttp(stream, "405 Method Not Allowed", "text/plain", "Method Not Allowed");
             return;
@@ -376,6 +426,15 @@ pub const WebAdapter = struct {
         const model_override = if (parsed.value.object.get("model_override")) |v| (if (v == .string) v.string else null) else null;
         const callback_channel = if (parsed.value.object.get("callback_channel")) |v| (if (v == .string) v.string else null) else null;
         const allowed_tools = if (parsed.value.object.get("allowed_tools")) |v| (if (v == .string) v.string else null) else null;
+        const adapter_context = if (parsed.value.object.get("adapter_context")) |v| (if (v == .string) v.string else null) else null;
+        const compact_tool_schemas = if (parsed.value.object.get("compact_tool_schemas")) |v|
+            (v == .bool and v.bool)
+        else
+            self.config.web.compact_tool_schemas;
+        const plans_required = if (parsed.value.object.get("plans_required")) |v|
+            (v == .bool and v.bool)
+        else
+            self.config.web.plans_required;
         const attachments = parseAttachments(self.allocator, parsed.value);
         defer if (attachments) |a| self.allocator.free(a);
 
@@ -385,6 +444,9 @@ pub const WebAdapter = struct {
             .model_override = model_override,
             .callback_channel = callback_channel,
             .allowed_tools = allowed_tools,
+            .adapter_context = adapter_context,
+            .compact_tool_schemas = compact_tool_schemas,
+            .plans_required = plans_required,
             .background = true,
             .attachments = attachments,
         } }, null, null);
@@ -407,7 +469,7 @@ pub const WebAdapter = struct {
         }
     }
 
-    fn handleApiBackground(self: *WebAdapter, stream: std.net.Stream, method: []const u8, path: []const u8, body: []const u8) !void {
+    fn handleApiBackground(self: *WebAdapter, stream: common.net.Stream, method: []const u8, path: []const u8, body: []const u8) !void {
         if (!std.mem.eql(u8, method, "POST")) {
             try self.sendHttp(stream, "405 Method Not Allowed", "text/plain", "Method Not Allowed");
             return;
@@ -435,8 +497,23 @@ pub const WebAdapter = struct {
                 try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"No worker pool\"}");
                 return;
             };
-            _ = wp.cancelBackgroundJob(&job_id);
-            try self.sendHttp(stream, "200 OK", "application/json", "{\"ok\":true}");
+            const ok = wp.cancelBackgroundJob(&job_id);
+            try self.sendHttp(stream, "200 OK", "application/json", if (ok) "{\"ok\":true}" else "{\"ok\":false,\"error\":\"Job not active\"}");
+            return;
+        }
+
+        if (std.mem.endsWith(u8, path, "/steer")) {
+            const wp = self.engine.worker_pool orelse {
+                try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"No worker pool\"}");
+                return;
+            };
+            const note = if (parsed.value.object.get("message")) |v| (if (v == .string) v.string else null) else null;
+            if (note == null or note.?.len == 0) {
+                try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Missing message\"}");
+                return;
+            }
+            const ok = wp.queueBackgroundSteering(&job_id, note.?);
+            try self.sendHttp(stream, "200 OK", "application/json", if (ok) "{\"ok\":true}" else "{\"ok\":false,\"error\":\"Job not active\"}");
             return;
         }
 
@@ -469,10 +546,18 @@ pub const WebAdapter = struct {
             try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"No worker pool\"}");
             return;
         };
+        const cursor = blk: {
+            if (parsed.value.object.get("cursor")) |cv| {
+                if (cv == .integer) break :blk @as(usize, @intCast(@max(0, cv.integer)));
+            }
+            break :blk @as(usize, 0);
+        };
 
         if (wp.getBackgroundResult(&job_id)) |result| {
-            var out: std.ArrayList(u8) = .{};
+            var out: std.ArrayList(u8) = .empty;
             defer out.deinit(self.allocator);
+            const te = try wp.getToolEvents(&job_id, cursor);
+            defer te.deinit();
 
             const status_str = switch (result.status) {
                 .completed => "completed",
@@ -511,12 +596,60 @@ pub const WebAdapter = struct {
             out.appendSlice(self.allocator, std.fmt.bufPrint(&num_buf, "{d}", .{result.input_tokens}) catch "0") catch {};
             out.appendSlice(self.allocator, ",\"output_tokens\":") catch {};
             out.appendSlice(self.allocator, std.fmt.bufPrint(&num_buf, "{d}", .{result.output_tokens}) catch "0") catch {};
+            out.appendSlice(self.allocator, ",\"tool_events\":[") catch {};
+            var first_evt = true;
+            for (te.events) |maybe_evt| {
+                const evt = maybe_evt orelse continue;
+                if (!first_evt) out.appendSlice(self.allocator, ",") catch {};
+                first_evt = false;
+                out.appendSlice(self.allocator, "{\"type\":\"") catch {};
+                out.appendSlice(
+                    self.allocator,
+                    switch (evt.event_type) {
+                        .tool_use => "tool_use",
+                        .tool_result => "tool_result",
+                        .model_wait => "model_wait",
+                        .model_text => "model_text",
+                        .control => "control",
+                    },
+                ) catch {};
+                out.appendSlice(self.allocator, "\",\"tool\":\"") catch {};
+                out.appendSlice(self.allocator, evt.tool_name) catch {};
+                out.appendSlice(self.allocator, "\",\"content\":\"") catch {};
+                for (evt.content) |ch| {
+                    switch (ch) {
+                        '"' => out.appendSlice(self.allocator, "\\\"") catch {},
+                        '\\' => out.appendSlice(self.allocator, "\\\\") catch {},
+                        '\n' => out.appendSlice(self.allocator, "\\n") catch {},
+                        '\r' => out.appendSlice(self.allocator, "\\r") catch {},
+                        '\t' => out.appendSlice(self.allocator, "\\t") catch {},
+                        else => {
+                            if (ch < 0x20) {
+                                out.appendSlice(self.allocator, "\\u00") catch {};
+                                const hex = "0123456789abcdef";
+                                out.append(self.allocator, hex[ch >> 4]) catch {};
+                                out.append(self.allocator, hex[ch & 0xf]) catch {};
+                            } else {
+                                out.append(self.allocator, ch) catch {};
+                            }
+                        },
+                    }
+                }
+                out.appendSlice(self.allocator, "\"") catch {};
+                if (evt.is_error) {
+                    out.appendSlice(self.allocator, ",\"is_error\":true") catch {};
+                }
+                out.appendSlice(self.allocator, "}") catch {};
+            }
+            var cursor_buf: [32]u8 = undefined;
+            out.appendSlice(self.allocator, "],\"cursor\":") catch {};
+            out.appendSlice(self.allocator, std.fmt.bufPrint(&cursor_buf, "{d}", .{te.new_cursor}) catch "0") catch {};
             out.appendSlice(self.allocator, "}") catch {};
             try self.sendHttp(stream, "200 OK", "application/json", out.items);
         } else {
             // No result yet — check for pending tool confirmation
             if (wp.getPendingConfirmation(&job_id)) |conf| {
-                var out: std.ArrayList(u8) = .{};
+                var out: std.ArrayList(u8) = .empty;
                 defer out.deinit(self.allocator);
                 out.appendSlice(self.allocator, "{\"status\":\"pending\",\"pending_confirmation\":{\"tool_name\":\"") catch {};
                 out.appendSlice(self.allocator, conf.tool_name) catch {};
@@ -537,15 +670,10 @@ pub const WebAdapter = struct {
                 try self.sendHttp(stream, "200 OK", "application/json", out.items);
             } else {
                 // No confirmation pending — return tool events if any
-                const cursor = blk: {
-                    if (parsed.value.object.get("cursor")) |cv| {
-                        if (cv == .integer) break :blk @as(usize, @intCast(@max(0, cv.integer)));
-                    }
-                    break :blk @as(usize, 0);
-                };
-                const te = wp.getToolEvents(&job_id, cursor);
+                const te = try wp.getToolEvents(&job_id, cursor);
+                defer te.deinit();
                 if (te.events.len > 0 or te.new_cursor > 0) {
-                    var out2: std.ArrayList(u8) = .{};
+                    var out2: std.ArrayList(u8) = .empty;
                     defer out2.deinit(self.allocator);
                     out2.appendSlice(self.allocator, "{\"status\":\"pending\",\"tool_events\":[") catch {};
                     var first = true;
@@ -554,7 +682,16 @@ pub const WebAdapter = struct {
                         if (!first) out2.appendSlice(self.allocator, ",") catch {};
                         first = false;
                         out2.appendSlice(self.allocator, "{\"type\":\"") catch {};
-                        out2.appendSlice(self.allocator, if (evt.event_type == .tool_use) "tool_use" else "tool_result") catch {};
+                        out2.appendSlice(
+                            self.allocator,
+                            switch (evt.event_type) {
+                                .tool_use => "tool_use",
+                                .tool_result => "tool_result",
+                                .model_wait => "model_wait",
+                                .model_text => "model_text",
+                                .control => "control",
+                            },
+                        ) catch {};
                         out2.appendSlice(self.allocator, "\",\"tool\":\"") catch {};
                         out2.appendSlice(self.allocator, evt.tool_name) catch {};
                         out2.appendSlice(self.allocator, "\",\"content\":\"") catch {};
@@ -588,6 +725,12 @@ pub const WebAdapter = struct {
                     out2.appendSlice(self.allocator, std.fmt.bufPrint(&num_buf2, "{d}", .{te.new_cursor}) catch "0") catch {};
                     out2.appendSlice(self.allocator, "}") catch {};
                     try self.sendHttp(stream, "200 OK", "application/json", out2.items);
+                } else if (!wp.hasBackgroundJob(&job_id)) {
+                    // Browser-local recovery IDs survive a daemon restart,
+                    // but the process-local queue/event/result state does
+                    // not. Distinguish that from a genuinely queued job so
+                    // the UI can offer a continuation instead of spinning.
+                    try self.sendHttp(stream, "200 OK", "application/json", "{\"status\":\"interrupted\"}");
                 } else {
                     try self.sendHttp(stream, "200 OK", "application/json", "{\"status\":\"pending\"}");
                 }
@@ -595,9 +738,58 @@ pub const WebAdapter = struct {
         }
     }
 
+    fn handleApiBackgroundActive(self: *WebAdapter, stream: common.net.Stream, method: []const u8, body: []const u8) !void {
+        if (!std.mem.eql(u8, method, "POST")) {
+            try self.sendHttp(stream, "405 Method Not Allowed", "text/plain", "Method Not Allowed");
+            return;
+        }
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{
+            .allocate = .alloc_always,
+        }) catch {
+            try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Invalid JSON\"}");
+            return;
+        };
+        defer parsed.deinit();
+
+        var session_buf: [36]u8 = undefined;
+        const session_filter: ?*const [36]u8 = blk: {
+            const sid = if (parsed.value.object.get("session_id")) |v| (if (v == .string) v.string else null) else null;
+            if (sid == null or sid.?.len != 36) break :blk null;
+            @memcpy(&session_buf, sid.?[0..36]);
+            break :blk &session_buf;
+        };
+
+        const wp = self.engine.worker_pool orelse {
+            try self.sendHttp(stream, "200 OK", "application/json", "{\"jobs\":[]}");
+            return;
+        };
+        const jobs = wp.getActiveBackgroundJobs(self.allocator, session_filter);
+        defer self.allocator.free(jobs);
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.allocator);
+        out.appendSlice(self.allocator, "{\"jobs\":[") catch {};
+        for (jobs, 0..) |job, i| {
+            if (i > 0) out.append(self.allocator, ',') catch {};
+            out.appendSlice(self.allocator, "{\"job_id\":\"") catch {};
+            out.appendSlice(self.allocator, &job.job_id) catch {};
+            out.appendSlice(self.allocator, "\",\"session_id\":\"") catch {};
+            out.appendSlice(self.allocator, &job.session_id) catch {};
+            out.appendSlice(self.allocator, "\",\"status\":\"") catch {};
+            out.appendSlice(self.allocator, switch (job.status) {
+                .queued => "queued",
+                .running => "running",
+            }) catch {};
+            out.appendSlice(self.allocator, "\"}") catch {};
+        }
+        out.appendSlice(self.allocator, "]}") catch {};
+        try self.sendHttp(stream, "200 OK", "application/json", out.items);
+    }
+
     /// SSE emitter context — holds the HTTP stream and allocator for building SSE events.
     const SSEContext = struct {
-        stream: std.net.Stream,
+        stream: common.net.Stream,
         allocator: std.mem.Allocator,
         cancelled: bool = false,
     };
@@ -610,7 +802,7 @@ pub const WebAdapter = struct {
 
         switch (response) {
             .stream_text => |text| {
-                var buf: std.ArrayList(u8) = .{};
+                var buf: std.ArrayList(u8) = .empty;
                 defer buf.deinit(sse_ctx.allocator);
                 buf.appendSlice(sse_ctx.allocator, "data: {\"type\":\"text\",\"text\":\"") catch return;
                 for (text) |ch| {
@@ -628,7 +820,7 @@ pub const WebAdapter = struct {
                 };
             },
             .stream_tool_use => |tool| {
-                var buf: std.ArrayList(u8) = .{};
+                var buf: std.ArrayList(u8) = .empty;
                 defer buf.deinit(sse_ctx.allocator);
                 buf.appendSlice(sse_ctx.allocator, "data: {\"type\":\"tool_use\",\"tool_name\":\"") catch return;
                 buf.appendSlice(sse_ctx.allocator, tool.tool_name) catch return;
@@ -650,7 +842,7 @@ pub const WebAdapter = struct {
                 };
             },
             .stream_tool_result => |result| {
-                var buf: std.ArrayList(u8) = .{};
+                var buf: std.ArrayList(u8) = .empty;
                 defer buf.deinit(sse_ctx.allocator);
                 buf.appendSlice(sse_ctx.allocator, "data: {\"type\":\"tool_result\",\"tool_id\":\"") catch return;
                 buf.appendSlice(sse_ctx.allocator, result.tool_id) catch return;
@@ -683,7 +875,7 @@ pub const WebAdapter = struct {
         return sse_ctx.cancelled;
     }
 
-    fn handleApiChatStream(self: *WebAdapter, stream: std.net.Stream, method: []const u8, body: []const u8) !void {
+    fn handleApiChatStream(self: *WebAdapter, stream: common.net.Stream, method: []const u8, body: []const u8) !void {
         if (!std.mem.eql(u8, method, "POST")) {
             try self.sendHttp(stream, "405 Method Not Allowed", "text/plain", "Method Not Allowed");
             return;
@@ -708,6 +900,14 @@ pub const WebAdapter = struct {
         // web UI model swaps silently fell back to the daemon default on
         // every streaming turn.
         const no_tools = if (parsed.value.object.get("no_tools")) |v| (v == .bool and v.bool) else false;
+        const compact_tool_schemas = if (parsed.value.object.get("compact_tool_schemas")) |v|
+            (v == .bool and v.bool)
+        else
+            self.config.web.compact_tool_schemas;
+        const plans_required = if (parsed.value.object.get("plans_required")) |v|
+            (v == .bool and v.bool)
+        else
+            self.config.web.plans_required;
         const session_id = if (parsed.value.object.get("session_id")) |v| (if (v == .string) v.string else null) else null;
         const model_override = if (parsed.value.object.get("model_override")) |v| (if (v == .string) v.string else null) else null;
         const allowed_tools = if (parsed.value.object.get("allowed_tools")) |v| (if (v == .string) v.string else null) else null;
@@ -723,29 +923,23 @@ pub const WebAdapter = struct {
         const header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\nAccess-Control-Allow-Origin: *\r\nConnection: keep-alive\r\n\r\n";
         _ = stream.write(header) catch return;
 
-        // Real streaming: emitter writes SSE events to the HTTP stream as text deltas arrive.
-        var sse_ctx = SSEContext{ .stream = stream, .allocator = self.allocator };
-        const emitter = core.Engine.StreamEmitter{
-            .ctx = @ptrCast(&sse_ctx),
-            .emitFn = &sseEmitCallback,
-            .isCancelledFn = &sseIsCancelled,
-        };
-
-        self.engine.beginStreaming();
         const result = self.engine.process(.{ .chat = .{
             .message = message,
             .session_id = session_id,
             .model_override = model_override,
             .no_tools = no_tools,
+            .compact_tool_schemas = compact_tool_schemas,
+            .plans_required = plans_required,
             .allowed_tools = allowed_tools,
             .adapter_context = adapter_context,
             .attachments = attachments,
-        } }, emitter, null);
+            .background = true,
+        } }, null, null);
 
         // After streaming completes, send done event with final metadata
         switch (result) {
             .chat => |chat| {
-                var end_buf: std.ArrayList(u8) = .{};
+                var end_buf: std.ArrayList(u8) = .empty;
                 defer end_buf.deinit(self.allocator);
                 var num_buf: [32]u8 = undefined;
 
@@ -766,6 +960,18 @@ pub const WebAdapter = struct {
                     end_buf.appendSlice(self.allocator, ",\"cache_creation_tokens\":") catch {};
                     end_buf.appendSlice(self.allocator, std.fmt.bufPrint(&num_buf, "{d}", .{chat.cache_creation_tokens}) catch "0") catch {};
                 }
+                end_buf.appendSlice(self.allocator, ",\"text\":\"") catch {};
+                for (chat.text) |ch| {
+                    switch (ch) {
+                        '"' => end_buf.appendSlice(self.allocator, "\\\"") catch {},
+                        '\\' => end_buf.appendSlice(self.allocator, "\\\\") catch {},
+                        '\n' => end_buf.appendSlice(self.allocator, "\\n") catch {},
+                        '\r' => end_buf.appendSlice(self.allocator, "\\r") catch {},
+                        '\t' => end_buf.appendSlice(self.allocator, "\\t") catch {},
+                        else => end_buf.append(self.allocator, ch) catch {},
+                    }
+                }
+                end_buf.append(self.allocator, '"') catch {};
 
                 // Include spawned subagent job IDs so the web UI can poll them
                 if (chat.spawned_jobs) |jobs_csv| {
@@ -787,6 +993,15 @@ pub const WebAdapter = struct {
                 _ = stream.write(end_buf.items) catch {};
             },
             .response => |resp| switch (resp) {
+                .background_queued => |bg| {
+                    var end_buf: [512]u8 = undefined;
+                    const event = std.fmt.bufPrint(
+                        &end_buf,
+                        "data: {{\"type\":\"done\",\"model\":\"background\",\"input_tokens\":0,\"output_tokens\":0,\"context_tokens\":0,\"text\":\"Queued in ClawForge as background job {s}.\",\"spawned_jobs\":[\"{s}\"]}}\n\n",
+                        .{ bg.job_id, bg.job_id },
+                    ) catch "";
+                    _ = stream.write(event) catch {};
+                },
                 .error_resp => |err| {
                     var err_buf: [256]u8 = undefined;
                     const err_event = std.fmt.bufPrint(&err_buf, "data: {{\"type\":\"error\",\"message\":\"{s}\"}}\n\n", .{err.message}) catch "";
@@ -795,12 +1010,9 @@ pub const WebAdapter = struct {
                 else => {},
             },
         }
-
-        // Release the compaction gate — deferred summarizations can now run.
-        self.engine.endStreaming();
     }
 
-    fn handleApiSessions(self: *WebAdapter, stream: std.net.Stream, method: []const u8, path: []const u8, body: []const u8) !void {
+    fn handleApiSessions(self: *WebAdapter, stream: common.net.Stream, method: []const u8, path: []const u8, body: []const u8) !void {
         // POST sub-routes
         if (std.mem.eql(u8, method, "POST")) {
             if (std.mem.endsWith(u8, path, "/rename")) {
@@ -827,7 +1039,7 @@ pub const WebAdapter = struct {
         };
 
         const sessions = self.engine.session_store.listSessionsByStatus(status) catch &.{};
-        var out: std.ArrayList(u8) = .{};
+        var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);
         out.append(self.allocator, '[') catch {};
         for (sessions, 0..) |sess, i| {
@@ -861,7 +1073,7 @@ pub const WebAdapter = struct {
         try self.sendHttp(stream, "200 OK", "application/json", out.items);
     }
 
-    fn handleSessionAction(self: *WebAdapter, stream: std.net.Stream, body: []const u8, action: []const u8) !void {
+    fn handleSessionAction(self: *WebAdapter, stream: common.net.Stream, body: []const u8, action: []const u8) !void {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{
             .allocate = .alloc_always,
         }) catch {
@@ -912,7 +1124,7 @@ pub const WebAdapter = struct {
                 self.allocator.free(sess.model);
                 if (sess.system_prompt) |s| self.allocator.free(s);
             }
-            var out: std.ArrayList(u8) = .{};
+            var out: std.ArrayList(u8) = .empty;
             defer out.deinit(self.allocator);
             out.appendSlice(self.allocator, "{\"ok\":true,\"model\":\"") catch {};
             out.appendSlice(self.allocator, sess.model) catch {};
@@ -937,7 +1149,7 @@ pub const WebAdapter = struct {
         try self.sendHttp(stream, "200 OK", "application/json", "{\"ok\":true}");
     }
 
-    fn handleApiSkills(self: *WebAdapter, stream: std.net.Stream, method: []const u8, body: []const u8) !void {
+    fn handleApiSkills(self: *WebAdapter, stream: common.net.Stream, method: []const u8, body: []const u8) !void {
         if (std.mem.eql(u8, method, "POST")) {
             const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{
                 .allocate = .alloc_always,
@@ -1003,7 +1215,7 @@ pub const WebAdapter = struct {
         // GET — list all skills
         if (self.engine.skill_store) |ss| {
             const skills = ss.list(100) catch &.{};
-            var out: std.ArrayList(u8) = .{};
+            var out: std.ArrayList(u8) = .empty;
             defer out.deinit(self.allocator);
             out.append(self.allocator, '[') catch {};
             for (skills, 0..) |skill, i| {
@@ -1050,7 +1262,7 @@ pub const WebAdapter = struct {
     }
 
     /// POST /api/upload — accept base64-encoded file, save to disk, return {path, mime, name}
-    fn handleApiUpload(self: *WebAdapter, stream: std.net.Stream, method: []const u8, body: []const u8) !void {
+    fn handleApiUpload(self: *WebAdapter, stream: common.net.Stream, method: []const u8, body: []const u8) !void {
         if (!std.mem.eql(u8, method, "POST")) {
             try self.sendHttp(stream, "405 Method Not Allowed", "text/plain", "Method Not Allowed");
             return;
@@ -1082,7 +1294,10 @@ pub const WebAdapter = struct {
         const allowed_mimes = [_][]const u8{ "image/png", "image/jpeg", "image/gif", "image/webp" };
         var mime_ok = false;
         for (&allowed_mimes) |m| {
-            if (std.mem.eql(u8, mime_str.?, m)) { mime_ok = true; break; }
+            if (std.mem.eql(u8, mime_str.?, m)) {
+                mime_ok = true;
+                break;
+            }
         }
         if (!mime_ok) {
             try self.sendHttp(stream, "400 Bad Request", "application/json", "{\"error\":\"Unsupported image type\"}");
@@ -1106,21 +1321,15 @@ pub const WebAdapter = struct {
 
         // Ensure upload directory exists
         const upload_dir = "/tmp/clawforge_attachments";
-        std.fs.makeDirAbsolute(upload_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => {
-                try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Cannot create upload dir\"}");
-                return;
-            },
+        const io = common.config.runtimeIo();
+        std.Io.Dir.cwd().createDirPath(io, upload_dir) catch {
+            try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Cannot create upload dir\"}");
+            return;
         };
 
         // Generate unique filename
-        const ts = std.time.timestamp();
-        const ext = if (std.mem.eql(u8, mime_str.?, "image/png")) ".png"
-            else if (std.mem.eql(u8, mime_str.?, "image/jpeg")) ".jpg"
-            else if (std.mem.eql(u8, mime_str.?, "image/gif")) ".gif"
-            else if (std.mem.eql(u8, mime_str.?, "image/webp")) ".webp"
-            else ".bin";
+        const ts = common.sync.timestamp();
+        const ext = if (std.mem.eql(u8, mime_str.?, "image/png")) ".png" else if (std.mem.eql(u8, mime_str.?, "image/jpeg")) ".jpg" else if (std.mem.eql(u8, mime_str.?, "image/gif")) ".gif" else if (std.mem.eql(u8, mime_str.?, "image/webp")) ".webp" else ".bin";
 
         // Strip existing extension from name to avoid double-extension
         const name_raw = name_str.?;
@@ -1136,18 +1345,19 @@ pub const WebAdapter = struct {
         };
 
         // Write file
-        const file = std.fs.createFileAbsolute(file_path, .{}) catch {
+        const file = std.Io.Dir.createFileAbsolute(io, file_path, .{}) catch {
             try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Cannot write file\"}");
             return;
         };
-        defer file.close();
-        file.writeAll(buf[0..decoded_len]) catch {
+        defer file.close(io);
+        var file_writer = file.writer(io, &.{});
+        file_writer.interface.writeAll(buf[0..decoded_len]) catch {
             try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Write failed\"}");
             return;
         };
 
         // Return JSON with path, mime, name
-        var out: std.ArrayList(u8) = .{};
+        var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);
         out.appendSlice(self.allocator, "{\"path\":\"") catch {};
         out.appendSlice(self.allocator, file_path) catch {};
@@ -1179,7 +1389,7 @@ pub const WebAdapter = struct {
         const items = field.array.items;
         if (items.len == 0) return null;
 
-        var list: std.ArrayList(common.Request.Attachment) = .{};
+        var list: std.ArrayList(common.Request.Attachment) = .empty;
         list.ensureTotalCapacity(allocator, items.len) catch return null;
         for (items) |item| {
             if (item != .object) continue;
@@ -1202,16 +1412,16 @@ pub const WebAdapter = struct {
     /// GET /api/vision  → returns current effective model + config
     /// POST /api/vision → { "model": "claude-opus-4-6" } sets runtime override
     /// POST /api/vision → { "model": null } clears the override
-    fn handleApiVision(self: *WebAdapter, stream: std.net.Stream, method: []const u8, body: []const u8) !void {
+    fn handleApiVision(self: *WebAdapter, stream: common.net.Stream, method: []const u8, body: []const u8) !void {
         if (std.mem.eql(u8, method, "GET")) {
             const vp = self.engine.vision_pipeline orelse {
-                try self.sendHttp(stream, "503 Service Unavailable", "application/json",
-                    "{\"error\":\"Vision pipeline not wired\"}");
+                try self.sendHttp(stream, "503 Service Unavailable", "application/json", "{\"error\":\"Vision pipeline not wired\"}");
                 return;
             };
             const effective = vp.effectiveModel();
             var out_buf: [512]u8 = undefined;
-            const json_resp = std.fmt.bufPrint(&out_buf,
+            const json_resp = std.fmt.bufPrint(
+                &out_buf,
                 "{{\"enabled\":{s},\"model\":\"{s}\",\"default_model\":\"{s}\",\"max_image_bytes\":{d},\"max_images_per_turn\":{d}}}",
                 .{
                     if (self.config.vision.enabled) "true" else "false",
@@ -1249,14 +1459,12 @@ pub const WebAdapter = struct {
         };
 
         const vp = self.engine.vision_pipeline orelse {
-            try self.sendHttp(stream, "503 Service Unavailable", "application/json",
-                "{\"error\":\"Vision pipeline not wired\"}");
+            try self.sendHttp(stream, "503 Service Unavailable", "application/json", "{\"error\":\"Vision pipeline not wired\"}");
             return;
         };
 
         vp.setModelOverride(new_model) catch {
-            try self.sendHttp(stream, "500 Internal Server Error", "application/json",
-                "{\"error\":\"Failed to set vision model\"}");
+            try self.sendHttp(stream, "500 Internal Server Error", "application/json", "{\"error\":\"Failed to set vision model\"}");
             return;
         };
         if (self.bg_engine) |bg| {
@@ -1268,7 +1476,8 @@ pub const WebAdapter = struct {
         std.log.info("Vision model override set to: {s}", .{new_model orelse "(cleared)"});
 
         var ok_buf: [256]u8 = undefined;
-        const ok_resp = std.fmt.bufPrint(&ok_buf,
+        const ok_resp = std.fmt.bufPrint(
+            &ok_buf,
             "{{\"ok\":true,\"model\":\"{s}\"}}",
             .{vp.effectiveModel()},
         ) catch "{\"ok\":true}";
@@ -1286,12 +1495,12 @@ pub const WebAdapter = struct {
     /// them back unchanged as a `model_override` and the engine resolver
     /// will dispatch them correctly. Anthropic + OpenAI lists are static;
     /// Ollama is queried live via `{base_url}/api/tags`.
-    fn handleApiModels(self: *WebAdapter, stream: std.net.Stream) !void {
+    fn handleApiModels(self: *WebAdapter, stream: common.net.Stream) !void {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        var out: std.ArrayList(u8) = .{};
+        var out: std.ArrayList(u8) = .empty;
         out.ensureTotalCapacity(arena, 4096) catch {};
 
         out.appendSlice(arena, "{\"providers\":[") catch {};
@@ -1363,6 +1572,10 @@ pub const WebAdapter = struct {
                 "codex:gpt-5.1-codex",
                 "codex:gpt-5.1-codex-mini",
                 "codex:gpt-5.3-codex",
+                "codex:gpt-5.5",
+                "codex:gpt-5.6-sol",
+                "codex:gpt-5.6-terra",
+                "codex:gpt-5.6-luna",
             };
             out.appendSlice(arena, ",{\"name\":\"codex\",\"models\":[") catch {};
             for (codex_models, 0..) |m, i| {
@@ -1390,7 +1603,7 @@ pub const WebAdapter = struct {
         base_url: []const u8,
     ) !void {
         _ = self;
-        var client = std.http.Client{ .allocator = arena };
+        var client = std.http.Client{ .allocator = arena, .io = common.config.runtimeIo() };
 
         var url_buf: [512]u8 = undefined;
         const url = std.fmt.bufPrint(&url_buf, "{s}/api/tags", .{base_url}) catch return;
@@ -1449,7 +1662,7 @@ pub const WebAdapter = struct {
 
         // Shell out to curl — Zig's HTTP client crashes on large compressed
         // responses from OpenRouter (~5MB gzipped). curl handles this natively.
-        const result = std.process.Child.run(.{
+        const result = common.process.run(.{
             .allocator = arena,
             .argv = &.{ "curl", "-s", "--max-time", "15", "-H", "Accept: application/json", url },
             .max_output_bytes = 16 * 1024 * 1024,
@@ -1517,7 +1730,7 @@ pub const WebAdapter = struct {
         std.log.info("OpenRouter: fetched {d} models with pricing", .{count});
     }
 
-    fn handleApiStatus(self: *WebAdapter, stream: std.net.Stream) !void {
+    fn handleApiStatus(self: *WebAdapter, stream: common.net.Stream) !void {
         const result = self.engine.process(.{ .status = {} }, null, null);
         switch (result) {
             .response => |resp| switch (resp) {
@@ -1534,7 +1747,7 @@ pub const WebAdapter = struct {
         }
     }
 
-    fn handleApiProjects(self: *WebAdapter, stream: std.net.Stream) !void {
+    fn handleApiProjects(self: *WebAdapter, stream: common.net.Stream) !void {
         const result = self.engine.process(.{ .project_list = {} }, null, null);
         switch (result) {
             .response => |resp| switch (resp) {
@@ -1544,7 +1757,10 @@ pub const WebAdapter = struct {
                     json_buf[pos] = '[';
                     pos += 1;
                     for (projects, 0..) |proj, i| {
-                        if (i > 0) { json_buf[pos] = ','; pos += 1; }
+                        if (i > 0) {
+                            json_buf[pos] = ',';
+                            pos += 1;
+                        }
                         var num_buf: [32]u8 = undefined;
                         const id_str = std.fmt.bufPrint(&num_buf, "{d}", .{proj.id}) catch "0";
                         const entry = std.fmt.bufPrint(json_buf[pos..],
@@ -1562,7 +1778,7 @@ pub const WebAdapter = struct {
         }
     }
 
-    fn handleApiToolToggle(self: *WebAdapter, stream: std.net.Stream, body: []const u8) !void {
+    fn handleApiToolToggle(self: *WebAdapter, stream: common.net.Stream, body: []const u8) !void {
         // Parse {"name": "tool_name", "enabled": true/false}
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{
             .allocate = .alloc_always,
@@ -1592,7 +1808,7 @@ pub const WebAdapter = struct {
     }
 
     /// GET returns {enabled: bool}. POST {enabled: bool} sets the flag.
-    fn handleApiToolAutoApprove(self: *WebAdapter, stream: std.net.Stream, method: []const u8, body: []const u8) !void {
+    fn handleApiToolAutoApprove(self: *WebAdapter, stream: common.net.Stream, method: []const u8, body: []const u8) !void {
         if (std.mem.eql(u8, method, "GET")) {
             const is_on = self.engine.tool_registry.isAutoApprove();
             const out = if (is_on) "{\"enabled\":true}" else "{\"enabled\":false}";
@@ -1621,9 +1837,9 @@ pub const WebAdapter = struct {
         try self.sendHttp(stream, "200 OK", "application/json", out);
     }
 
-    fn handleApiTools(self: *WebAdapter, stream: std.net.Stream) !void {
+    fn handleApiTools(self: *WebAdapter, stream: common.net.Stream) !void {
         // Return all registered tools with live enabled status from the registry
-        var out: std.ArrayList(u8) = .{};
+        var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);
 
         out.appendSlice(self.allocator, "[") catch {};
@@ -1647,9 +1863,23 @@ pub const WebAdapter = struct {
         try self.sendHttp(stream, "200 OK", "application/json", out.items);
     }
 
+    fn handleApiToolSettings(self: *WebAdapter, stream: common.net.Stream, method: []const u8) !void {
+        if (!std.mem.eql(u8, method, "GET")) {
+            try self.sendHttp(stream, "405 Method Not Allowed", "text/plain", "Method Not Allowed");
+            return;
+        }
+        var out_buf: [96]u8 = undefined;
+        const out = std.fmt.bufPrint(
+            &out_buf,
+            "{{\"compact_tool_schemas\":{},\"plans_required\":{}}}",
+            .{ self.config.web.compact_tool_schemas, self.config.web.plans_required },
+        ) catch "{\"compact_tool_schemas\":false,\"plans_required\":true}";
+        try self.sendHttp(stream, "200 OK", "application/json", out);
+    }
+
     /// Register a script-based tool at runtime (no rebuild needed).
     /// POST /api/tools/register {name, description, input_schema, script_path, language, requires_confirmation}
-    fn handleApiToolRegister(self: *WebAdapter, stream: std.net.Stream, body: []const u8) !void {
+    fn handleApiToolRegister(self: *WebAdapter, stream: common.net.Stream, body: []const u8) !void {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{
             .allocate = .alloc_always,
         }) catch {
@@ -1706,7 +1936,7 @@ pub const WebAdapter = struct {
     ///   action=select: set active persona for the given session (or active session if none)
     ///   action=create: create new persona file
     ///   action=delete: delete persona file
-    fn handleApiPersona(self: *WebAdapter, stream: std.net.Stream, method: []const u8, path: []const u8, body: []const u8) !void {
+    fn handleApiPersona(self: *WebAdapter, stream: common.net.Stream, method: []const u8, path: []const u8, body: []const u8) !void {
         const prompt_mod = @import("core").prompt;
 
         if (std.mem.eql(u8, method, "GET")) {
@@ -1740,7 +1970,7 @@ pub const WebAdapter = struct {
             }
             defer if (_sess_info) |*si| self.engine.session_store.freeSessionInfo(si);
 
-            var out: std.ArrayList(u8) = .{};
+            var out: std.ArrayList(u8) = .empty;
             defer out.deinit(self.allocator);
             out.appendSlice(self.allocator, "{\"active\":\"") catch {};
             out.appendSlice(self.allocator, active_name) catch {};
@@ -1824,7 +2054,7 @@ pub const WebAdapter = struct {
         }
     }
 
-    fn handleApiMessages(self: *WebAdapter, stream: std.net.Stream, path: []const u8) !void {
+    fn handleApiMessages(self: *WebAdapter, stream: common.net.Stream, path: []const u8) !void {
         // Parse query params: /api/messages?session_id=UUID&limit=50&before_seq=1234
         const session_id = blk: {
             if (std.mem.indexOf(u8, path, "session_id=")) |idx| {
@@ -1871,33 +2101,34 @@ pub const WebAdapter = struct {
         // Fetch limit+1 to detect has_more. Then outer query re-sorts ascending.
         var query_buf: [1024]u8 = undefined;
         const query = if (before_seq) |bs|
-            std.fmt.bufPrint(&query_buf,
+            std.fmt.bufPrint(
+                &query_buf,
                 "SELECT * FROM (" ++
-                "SELECT sequence, role, content, datetime(created_at, 'unixepoch') as created_at, " ++
-                "model_used, input_tokens, output_tokens " ++
-                "FROM messages WHERE session_id = {s} AND sequence < {d} " ++
-                "ORDER BY sequence DESC LIMIT {d}" ++
-                ") ORDER BY sequence ASC;",
+                    "SELECT sequence, role, content, datetime(created_at, 'unixepoch') as created_at, " ++
+                    "model_used, input_tokens, output_tokens " ++
+                    "FROM messages WHERE session_id = {s} AND sequence < {d} " ++
+                    "ORDER BY sequence DESC LIMIT {d}" ++
+                    ") ORDER BY sequence ASC;",
                 .{ sid_expr, bs, limit + 1 },
             ) catch ""
         else
-            std.fmt.bufPrint(&query_buf,
+            std.fmt.bufPrint(
+                &query_buf,
                 "SELECT * FROM (" ++
-                "SELECT sequence, role, content, datetime(created_at, 'unixepoch') as created_at, " ++
-                "model_used, input_tokens, output_tokens " ++
-                "FROM messages WHERE session_id = {s} " ++
-                "ORDER BY sequence DESC LIMIT {d}" ++
-                ") ORDER BY sequence ASC;",
+                    "SELECT sequence, role, content, datetime(created_at, 'unixepoch') as created_at, " ++
+                    "model_used, input_tokens, output_tokens " ++
+                    "FROM messages WHERE session_id = {s} " ++
+                    "ORDER BY sequence DESC LIMIT {d}" ++
+                    ") ORDER BY sequence ASC;",
                 .{ sid_expr, limit + 1 },
             ) catch "";
 
         if (query.len == 0) {
-            try self.sendHttp(stream, "200 OK", "application/json",
-                "{\"messages\":[],\"pagination\":{\"has_more\":false,\"oldest_seq\":null,\"newest_seq\":null}}");
+            try self.sendHttp(stream, "200 OK", "application/json", "{\"messages\":[],\"pagination\":{\"has_more\":false,\"oldest_seq\":null,\"newest_seq\":null}}");
             return;
         }
 
-        const result = std.process.Child.run(.{
+        const result = common.process.run(.{
             .allocator = self.allocator,
             .argv = &.{ "sqlite3", "-json", "-readonly", db_path, query },
             .max_output_bytes = 4 * 1024 * 1024,
@@ -1910,15 +2141,13 @@ pub const WebAdapter = struct {
 
         // Parse rows, detect has_more, extract oldest/newest sequence
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, if (result.stdout.len == 0) "[]" else result.stdout, .{}) catch {
-            try self.sendHttp(stream, "200 OK", "application/json",
-                "{\"messages\":[],\"pagination\":{\"has_more\":false,\"oldest_seq\":null,\"newest_seq\":null}}");
+            try self.sendHttp(stream, "200 OK", "application/json", "{\"messages\":[],\"pagination\":{\"has_more\":false,\"oldest_seq\":null,\"newest_seq\":null}}");
             return;
         };
         defer parsed.deinit();
 
         if (parsed.value != .array) {
-            try self.sendHttp(stream, "200 OK", "application/json",
-                "{\"messages\":[],\"pagination\":{\"has_more\":false,\"oldest_seq\":null,\"newest_seq\":null}}");
+            try self.sendHttp(stream, "200 OK", "application/json", "{\"messages\":[],\"pagination\":{\"has_more\":false,\"oldest_seq\":null,\"newest_seq\":null}}");
             return;
         }
 
@@ -1941,7 +2170,7 @@ pub const WebAdapter = struct {
         }
 
         // Serialize response — manually emit each msg field to avoid re-stringify API churn.
-        var out: std.ArrayList(u8) = .{};
+        var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);
         const a = self.allocator;
         try out.appendSlice(a, "{\"messages\":[");
@@ -2043,7 +2272,7 @@ pub const WebAdapter = struct {
         }
     }
 
-    fn serve404(self: *WebAdapter, stream: std.net.Stream) !void {
+    fn serve404(self: *WebAdapter, stream: common.net.Stream) !void {
         try self.sendHttp(stream, "404 Not Found", "text/plain", "Not Found");
     }
 };

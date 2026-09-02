@@ -1,1619 +1,876 @@
-"""
-ClawForge Discord Bridge
+#!/usr/bin/env python3
+"""discord.py transport sidecar for ClawForge.
 
-Thin transport layer: discord.py handles the Gateway WebSocket,
-this script forwards messages to ClawForge's HTTP API and relays responses.
-
-Two-tier pattern:
-  1. Quick ack via Haiku (no tools, ~2s) — posted immediately on @mention
-  2. Background worker (full model + tools) — posted when done
-
-Slash commands provide management surfaces (personas, tools, sessions, etc.).
-
-Token resolution (first match wins):
-  1. --token CLI argument
-  2. DISCORD_TOKEN environment variable
-  3. ClawForge/.env DISCORD_TOKEN
-
-Requires: discord.py>=2.3, aiohttp>=3.9
+Protocol stdout is reserved for newline-delimited JSON RPC. All ClawForge
+semantics, sessions, jobs, confirmations, and configuration live in the Zig
+DiscordAdapter; this process only owns Discord Gateway/REST and UI rendering.
 """
 
-import json
-import os
-import re
-import sys
-import asyncio
-import logging
+from __future__ import annotations
+
 import argparse
+import asyncio
+import json
+import logging
+import os
+import sys
+import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import discord
-from discord import app_commands
 import aiohttp
+from discord import app_commands
 
-try:
-    from PIL import Image
-    _PIL_AVAILABLE = True
-except ImportError:
-    _PIL_AVAILABLE = False
-
-log = logging.getLogger("clawforge-discord")
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
+    stream=sys.stderr,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("clawforge.discord")
+
+MAX_DISCORD_MESSAGE = 1900
+STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "discord_bridge_state.json"
+DEFAULT_WEB_URL = "http://127.0.0.1:8081"
+DISPATCH_CONTEXT = (
+    "You are ClawForge's Discord preflight dispatcher. Reply directly and briefly to casual chat, "
+    "questions answerable from context, and other requests needing no tools. For work that needs "
+    "code inspection, file changes, commands, research, or multiple steps, call summon_subagent in "
+    "explore mode with a concrete task and chain=true, then give the user one short natural-language "
+    "acknowledgment. Never claim work completed before the background job returns. Keep Discord "
+    "responses concise and never mention RPC or transport internals."
 )
 
-# Strip hallucinated tool-call XML the model may emit in dispatcher mode.
-# Handles closed blocks plus dangling open blocks (model truncated mid-call).
-_FUNCTION_CALLS_CLOSED = re.compile(r"<function_calls>.*?</function_calls>", re.DOTALL)
-_FUNCTION_CALLS_OPEN = re.compile(r"<function_calls>.*\Z", re.DOTALL)
-_INVOKE_BLOCK = re.compile(r"<invoke[^>]*>.*?</invoke>", re.DOTALL)
-_PARAMETER_BLOCK = re.compile(r"<parameter[^>]*>.*?</parameter>", re.DOTALL)
+
+def rank_model_autocomplete(
+    providers: list[dict[str, Any]], current: str
+) -> list[str]:
+    """Return Discord-sized model suggestions with OAuth Codex models first."""
+    codex_models: list[str] = []
+    other_models: list[str] = []
+    seen = {"reset"}
+
+    for provider in providers:
+        provider_name = str(provider.get("name", "")).casefold()
+        for entry in provider.get("models", []):
+            value = entry.get("id", "") if isinstance(entry, dict) else entry
+            if not isinstance(value, str) or not value or value in seen:
+                continue
+            seen.add(value)
+            if provider_name == "codex" or value.casefold().startswith("codex:"):
+                codex_models.append(value)
+            else:
+                other_models.append(value)
+
+    needle = current.casefold().strip()
+    entries = ["reset", *codex_models, *other_models]
+    if needle:
+        entries = [value for value in entries if needle in value.casefold()]
+    return entries[:25]
 
 
-_TOOL_OUTPUT_URLS = re.compile(
-    r'<tool_call\s+name="(\w+)"[^>]*>.*?<output[^>]*>(.*?)</output>',
-    re.DOTALL,
-)
-_IMAGE_URL = re.compile(r'(https?://[^\s<>"]+\.(?:png|jpg|jpeg|gif|webp)[^\s<>"]*)', re.IGNORECASE)
+class DaemonRPC:
+    def __init__(self) -> None:
+        self.pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self.write_lock = asyncio.Lock()
+        self.reader_task: Optional[asyncio.Task[None]] = None
 
+    async def start(self) -> None:
+        self.reader_task = asyncio.create_task(self._read_loop())
 
-def extract_media_urls(text: str) -> list[str]:
-    """Pull image URLs out of tool_call output blocks before they get stripped."""
-    urls = []
-    for match in _TOOL_OUTPUT_URLS.finditer(text):
-        output = match.group(2)
-        for url_match in _IMAGE_URL.finditer(output):
-            urls.append(url_match.group(1))
-    return urls
+    async def close(self) -> None:
+        if self.reader_task:
+            self.reader_task.cancel()
 
-
-def strip_tool_calls(text: str) -> str:
-    """Remove any tool-call XML the model emitted as text. Returns cleaned text."""
-    if not text:
-        return text
-    text = _FUNCTION_CALLS_CLOSED.sub("", text)
-    text = _FUNCTION_CALLS_OPEN.sub("", text)
-    text = _INVOKE_BLOCK.sub("", text)
-    text = _PARAMETER_BLOCK.sub("", text)
-    # Collapse runs of >2 blank lines that the stripping may leave behind
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-FAST_MODEL = "claude-haiku-4-5-20251001"
-
-# Dispatcher toolset — middle path between "answer inline" and "delegate everything".
-# Read-only + single-file edits run inline for snappy UX. summon_subagent is reserved
-# for heavy work (multi-file changes, builds, long investigations).
-DISPATCHER_TOOLS = [
-    "plan",
-    "summon_subagent",
-    "bash",
-    "file_read",
-    "file_diff",
-    "introspect",
-    "calc",
-    "research",
-    "meme_tool",
-    "amazon_search",
-]
-
-DISPATCHER_CONTEXT = (
-    "You are the Discord dispatcher for ClawForge. Never emit <function_calls>, "
-    "<invoke>, or any XML tool-call markup as text.\n"
-    "\n"
-    "You have THREE modes. Default to the lowest one that fits.\n"
-    "\n"
-    "QUICK MODE — no tools, just answer:\n"
-    "- Casual chat, conceptual explanations, answering from conversation history.\n"
-    "\n"
-    "INLINE TOOL MODE — call tools yourself, answer in one turn:\n"
-    "Use when the work is small enough to finish in ≤3 tool rounds:\n"
-    "- Read/show/list/search: file_read, bash (ls, grep, find, cat, git log/status/diff), introspect.\n"
-    "- Single-file edits: file_diff. ONE file, a focused change, no build step needed.\n"
-    "- Math: calc. Web lookup: research. Meme: meme_tool. Shopping: amazon_search.\n"
-    "No plan required for inline mode. Just call the tool and reply.\n"
-    "\n"
-    "DELEGATE MODE — summon_subagent:\n"
-    "Use ONLY when ALL of these are likely true:\n"
-    "  (a) work touches 2+ files OR runs a build/test OR does destructive shell work,\n"
-    "  (b) you'd need more than ~3 tool rounds to finish it inline,\n"
-    "  (c) it's safe to run in the background (user doesn't need an interactive reply).\n"
-    "\n"
-    "summon_subagent has TWO modes — use them together:\n"
-    "\n"
-    "  STEP A — mode='explore' (read-only research, ASYNC with auto-chain):\n"
-    "  When you need to understand code you haven't read, spawn an explore subagent.\n"
-    "  It returns a structured 3-layer JSON brief (executive map + structured facts +\n"
-    "  pinned evidence). It only needs a 'task' field (the question) and optional\n"
-    "  'target_files' as hint paths. Explore bypasses the plan gate.\n"
-    "\n"
-    "  HOW THE EXPLORE FLOW WORKS NOW (default: chain=true, wait=false):\n"
-    "    1. You call summon_subagent(mode='explore', ...). The tool returns a brief\n"
-    "       'dispatched' ack. You reply with ONE short sentence acknowledging the work\n"
-    "       (e.g. 'Sending a probe out — be right back.'). Your reply goes to the user.\n"
-    "    2. The subagent runs on a worker thread. When it finishes, a dispatcher\n"
-    "       CONTINUATION TURN is automatically started on the worker — THAT turn is\n"
-    "       YOU again, running with the brief injected as a synthetic user message.\n"
-    "    3. In the continuation turn you'll see '[EXPLORE SUBAGENT RESULT]' at the\n"
-    "       top of the user message, followed by the 3-layer brief. Use it to either\n"
-    "       auto-summon execute, or summarize findings for the user and ask.\n"
-    "    4. Your continuation reply is what the user actually sees as the final\n"
-    "       message. So keep step 1's ack SHORT and let the real content land in the\n"
-    "       continuation.\n"
-    "\n"
-    "  OVERRIDES:\n"
-    "    - wait=true: block the tool call, see the brief in-turn, chain inline.\n"
-    "      Useful if you prefer one synchronous turn over two async ones.\n"
-    "    - chain=false: disable auto-continuation. The raw JSON brief becomes the\n"
-    "      user-facing message. Rarely what you want.\n"
-    "\n"
-    "  STEP B — mode='execute' (default, the worker that changes things):\n"
-    "  Take the explore brief's layer2_facts + layer3_evidence and drop them into\n"
-    "  known_facts. Take the paths from layer1_map and use them as target_files.\n"
-    "  Add task + acceptance + constraints. The execute subagent does the real work.\n"
-    "  execute defaults to wait=false — the user receives the result asynchronously.\n"
-    "\n"
-    "  PAUSE FOR APPROVAL:\n"
-    "  When the user said things like 'just explore first', 'show me the plan before\n"
-    "  you touch anything', or 'explore only', in the CONTINUATION TURN you should\n"
-    "  summarize the brief plainly and ask for their green-light — do NOT auto-summon\n"
-    "  execute. When they approve next turn, summon execute with the same brief\n"
-    "  facts (you have them in the prior continuation's history).\n"
-    "\n"
-    "The explore→execute pattern is the preferred flow for anything non-trivial.\n"
-    "Skipping the explore step is fine ONLY when you've already done the recon\n"
-    "yourself inline (file_read, bash grep) and have the facts at hand.\n"
-    "\n"
-    "A subagent sees NONE of this Discord conversation — only the brief you send.\n"
-    "Empty or vague briefs are the #1 cause of failure. Execute-mode requires\n"
-    "task + target_files + acceptance; the schema will reject a bare task string.\n"
-    "\n"
-    "Other brief fields:\n"
-    "  - context: the user's actual words — the subagent needs to know why\n"
-    "  - constraints / out_of_scope: things not to touch, to prevent drift\n"
-    "\n"
-    "After summon_subagent: reply with ONE short sentence acknowledging the work.\n"
-    "Do NOT narrate fake progress. The user sees subagent results automatically.\n"
-    "\n"
-    "CRITICAL: default to the lowest mode that works. A single-file edit goes through\n"
-    "file_diff inline, NOT through a subagent. Only escalate when inline would be\n"
-    "painful or unsafe."
-)
-
-ALL_TOOLS = [
-    "file_read", "file_diff", "file_write", "bash", "rebuild",
-    "zig_test", "calc", "introspect", "research_tool", "amazon_search", "meme_tool",
-]
-
-DEFAULT_ENABLED_TOOLS = {
-    "file_read", "file_diff", "file_write", "bash",
-    "calc", "introspect", "zig_test", "rebuild",
-    "meme_tool", "amazon_search", "summon_subagent",
-}
-
-class ToolConfirmView(discord.ui.View):
-    """Discord button view for approving/denying tool execution."""
-
-    def __init__(self, http_session: aiohttp.ClientSession, clawforge_url: str,
-                 job_id: str, tool_id: str, tool_name: str):
-        super().__init__(timeout=60)
-        self.http_session = http_session
-        self.clawforge_url = clawforge_url
-        self.job_id = job_id
-        self.tool_id = tool_id
-        self.tool_name = tool_name
-        self.resolved = False
-
-    async def _resolve(self, interaction: discord.Interaction, approved: bool):
-        if self.resolved:
-            await interaction.response.send_message("Already resolved.", ephemeral=True)
-            return
-        self.resolved = True
-        try:
-            async with self.http_session.post(
-                f"{self.clawforge_url}/api/background/confirm",
-                json={"job_id": self.job_id, "tool_id": self.tool_id, "approved": approved},
-            ) as resp:
-                if resp.status != 200:
-                    log.warning("Confirm POST failed: %s", await resp.text())
-        except Exception as e:
-            log.error("Confirm error: %s", e)
-
-        label = "Approved" if approved else "Denied"
-        for child in self.children:
-            child.disabled = True
-        await interaction.response.edit_message(
-            content=f"**{self.tool_name}** — {label}", view=self
+    async def call(self, method: str, **params: Any) -> dict[str, Any]:
+        request_id = uuid.uuid4().hex
+        future = asyncio.get_running_loop().create_future()
+        self.pending[request_id] = future
+        frame = json.dumps(
+            {"id": request_id, "method": method, "params": params},
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
+        async with self.write_lock:
+            sys.stdout.write(frame + "\n")
+            sys.stdout.flush()
+        try:
+            response = await asyncio.wait_for(future, timeout=65)
+        finally:
+            self.pending.pop(request_id, None)
+        if not response.get("ok"):
+            raise RuntimeError(response.get("error_message", "daemon RPC failed"))
+        return response.get("result", {})
+
+    async def _read_loop(self) -> None:
+        while True:
+            line = await asyncio.to_thread(sys.stdin.readline)
+            if not line:
+                error = RuntimeError("daemon closed Discord RPC stdin")
+                for future in self.pending.values():
+                    if not future.done():
+                        future.set_exception(error)
+                return
+            try:
+                frame = json.loads(line)
+                future = self.pending.get(str(frame.get("id", "")))
+                if future and not future.done():
+                    future.set_result(frame)
+            except Exception:
+                log.exception("invalid daemon RPC frame")
+
+
+class CancelView(discord.ui.View):
+    def __init__(self, bridge: "DiscordTransport", job_id: str) -> None:
+        super().__init__(timeout=900)
+        self.bridge = bridge
+        self.job_id = job_id
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            result = await self.bridge.rpc.call("cancel", job_id=self.job_id)
+            text = "Cancellation requested." if result.get("cancelled") else "Job is no longer cancellable."
+        except Exception as exc:
+            text = f"Cancellation failed: {exc}"
+        await interaction.followup.send(text, ephemeral=True)
         self.stop()
 
-    @discord.ui.button(label="Approve", style=discord.ButtonStyle.green)
-    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._resolve(interaction, True)
 
-    @discord.ui.button(label="Deny", style=discord.ButtonStyle.red)
-    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._resolve(interaction, False)
+class ConfirmationView(discord.ui.View):
+    def __init__(self, bridge: "DiscordTransport", job_id: str, tool_id: str) -> None:
+        super().__init__(timeout=300)
+        self.bridge = bridge
+        self.job_id = job_id
+        self.tool_id = tool_id
+        self.resolved = False
 
-    async def on_timeout(self):
+    async def resolve(self, interaction: discord.Interaction, approved: bool) -> None:
+        await interaction.response.defer()
+        try:
+            result = await self.bridge.rpc.call(
+                "confirm", job_id=self.job_id, tool_id=self.tool_id, approved=approved
+            )
+            text = "Approved." if approved else "Denied."
+            if not result.get("resolved"):
+                text = "Confirmation had already expired."
+        except Exception as exc:
+            text = f"Confirmation failed: {exc}"
+        self.resolved = True
+        self.stop()
+        await interaction.edit_original_response(content=text, view=None)
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
+    async def approve(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.resolve(interaction, True)
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
+    async def deny(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.resolve(interaction, False)
+
+    async def on_timeout(self) -> None:
         if not self.resolved:
-            self.resolved = True
             try:
-                async with self.http_session.post(
-                    f"{self.clawforge_url}/api/background/confirm",
-                    json={"job_id": self.job_id, "tool_id": self.tool_id, "approved": False},
-                ) as resp:
-                    pass
+                await self.bridge.rpc.call(
+                    "confirm", job_id=self.job_id, tool_id=self.tool_id, approved=False
+                )
             except Exception:
-                pass
+                log.exception("timed-out confirmation could not be denied")
 
 
-STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "discord_bridge_state.json"
-
-
-class ClawForgeBridge(discord.Client):
-    def __init__(self, clawforge_url: str, guild_id: Optional[str] = None, **kwargs):
-        super().__init__(**kwargs)
-        self.clawforge_url = clawforge_url.rstrip("/")
-        self.guild_id = guild_id
-        self.http_session: Optional[aiohttp.ClientSession] = None
+class DiscordTransport(discord.Client):
+    def __init__(self, guild_id: Optional[int], attachment_spool: Path, max_attachment_bytes: int, max_attachment_count: int) -> None:
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+        self.rpc = DaemonRPC()
+        self.channel_jobs: dict[int, str] = {}
         self.channel_sessions: dict[str, str] = {}
         self.channel_models: dict[str, str] = {}
-        self.channel_jobs: dict[str, str] = {}  # channel_id -> active background job_id (NOT persisted)
-        self.channel_respond_all: dict[str, bool] = {}  # channel_id -> respond to every message
-        self.enabled_tools: set[str] = set(DEFAULT_ENABLED_TOOLS)
-        self.known_guild_ids: set[str] = set()  # auto-detected guild IDs
-        self.tree = app_commands.CommandTree(self)
+        self.channel_respond_all: dict[str, bool] = {}
+        self.channel_plans_required: dict[str, bool] = {}
+        self.enabled_tools: set[str] = set()
+        self.known_guild_ids: set[str] = {str(guild_id)} if guild_id else set()
+        self.attachment_spool = attachment_spool.resolve()
+        self.max_attachment_bytes = max_attachment_bytes
+        self.max_attachment_count = max_attachment_count
+        self.api_session: Optional[aiohttp.ClientSession] = None
         self.load_state()
 
     def load_state(self) -> None:
-        if not STATE_FILE.is_file():
-            return
         try:
-            data = json.loads(STATE_FILE.read_text())
-        except Exception as e:
-            log.warning("Failed to load bridge state: %s", e)
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except FileNotFoundError:
             return
-
+        except Exception:
+            log.exception("failed to load Discord bridge state")
+            return
         self.channel_sessions = dict(data.get("channel_sessions", {}))
         self.channel_models = dict(data.get("channel_models", {}))
-        self.channel_respond_all = {k: bool(v) for k, v in data.get("channel_respond_all", {}).items()}
-        tools = data.get("enabled_tools")
-        if isinstance(tools, list):
-            self.enabled_tools = set(tools)
-        guilds = data.get("known_guild_ids")
-        if isinstance(guilds, list):
-            self.known_guild_ids = set(guilds)
-            # Use first known guild as fallback if no explicit guild_id configured
-            if not self.guild_id and self.known_guild_ids:
-                self.guild_id = next(iter(self.known_guild_ids))
-                log.info("Auto-detected guild_id from state: %s", self.guild_id)
-        log.info(
-            "Loaded bridge state: %d channels, %d models, %d tools enabled, %d guilds",
-            len(self.channel_sessions),
-            len(self.channel_models),
-            len(self.enabled_tools),
-            len(self.known_guild_ids),
-        )
+        self.channel_respond_all = {
+            str(key): bool(value) for key, value in data.get("channel_respond_all", {}).items()
+        }
+        self.channel_plans_required = {
+            str(key): bool(value) for key, value in data.get("channel_plans_required", {}).items()
+        }
+        self.enabled_tools = set(data.get("enabled_tools", []))
+        self.known_guild_ids.update(str(value) for value in data.get("known_guild_ids", []))
 
     def save_state(self) -> None:
-        try:
-            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "channel_sessions": self.channel_sessions,
-                "channel_models": self.channel_models,
-                "channel_respond_all": self.channel_respond_all,
-                "enabled_tools": sorted(self.enabled_tools),
-                "known_guild_ids": sorted(self.known_guild_ids),
-            }
-            tmp = STATE_FILE.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(payload, indent=2))
-            tmp.replace(STATE_FILE)
-        except Exception as e:
-            log.warning("Failed to save bridge state: %s", e)
+        payload = {
+            "channel_sessions": self.channel_sessions,
+            "channel_models": self.channel_models,
+            "channel_respond_all": self.channel_respond_all,
+            "channel_plans_required": self.channel_plans_required,
+            "enabled_tools": sorted(self.enabled_tools),
+            "known_guild_ids": sorted(self.known_guild_ids),
+        }
+        temporary = STATE_FILE.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(STATE_FILE)
 
-    async def validate_persisted_sessions(self) -> None:
-        """Drop cached channel→session mappings whose session no longer exists."""
-        if not self.channel_sessions:
-            return
-        sessions = await self.fetch_sessions()
-        valid_ids = {s.get("id") for s in sessions}
-        dropped = [
-            cid for cid, sid in self.channel_sessions.items() if sid not in valid_ids
-        ]
-        for cid in dropped:
-            log.info("Dropping stale session for channel %s", cid)
-            self.channel_sessions.pop(cid, None)
-        if dropped:
-            self.save_state()
-
-    async def setup_hook(self):
-        # Dispatcher now runs inline tools (file_read, file_diff, bash, introspect)
-        # before deciding whether to delegate, so the /api/chat round-trip can take
-        # longer than the old 120s budget. 300s covers a dispatcher that does a few
-        # rounds of recon + a small edit before handing off (or completing inline).
-        self.http_session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=300)
-        )
-        await self.validate_persisted_sessions()
-        register_commands(self)
-
-        # Sync slash commands to known guilds (instant).
-        # We avoid global sync entirely — it causes duplicate commands in
-        # guilds that also have guild-specific commands. New guilds get
-        # commands synced on first interaction via _maybe_learn_guild().
-        synced_guilds = set()
-        for gid in self.known_guild_ids:
-            try:
-                guild = discord.Object(id=int(gid))
+    async def setup_hook(self) -> None:
+        await self.rpc.start()
+        self.api_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=65))
+        if self.known_guild_ids:
+            for guild_id in self.known_guild_ids:
+                guild = discord.Object(id=int(guild_id))
                 self.tree.copy_global_to(guild=guild)
                 synced = await self.tree.sync(guild=guild)
-                synced_guilds.add(gid)
-                log.info("Synced %d slash commands to guild %s (instant)", len(synced), gid)
-            except Exception as e:
-                log.error("Guild sync failed for %s: %s", gid, e)
+                log.info("synced %d Discord commands to guild %s", len(synced), guild_id)
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
+            log.info("cleared stale global Discord commands")
+        else:
+            synced = await self.tree.sync()
+            log.info("synced %d global Discord commands", len(synced))
 
-        if self.guild_id and self.guild_id not in synced_guilds:
-            try:
-                guild = discord.Object(id=int(self.guild_id))
-                self.tree.copy_global_to(guild=guild)
-                synced = await self.tree.sync(guild=guild)
-                log.info("Synced %d slash commands to guild %s (instant)", len(synced), self.guild_id)
-            except Exception as e:
-                log.error("Guild sync failed for %s: %s", self.guild_id, e)
-
-        # Clear stale global commands that cause duplicates
-        if self.known_guild_ids or self.guild_id:
-            try:
-                self.tree.clear_commands(guild=None)
-                await self.tree.sync()
-                log.info("Cleared global slash commands (guild-only mode)")
-            except Exception as e:
-                log.error("Failed to clear global commands: %s", e)
-
-    async def close(self):
-        if self.http_session:
-            await self.http_session.close()
+    async def close(self) -> None:
+        if self.api_session:
+            await self.api_session.close()
+        await self.rpc.close()
         await super().close()
 
-    # -- ClawForge API helpers --
-
-    async def ensure_session(self, channel_id: str, channel_name: str) -> Optional[str]:
-        if channel_id in self.channel_sessions:
-            return self.channel_sessions[channel_id]
-
-        session_id = await self._create_session(f"discord-{channel_name}")
-        if session_id:
-            self.channel_sessions[channel_id] = session_id
-            self.save_state()
-        return session_id
-
-    async def _create_session(self, name: str) -> Optional[str]:
-        try:
-            async with self.http_session.post(
-                f"{self.clawforge_url}/api/sessions/new",
-                json={"name": name},
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("id")
-                log.warning("Session create failed: %s", await resp.text())
-        except Exception as e:
-            log.error("Session create error: %s", e)
-        return None
-
-    async def fetch_sessions(self) -> list[dict]:
-        try:
-            async with self.http_session.get(f"{self.clawforge_url}/api/sessions") as resp:
-                if resp.status == 200:
-                    return await resp.json()
-        except Exception as e:
-            log.error("Fetch sessions error: %s", e)
-        return []
-
-    async def fetch_personas(self, session_id: Optional[str] = None) -> dict:
-        url = f"{self.clawforge_url}/api/persona"
-        if session_id:
-            url += f"?session_id={session_id}"
-        try:
-            async with self.http_session.get(url) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-        except Exception as e:
-            log.error("Fetch personas error: %s", e)
-        return {"active": "default", "personas": []}
-
-    async def set_persona(self, session_id: str, name: str) -> bool:
-        try:
-            async with self.http_session.post(
-                f"{self.clawforge_url}/api/persona",
-                json={"action": "select", "name": name, "session_id": session_id},
-            ) as resp:
-                return resp.status == 200
-        except Exception as e:
-            log.error("Set persona error: %s", e)
-            return False
-
-    async def create_persona(self, name: str, content: str) -> bool:
-        try:
-            async with self.http_session.post(
-                f"{self.clawforge_url}/api/persona",
-                json={"action": "create", "name": name, "content": content},
-            ) as resp:
-                return resp.status == 200
-        except Exception as e:
-            log.error("Create persona error: %s", e)
-            return False
-
-    async def delete_persona(self, name: str) -> bool:
-        try:
-            async with self.http_session.post(
-                f"{self.clawforge_url}/api/persona",
-                json={"action": "delete", "name": name},
-            ) as resp:
-                return resp.status == 200
-        except Exception as e:
-            log.error("Delete persona error: %s", e)
-            return False
-
-    async def fetch_auto_approve(self) -> Optional[bool]:
-        try:
-            async with self.http_session.get(
-                f"{self.clawforge_url}/api/tools/autoapprove"
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return bool(data.get("enabled", False))
-        except Exception as e:
-            log.error("Fetch auto-approve error: %s", e)
-        return None
-
-    async def set_auto_approve(self, enabled: bool) -> bool:
-        try:
-            async with self.http_session.post(
-                f"{self.clawforge_url}/api/tools/autoapprove",
-                json={"enabled": enabled},
-            ) as resp:
-                return resp.status == 200
-        except Exception as e:
-            log.error("Set auto-approve error: %s", e)
-            return False
-
-    async def fetch_status(self) -> Optional[dict]:
-        try:
-            async with self.http_session.get(f"{self.clawforge_url}/api/status") as resp:
-                if resp.status == 200:
-                    return await resp.json()
-        except Exception as e:
-            log.error("Status error: %s", e)
-        return None
-
-    async def fetch_vision(self) -> Optional[dict]:
-        try:
-            async with self.http_session.get(f"{self.clawforge_url}/api/vision") as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                log.warning("Vision GET failed: %d %s", resp.status, await resp.text())
-        except Exception as e:
-            log.error("Vision GET error: %s", e)
-        return None
-
-    async def fetch_models(self) -> list[str]:
-        """Query /api/models and return a flat list of `provider:model` strings
-        across all enabled providers. Used for /model autocomplete."""
-        try:
-            async with self.http_session.get(f"{self.clawforge_url}/api/models") as resp:
-                if resp.status != 200:
-                    log.warning("Models GET failed: %d %s", resp.status, await resp.text())
-                    return []
-                data = await resp.json()
-        except Exception as e:
-            log.error("Models GET error: %s", e)
-            return []
-
-        # Curated model list per provider.
-        # Models come as "provider:model" strings or objects with "id".
-        # Only surface models we actually want in Discord autocomplete.
-        allowed_ollama = {"ollama:qwen3:4b"}
-        allowed_openrouter = {"openrouter:x-ai/grok-4.1-fast"}
-
-        out: list[str] = []
-        for prov in data.get("providers", []):
-            provider_name = prov.get("name", "").lower()
-            for m in prov.get("models", []):
-                if not m:
-                    continue
-                # OpenRouter returns objects with "id" key
-                model_id = m["id"] if isinstance(m, dict) and "id" in m else m
-                if not isinstance(model_id, str):
-                    continue
-
-                if provider_name == "anthropic":
-                    # All Anthropic models
-                    out.append(model_id)
-                elif provider_name == "ollama" and model_id in allowed_ollama:
-                    out.append(model_id)
-                elif provider_name == "openrouter" and model_id in allowed_openrouter:
-                    out.append(model_id)
-        return out
-
-    async def set_vision_model(self, model: Optional[str]) -> bool:
-        """Set (or clear) the runtime vision model override."""
-        try:
-            async with self.http_session.post(
-                f"{self.clawforge_url}/api/vision",
-                json={"model": model},
-            ) as resp:
-                if resp.status == 200:
-                    return True
-                log.warning("Vision POST failed: %d %s", resp.status, await resp.text())
-        except Exception as e:
-            log.error("Vision POST error: %s", e)
-        return False
-
-    async def cancel_job(self, job_id: str) -> bool:
-        try:
-            async with self.http_session.post(
-                f"{self.clawforge_url}/api/background/cancel",
-                json={"job_id": job_id},
-            ) as resp:
-                return resp.status == 200
-        except Exception as e:
-            log.error("Cancel error: %s", e)
-            return False
-
-    IMAGE_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"}
-    IMAGE_EXT_TO_MIME = {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".gif": "image/gif",
-        ".webp": "image/webp",
-    }
-    ATTACHMENT_DIR = Path("/tmp/clawforge_attachments")
-
-    # Anthropic internally downscales images so the longest edge is ~1568px
-    # before the model sees them. Anything larger is thrown away server-side,
-    # so pre-resizing to this target gives identical OCR quality at a fraction
-    # of the payload size and token cost. It also guarantees we stay under
-    # their 8000px hard limit on either dimension.
-    VISION_LONGEST_EDGE = 1568
-    VISION_JPEG_QUALITY = 85
-
-    async def download_image_attachments(
-        self, attachments: list[discord.Attachment]
-    ) -> list[dict]:
-        """Download image attachments to /tmp and return [{path, mime, name}].
-
-        Pipeline: Discord download → Pillow open (format sniff from magic
-        bytes, not extension/content_type) → resize if longest edge > target
-        → re-encode as JPEG. This normalizes everything to a known-good
-        format and shrinks phone photos from ~4MB to ~200KB.
-        """
-        if not attachments:
-            return []
-        self.ATTACHMENT_DIR.mkdir(parents=True, exist_ok=True)
-        out: list[dict] = []
-        for att in attachments[:4]:  # hard cap at 4 per Discord message
-            mime = (att.content_type or "").lower().split(";")[0].strip()
-            if not mime:
-                mime = self.IMAGE_EXT_TO_MIME.get(Path(att.filename).suffix.lower(), "")
-            if mime not in self.IMAGE_MIMES:
-                log.info("Skipping non-image attachment: %s (%s)", att.filename, mime or "?")
-                continue
-            safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", att.filename) or "image"
-            raw_path = self.ATTACHMENT_DIR / f"{att.id}_{safe_name}"
-            try:
-                await att.save(raw_path)
-            except Exception as e:
-                log.warning("Failed to save %s: %s", att.filename, e)
-                continue
-
-            final_path, final_mime = await asyncio.to_thread(
-                self._preprocess_image, raw_path
-            )
-            if final_path is None:
-                log.warning("Skipping %s: preprocess failed", att.filename)
-                continue
-
-            out.append({
-                "path": str(final_path),
-                "mime": final_mime,
-                "name": att.filename,
-            })
-        if out:
-            log.info("Downloaded %d image attachment(s) for vision", len(out))
-        return out
-
-    def _preprocess_image(self, raw_path: Path) -> tuple[Optional[Path], str]:
-        """Open with Pillow, resize if oversized, re-encode as JPEG.
-
-        Returns (path, mime) on success, (None, "") on failure. Runs in a
-        worker thread because Pillow is blocking.
-        """
-        if not _PIL_AVAILABLE:
-            # Without Pillow we can't sniff or resize — fall back to raw bytes
-            # with the extension-derived MIME. Accuracy not guaranteed.
-            ext = raw_path.suffix.lower()
-            return raw_path, self.IMAGE_EXT_TO_MIME.get(ext, "image/png")
-        try:
-            with Image.open(raw_path) as im:
-                im.load()
-                # Convert anything with alpha or palette to RGB for JPEG.
-                if im.mode not in ("RGB", "L"):
-                    im = im.convert("RGB")
-                w, h = im.size
-                longest = max(w, h)
-                if longest > self.VISION_LONGEST_EDGE:
-                    scale = self.VISION_LONGEST_EDGE / longest
-                    new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
-                    im = im.resize(new_size, Image.LANCZOS)
-                    log.info(
-                        "Resized %s: %dx%d → %dx%d",
-                        raw_path.name, w, h, new_size[0], new_size[1],
-                    )
-                out_path = raw_path.with_suffix(".vision.jpg")
-                im.save(out_path, "JPEG", quality=self.VISION_JPEG_QUALITY, optimize=True)
-            # Remove the raw download once we have the normalized copy.
-            try:
-                raw_path.unlink()
-            except OSError:
-                pass
-            return out_path, "image/jpeg"
-        except Exception as e:
-            log.warning("Pillow preprocess failed for %s: %s", raw_path.name, e)
-            return None, ""
-
-    async def _pulse_typing(self, channel: discord.TextChannel) -> None:
-        """Send repeated typing indicators until cancelled.
-
-        Discord's typing indicator lasts ~10s; re-send every 8s so the user
-        sees *something* while the dispatcher is thinking. Cancel this task
-        as soon as you have a reply ready to prevent the eternal "typing..."
-        UX hang.
-        """
-        try:
-            while True:
-                await channel.trigger_typing()
-                await asyncio.sleep(8)
-        except asyncio.CancelledError:
-            pass
-
-    async def dispatcher_chat(
-        self,
-        message_text: str,
-        session_id: Optional[str] = None,
-        model_override: Optional[str] = None,
-        attachments: Optional[list[dict]] = None,
-    ) -> dict:
-        """Dispatcher chat: fast model with summon_subagent as the only tool.
-
-        Returns a dict with keys: text (str), spawned_jobs (list[str]), error (Optional[str]).
-        The model decides whether to answer directly or call summon_subagent for real work.
-        """
-        payload = {
-            "message": message_text,
-            "model_override": model_override or FAST_MODEL,
-            "allowed_tools": ",".join(DISPATCHER_TOOLS),
-            "adapter_context": DISPATCHER_CONTEXT,
-        }
-        if session_id:
-            payload["session_id"] = session_id
-        if attachments:
-            payload["attachments"] = attachments
-        try:
-            async with self.http_session.post(
-                f"{self.clawforge_url}/api/chat",
-                json=payload,
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("ok"):
-                        return {
-                            "text": data.get("text", "") or "",
-                            "spawned_jobs": data.get("spawned_jobs", []) or [],
-                            "error": None,
-                        }
-                    return {"text": "", "spawned_jobs": [], "error": data.get("error", "ClawForge error")}
-                return {"text": "", "spawned_jobs": [], "error": f"ClawForge HTTP {resp.status}"}
-        except asyncio.TimeoutError:
-            return {"text": "", "spawned_jobs": [], "error": "Request timed out."}
-        except Exception as e:
-            log.error("Dispatcher chat error: %s", e)
-            return {"text": "", "spawned_jobs": [], "error": f"Bridge error: {e}"}
-
-    async def spawn_background(
-        self,
-        message_text: str,
-        session_id: Optional[str] = None,
-        callback_channel: Optional[str] = None,
-        model_override: Optional[str] = None,
-    ) -> Optional[str]:
-        """Enqueue a background job. Returns job_id."""
-        payload = {"message": message_text}
-        if session_id:
-            payload["session_id"] = session_id
-        if callback_channel:
-            payload["callback_channel"] = callback_channel
-        if model_override:
-            payload["model_override"] = model_override
-        if self.enabled_tools:
-            payload["allowed_tools"] = ",".join(sorted(self.enabled_tools))
-        try:
-            async with self.http_session.post(
-                f"{self.clawforge_url}/api/chat/background",
-                json=payload,
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("job_id")
-                log.warning("Background spawn failed: %s", await resp.text())
-        except Exception as e:
-            log.error("Background spawn error: %s", e)
-        return None
-
-    async def poll_background(self, job_id: str, cursor: int = 0) -> Optional[dict]:
-        try:
-            async with self.http_session.post(
-                f"{self.clawforge_url}/api/background/status",
-                json={"job_id": job_id, "cursor": cursor},
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-        except Exception as e:
-            log.error("Poll error: %s", e)
-        return None
-
-    # -- Discord event handlers --
-
-    async def on_ready(self):
-        log.info("Connected as %s (id: %s)", self.user, self.user.id)
-        log.info("ClawForge API: %s", self.clawforge_url)
-        # Learn all guilds the bot is currently in
+    async def on_ready(self) -> None:
+        log.info("Discord transport connected as %s", self.user)
         for guild in self.guilds:
-            await self._maybe_learn_guild(guild)
+            guild_id = str(guild.id)
+            if guild_id in self.known_guild_ids:
+                continue
+            self.known_guild_ids.add(guild_id)
+            self.save_state()
+            target = discord.Object(id=guild.id)
+            self.tree.copy_global_to(guild=target)
+            synced = await self.tree.sync(guild=target)
+            log.info("synced %d Discord commands to new guild %s", len(synced), guild_id)
 
-    async def _maybe_learn_guild(self, guild: Optional[discord.Guild]) -> None:
-        """Auto-detect guild ID on first interaction and re-sync slash commands."""
-        if guild is None:
+    async def on_message(self, message: discord.Message) -> None:
+        if message.author.bot or not self.user:
             return
-        gid = str(guild.id)
-        if gid in self.known_guild_ids:
+        mentioned = self.user in message.mentions
+        respond_all = self.channel_respond_all.get(str(message.channel.id), False)
+        if message.guild and not mentioned and not respond_all:
             return
-
-        log.info("Auto-detected new guild: %s (id: %s)", guild.name, gid)
-        self.known_guild_ids.add(gid)
-
-        # Use as primary guild_id if none configured
-        if not self.guild_id:
-            self.guild_id = gid
-
-        # Sync slash commands to this guild for instant availability
-        try:
-            guild_obj = discord.Object(id=int(gid))
-            self.tree.copy_global_to(guild=guild_obj)
-            synced = await self.tree.sync(guild=guild_obj)
-            log.info("Re-synced %d slash commands to guild %s (instant)", len(synced), gid)
-        except Exception as e:
-            log.error("Guild sync failed for %s: %s", gid, e)
-
-        self.save_state()
-
-    async def on_message(self, message: discord.Message):
-        if message.author.bot:
-            return
-
-        # Auto-detect guild on first message
-        await self._maybe_learn_guild(message.guild)
-
-        channel_id = str(message.channel.id)
-        respond_all = self.channel_respond_all.get(channel_id, False)
-        mentioned = self.user.mentioned_in(message) and not message.mention_everyone
-
-        if not respond_all and not mentioned:
-            return
-
         content = message.content
         if mentioned:
-            for mention in message.mentions:
-                if mention == self.user:
-                    content = content.replace(f"<@{mention.id}>", "")
-                    content = content.replace(f"<@!{mention.id}>", "")
-        content = content.strip()
+            content = content.replace(f"<@{self.user.id}>", "").replace(f"<@!{self.user.id}>", "").strip()
+        if not content:
+            content = "Please respond to the attached message."
+        descriptors = await self.spool_attachments(message.attachments)
+        await self.submit(message.channel, content, reply_to=message, attachments=descriptors)
 
-        # Download image attachments to /tmp so the daemon can read them.
-        # Skipped for text-only messages; non-images are ignored.
-        downloaded_attachments: list[dict] = []
-        if message.attachments:
-            downloaded_attachments = await self.download_image_attachments(message.attachments)
+    async def spool_attachments(self, attachments: list[discord.Attachment]) -> list[dict[str, str]]:
+        if len(attachments) > self.max_attachment_count:
+            raise ValueError(f"too many attachments (maximum {self.max_attachment_count})")
+        if not attachments:
+            return []
+        self.attachment_spool.mkdir(parents=True, exist_ok=True)
+        descriptors: list[dict[str, str]] = []
+        for attachment in attachments:
+            if attachment.size > self.max_attachment_bytes:
+                raise ValueError(f"attachment {attachment.filename!r} exceeds the size limit")
+            disk_name = f"{attachment.id}-{uuid.uuid4().hex}"
+            final_path = self.attachment_spool / disk_name
+            part_path = self.attachment_spool / f"{disk_name}.part"
+            written = 0
+            try:
+                assert self.api_session is not None
+                async with self.api_session.get(attachment.url) as response:
+                    response.raise_for_status()
+                    with part_path.open("xb") as output:
+                        async for chunk in response.content.iter_chunked(64 * 1024):
+                            written += len(chunk)
+                            if written > self.max_attachment_bytes:
+                                raise ValueError(f"attachment {attachment.filename!r} exceeds the size limit")
+                            output.write(chunk)
+                part_path.replace(final_path)
+            except Exception:
+                part_path.unlink(missing_ok=True)
+                raise
+            descriptors.append({
+                "path": str(final_path),
+                "mime": attachment.content_type or "application/octet-stream",
+                "name": attachment.filename,
+            })
+        return descriptors
 
-        if not content and not downloaded_attachments:
-            if mentioned:
-                await message.reply("You mentioned me but didn't say anything.", mention_author=False)
+    async def submit(
+        self,
+        channel: discord.abc.Messageable,
+        prompt: str,
+        *,
+        reply_to: Optional[discord.Message] = None,
+        model: Optional[str] = None,
+        attachments: Optional[list[dict[str, str]]] = None,
+    ) -> None:
+        channel_id = getattr(channel, "id", None)
+        if channel_id is None:
             return
+        channel_key = str(channel_id)
+        status_message: Optional[discord.Message] = None
+        try:
+            session_id = await self.ensure_session(channel_key, getattr(channel, "name", channel_key))
+            selected_model = model or self.channel_models.get(channel_key)
+            dispatch_context = DISPATCH_CONTEXT
+            if selected_model:
+                dispatch_context += (
+                    f" When calling summon_subagent, set its model field to {selected_model!r}; "
+                    "that is the user's selected model for background work."
+                )
+            async with channel.typing():
+                if attachments:
+                    result = await self.rpc.call(
+                        "chat",
+                        message=prompt,
+                        channel=channel_key,
+                        session_id=session_id,
+                        model=selected_model,
+                        plans_required=False,
+                        adapter_context="Discord attachment request.",
+                        attachments=attachments,
+                    )
+                else:
+                    result = await self.rpc.call(
+                        "dispatch",
+                        message=prompt,
+                        channel=channel_key,
+                        session_id=session_id,
+                        model=selected_model,
+                        plans_required=False,
+                        allowed_tools="summon_subagent",
+                        adapter_context=dispatch_context,
+                    )
+            if attachments:
+                job_id = result["queued"]["job_id"]
+                self.channel_jobs[channel_id] = job_id
+                status_message = await self._send(
+                    channel, f"Working on job `{job_id[:8]}`…", view=CancelView(self, job_id), reply_to=reply_to
+                )
+                await self.poll_job(channel, status_message, job_id)
+                return
+            dispatched = result["dispatched"]
+            text = dispatched.get("text", "").strip()
+            spawned = [
+                job_id.strip()
+                for job_id in (dispatched.get("spawned_jobs") or "").split(",")
+                if job_id.strip()
+            ]
+            if not spawned:
+                await self._send(channel, text or "Done.", reply_to=reply_to)
+                return
 
-        if not content and downloaded_attachments:
-            content = "(image attached — please describe and respond)"
+            job_id = spawned[0]
+            self.channel_jobs[channel_id] = job_id
+            if text:
+                await self._send(channel, text, reply_to=reply_to)
+            status_message = await self._send(
+                channel,
+                f"Working on job `{job_id[:8]}`…",
+                view=CancelView(self, job_id),
+                reply_to=None if text else reply_to,
+            )
+            await self.poll_job(channel, status_message, job_id)
+        except Exception as exc:
+            log.exception("Discord request failed")
+            detail = str(exc) or type(exc).__name__
+            error_text = f"ClawForge request failed: {detail}"
+            if status_message:
+                await status_message.edit(content=error_text, view=None)
+            else:
+                await self._send(channel, error_text, reply_to=reply_to)
 
-        channel_name = getattr(message.channel, "name", channel_id)
-        guild_name = message.guild.name if message.guild else "DM"
-        username = message.author.display_name or message.author.name
+    async def api(self, method: str, path: str, **kwargs: Any) -> Any:
+        if not self.api_session:
+            raise RuntimeError("management API is not ready")
+        async with self.api_session.request(method, DEFAULT_WEB_URL + path, **kwargs) as response:
+            if response.status >= 400:
+                raise RuntimeError(f"daemon HTTP {response.status}: {await response.text()}")
+            return await response.json()
 
-        log.info("[%s/#%s] %s: %s", guild_name, channel_name, username, content[:80])
+    async def ensure_session(self, channel_id: str, channel_name: str) -> str:
+        if session_id := self.channel_sessions.get(channel_id):
+            return session_id
+        result = await self.api("POST", "/api/sessions/new", json={"name": f"discord-{channel_name}"})
+        session_id = result["id"]
+        self.channel_sessions[channel_id] = session_id
+        self.save_state()
+        return session_id
 
-        # If a background job is already in flight for this channel, the
-        # Haiku dispatcher has no way to check on it — it will hallucinate
-        # progress ("still working", "the subagent returned X"). Short-circuit
-        # and give the user a deterministic status message instead. The
-        # existing poll_and_deliver task will post the real result.
-        existing_job = self.channel_jobs.get(channel_id)
-        if existing_job:
-            await message.reply(
-                f"Still working on the previous task (job `{existing_job[:8]}`). "
-                "I'll post the result here as soon as it finishes — no need to "
-                "ask me for status, I can't check on it mid-flight.",
-                mention_author=False,
+    async def poll_job(self, channel: discord.abc.Messageable, status: discord.Message, job_id: str) -> None:
+        confirmation_id: Optional[str] = None
+        cursor = 0
+        activity = "Waiting for the model"
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        next_progress_update = started + 15
+        while True:
+            result = await self.rpc.call("poll", job_id=job_id, cursor=cursor)
+            if "finished" in result:
+                finished = result["finished"]
+                text = finished.get("text") or f"Job ended with status `{finished.get('status', 'unknown')}`."
+                await status.edit(content=text[:MAX_DISCORD_MESSAGE], view=None)
+                for chunk in chunks(text[MAX_DISCORD_MESSAGE:]):
+                    await channel.send(chunk)
+                self.channel_jobs.pop(getattr(channel, "id", 0), None)
+                return
+            confirmation = result.get("confirmation")
+            if confirmation and confirmation.get("tool_id") != confirmation_id:
+                confirmation_id = confirmation["tool_id"]
+                preview = confirmation.get("input_preview", "")
+                content = f"Approve tool `{confirmation.get('tool_name', 'unknown')}`?\n```\n{preview[:1200]}\n```"
+                await channel.send(
+                    content,
+                    view=ConfirmationView(self, job_id, confirmation_id),
+                )
+            pending = result.get("pending", {})
+            cursor = int(pending.get("cursor", cursor))
+            event = pending.get("event")
+            if event:
+                event_type = event.get("type", "")
+                tool_name = event.get("tool", "")
+                if event_type == "tool_use" and tool_name:
+                    activity = f"Using `{tool_name}`"
+                elif event_type == "tool_result" and tool_name:
+                    activity = f"Finished `{tool_name}`"
+                elif event_type == "model_wait":
+                    activity = "Waiting for the model"
+                elif event.get("content"):
+                    activity = str(event["content"])[:120]
+            now = loop.time()
+            if now >= next_progress_update:
+                elapsed = int(now - started)
+                await status.edit(
+                    content=f"{activity} — job `{job_id[:8]}` ({elapsed}s elapsed)"
+                )
+                next_progress_update = now + 15
+            await asyncio.sleep(1)
+
+    async def _send(
+        self,
+        channel: discord.abc.Messageable,
+        content: str,
+        *,
+        view: Optional[discord.ui.View] = None,
+        reply_to: Optional[discord.Message] = None,
+    ) -> discord.Message:
+        if reply_to:
+            return await reply_to.reply(content, view=view, mention_author=False)
+        return await channel.send(content, view=view)
+
+
+def chunks(text: str):
+    for index in range(0, len(text), MAX_DISCORD_MESSAGE):
+        yield text[index : index + MAX_DISCORD_MESSAGE]
+
+
+def register_commands(bot: DiscordTransport) -> None:
+    @bot.tree.error
+    async def command_error(
+        interaction: discord.Interaction, error: app_commands.AppCommandError
+    ) -> None:
+        log.exception("Discord command %s failed", interaction.command, exc_info=error)
+        message = f"ClawForge command failed: {error}"
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+
+    @bot.tree.command(name="ask", description="Ask ClawForge")
+    @app_commands.describe(prompt="Message for ClawForge", model="Optional model override")
+    async def ask(interaction: discord.Interaction, prompt: str, model: Optional[str] = None) -> None:
+        await interaction.response.defer()
+        await bot.submit(interaction.channel, prompt, model=model)
+        await interaction.delete_original_response()
+
+    async def persona_names(current: str, *, deletable: bool = False) -> list[app_commands.Choice[str]]:
+        try:
+            data = await bot.api("GET", "/api/persona")
+            names = list(data.get("personas", []))
+        except Exception:
+            log.exception("persona autocomplete failed")
+            names = []
+        if not deletable and "default" not in names:
+            names.insert(0, "default")
+        if deletable:
+            names = [name for name in names if name != "default"]
+        needle = current.casefold()
+        return [
+            app_commands.Choice(name=name, value=name)
+            for name in names
+            if needle in name.casefold()
+        ][:25]
+
+    @bot.tree.command(name="persona", description="Set or view the persona for this channel")
+    @app_commands.describe(name="Persona name (omit to view current)")
+    async def persona(interaction: discord.Interaction, name: Optional[str] = None) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        channel_id = str(interaction.channel_id)
+        session_id = await bot.ensure_session(
+            channel_id, getattr(interaction.channel, "name", channel_id)
+        )
+        if name is None:
+            data = await bot.api("GET", f"/api/persona?session_id={session_id}")
+            available = ", ".join(data.get("personas", [])) or "(none)"
+            await interaction.followup.send(
+                f"**Active persona:** `{data.get('active', 'default')}`\n**Available:** {available}"
             )
             return
+        await bot.api(
+            "POST",
+            "/api/persona",
+            json={"action": "select", "name": name, "session_id": session_id},
+        )
+        await interaction.followup.send(f"Persona set to `{name}` for this channel.")
 
-        session_id = await self.ensure_session(channel_id, channel_name)
-        prefixed = f"[Discord user: {username}] {content}"
-        dispatcher_model = self.channel_models.get(channel_id)
+    @persona.autocomplete("name")
+    async def persona_autocomplete(
+        _: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await persona_names(current)
 
-        # Fire dispatcher in background — don't hold typing() for the full
-        # model round-trip (can be 30s+ when summon_subagent is involved).
-        # We send an immediate typing indicator, then drop it as soon as the
-        # dispatcher returns its ack text, then hand off to poll_and_deliver.
-        async def _dispatch_and_deliver():
-            # Brief typing pulse (5s max) just to show we received the message.
-            # Cancelled as soon as dispatcher_chat returns.
-            typing_task = asyncio.create_task(self._pulse_typing(message.channel))
-            try:
-                result = await self.dispatcher_chat(
-                    prefixed,
-                    session_id,
-                    dispatcher_model,
-                    attachments=downloaded_attachments or None,
-                )
-            finally:
-                typing_task.cancel()
+    @bot.tree.command(name="persona_create", description="Create a new persona")
+    async def persona_create(interaction: discord.Interaction, name: str, content: str) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await bot.api(
+            "POST", "/api/persona", json={"action": "create", "name": name, "content": content}
+        )
+        await interaction.followup.send(f"Persona `{name}` created.")
 
-            if result.get("error"):
-                await message.reply(result["error"], mention_author=False)
-                return
+    @bot.tree.command(name="persona_delete", description="Delete a persona")
+    async def persona_delete(interaction: discord.Interaction, name: str) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await bot.api("POST", "/api/persona", json={"action": "delete", "name": name})
+        await interaction.followup.send(f"Persona `{name}` deleted.")
 
-            spawned = result.get("spawned_jobs", []) or []
-            raw_text = result.get("text", "")
-            # Extract media URLs from tool outputs before stripping the XML
-            media_urls = extract_media_urls(raw_text)
-            cleaned = strip_tool_calls(raw_text)
-            # Append any media URLs the model forgot to include in its text
-            for url in media_urls:
-                if url not in cleaned:
-                    cleaned = cleaned.rstrip() + "\n" + url if cleaned else url
-            if spawned:
-                # Prefer the dispatcher's actual generated text as the ack so
-                # each spawn feels unique. Strip XML tool-call markup first
-                # (Haiku sometimes emits <function_calls> blocks in its text).
-                # Fall back to a canned string only if nothing real survived.
-                if cleaned:
-                    await self.send_chunked(message, cleaned)
-                else:
-                    await message.reply(
-                        "On it — working on this in the background. I'll reply with the result.",
-                        mention_author=False,
-                    )
-            else:
-                if cleaned:
-                    await self.send_chunked(message, cleaned)
+    @persona_delete.autocomplete("name")
+    async def persona_delete_autocomplete(
+        _: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return await persona_names(current, deletable=True)
 
-            for job_id in spawned:
-                self.channel_jobs[channel_id] = job_id
-                log.info("Subagent job %s spawned for #%s", job_id[:8], channel_name)
-                asyncio.create_task(self.poll_and_deliver(message, job_id, channel_id))
+    @bot.tree.command(name="tools", description="Show enabled and disabled tools")
+    async def tools(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        registered = await bot.api("GET", "/api/tools")
+        lines = [
+            f"{'✅' if item.get('name') in bot.enabled_tools else '⬜'} `{item.get('name')}`"
+            for item in sorted(registered, key=lambda value: value.get("name", ""))
+        ]
+        await interaction.followup.send(
+            embed=discord.Embed(title="Discord Tool Allowlist", description="\n".join(lines))
+        )
 
-        asyncio.create_task(_dispatch_and_deliver())
+    @bot.tree.command(name="tool_toggle", description="Enable or disable a tool")
+    async def tool_toggle(interaction: discord.Interaction, tool: str) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        enabled = tool not in bot.enabled_tools
+        if enabled:
+            bot.enabled_tools.add(tool)
+        else:
+            bot.enabled_tools.discard(tool)
+        bot.save_state()
+        await interaction.followup.send(f"Tool `{tool}` {'enabled' if enabled else 'disabled'}.")
 
-    async def poll_and_deliver(self, original: discord.Message, job_id: str, channel_id: str):
-        """Poll until background job completes, then post result."""
-        shown_confirmations: set[str] = set()
-        event_cursor = 0
-        # Track which tool events we've posted to avoid duplicates.
-        # We batch events into a single progress message per poll cycle.
-        progress_msg: Optional[discord.Message] = None
-        progress_lines: list[str] = []
-        # Poll every 3s for up to 20 minutes. Deep investigations routinely
-        # run 5-10 min; the old 6-min cap silently killed long-running jobs.
-        max_iterations = 400
+    @tool_toggle.autocomplete("tool")
+    async def tool_autocomplete(
+        _: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
         try:
-            for _ in range(max_iterations):
-                await asyncio.sleep(3)
-                try:
-                    result = await self.poll_background(job_id, cursor=event_cursor)
-                except Exception as e:
-                    log.error("poll_background raised for %s: %s", job_id[:8], e)
-                    continue
-                if not result:
-                    continue
+            registered = await bot.api("GET", "/api/tools")
+            names = [item.get("name", "") for item in registered]
+        except Exception:
+            names = sorted(bot.enabled_tools)
+        needle = current.casefold()
+        return [app_commands.Choice(name=name, value=name) for name in names if needle in name.casefold()][
+            :25
+        ]
 
-                # Render new tool events as a live progress embed
-                tool_events = result.get("tool_events", [])
-                if tool_events:
-                    for evt in tool_events:
-                        etype = evt.get("type", "?")
-                        tool = evt.get("tool", "?")
-                        content = evt.get("content", "")
-                        is_error = evt.get("is_error", False)
-                        if etype == "tool_use":
-                            preview = content[:120] + "..." if len(content) > 120 else content
-                            progress_lines.append(f"▶ `{tool}` {preview}")
-                        else:
-                            status_icon = "❌" if is_error else "✓"
-                            preview = content[:100] + "..." if len(content) > 100 else content
-                            progress_lines.append(f"  {status_icon} {preview}")
-
-                    # Keep only last 15 lines to stay within Discord limits
-                    if len(progress_lines) > 15:
-                        progress_lines = progress_lines[-15:]
-
-                    progress_text = (
-                        f"**Subagent `{job_id[:8]}`** — working...\n"
-                        + "\n".join(progress_lines)
-                    )
-                    try:
-                        if progress_msg is None:
-                            progress_msg = await original.channel.send(progress_text)
-                        else:
-                            await progress_msg.edit(content=progress_text)
-                    except Exception as e:
-                        log.warning("Failed to update progress message: %s", e)
-
-                if result.get("cursor") is not None:
-                    event_cursor = result["cursor"]
-
-                status = result.get("status", "pending")
-
-                if status == "pending":
-                    conf = result.get("pending_confirmation")
-                    if conf and conf["tool_id"] not in shown_confirmations:
-                        shown_confirmations.add(conf["tool_id"])
-                        preview = conf.get("input_preview", "")
-                        if len(preview) > 500:
-                            preview = preview[:500] + "..."
-                        view = ToolConfirmView(
-                            self.http_session, self.clawforge_url,
-                            job_id, conf["tool_id"], conf["tool_name"],
-                        )
-                        await original.channel.send(
-                            f"**Tool request: `{conf['tool_name']}`**\n```\n{preview}\n```",
-                            view=view,
-                        )
-                    continue
-
-                if status == "completed":
-                    raw = result.get("text", "") or ""
-                    media_urls = extract_media_urls(raw)
-                    cleaned = strip_tool_calls(raw)
-                    for url in media_urls:
-                        if url not in cleaned:
-                            cleaned = cleaned.rstrip() + "\n" + url if cleaned else url
-                    if cleaned:
-                        await self.send_chunked(original, cleaned)
-                    elif raw.strip():
-                        # Subagent returned only tool-call XML / structured content.
-                        # Don't drop silently — show the user what actually happened.
-                        log.warning(
-                            "Subagent %s returned only tool-call content after stripping (raw=%d chars). Sending raw.",
-                            job_id[:8], len(raw),
-                        )
-                        fallback = (
-                            "Subagent finished but its final response was only tool-call "
-                            "markup — no user-facing text. Raw output:\n```\n"
-                            + raw[:1800]
-                            + ("\n...(truncated)" if len(raw) > 1800 else "")
-                            + "\n```"
-                        )
-                        await original.channel.send(fallback)
-                    else:
-                        log.warning("Subagent %s completed with empty text.", job_id[:8])
-                        await original.channel.send(
-                            "Subagent finished but returned no text at all. "
-                            "Check the daemon log for details."
-                        )
-                elif status == "failed":
-                    err = result.get("text", "Unknown error")
-                    await original.channel.send(f"Background task failed: {err}")
-                elif status == "cancelled":
-                    await original.channel.send("Background task was cancelled.")
-
-                # Mark progress message as done
-                if progress_msg is not None:
-                    final_status = "done" if status == "completed" else status
-                    try:
-                        final_text = (
-                            f"**Subagent `{job_id[:8]}`** — {final_status}\n"
-                            + "\n".join(progress_lines[-10:])
-                        )
-                        await progress_msg.edit(content=final_text)
-                    except Exception:
-                        pass
-                return
-            log.warning("Subagent %s timed out in poll loop after %d iterations.", job_id[:8], max_iterations)
-            await original.channel.send("Background task timed out after 20 minutes.")
-        except Exception as e:
-            log.exception("poll_and_deliver crashed for %s: %s", job_id[:8], e)
-            try:
-                await original.channel.send(
-                    f"Bridge error while waiting for subagent {job_id[:8]}: {e}"
-                )
-            except Exception:
-                pass
-        finally:
-            if self.channel_jobs.get(channel_id) == job_id:
-                self.channel_jobs.pop(channel_id, None)
-
-    async def send_chunked(self, original: discord.Message, text: str):
-        if len(text) <= 2000:
-            await original.reply(text, mention_author=False)
+    @bot.tree.command(name="model", description="Set or view the model override for this channel")
+    async def model(interaction: discord.Interaction, model: Optional[str] = None) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        channel_id = str(interaction.channel_id)
+        if model is None:
+            await interaction.followup.send(
+                f"**Current model:** `{bot.channel_models.get(channel_id, '(daemon default)')}`"
+            )
             return
+        if model.casefold() == "reset":
+            bot.channel_models.pop(channel_id, None)
+            text = "Model override cleared — using daemon default."
+        else:
+            bot.channel_models[channel_id] = model
+            text = f"Model set to `{model}` for this channel."
+        bot.save_state()
+        await interaction.followup.send(text)
 
-        chunks = []
-        current = ""
-        for line in text.split("\n"):
-            if len(current) + len(line) + 1 <= 2000:
-                current += line + "\n"
-            else:
-                if current:
-                    chunks.append(current.rstrip())
-                while len(line) > 2000:
-                    chunks.append(line[:2000])
-                    line = line[2000:]
-                current = line + "\n"
-        if current.strip():
-            chunks.append(current.rstrip())
+    @model.autocomplete("model")
+    async def model_autocomplete(
+        _: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        entries = rank_model_autocomplete([], current)
+        try:
+            data = await bot.api("GET", "/api/models")
+            entries = rank_model_autocomplete(data.get("providers", []), current)
+        except Exception:
+            log.exception("model autocomplete failed")
+        return [app_commands.Choice(name=value, value=value) for value in entries]
 
-        if chunks:
-            await original.reply(chunks[0], mention_author=False)
-            for chunk in chunks[1:]:
-                await original.channel.send(chunk)
+    @bot.tree.command(name="session", description="Show this channel's ClawForge session info")
+    async def session(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        channel_id = str(interaction.channel_id)
+        session_id = await bot.ensure_session(
+            channel_id, getattr(interaction.channel, "name", channel_id)
+        )
+        sessions = await bot.api("GET", "/api/sessions")
+        info = next((item for item in sessions if item.get("id") == session_id), {})
+        persona_data = await bot.api("GET", f"/api/persona?session_id={session_id}")
+        embed = discord.Embed(title=f"Session: {getattr(interaction.channel, 'name', channel_id)}")
+        embed.add_field(name="ID", value=f"`{session_id}`", inline=False)
+        embed.add_field(name="Messages", value=str(info.get("message_count", 0)))
+        embed.add_field(name="Persona", value=f"`{persona_data.get('active', 'default')}`")
+        embed.add_field(name="Model", value=f"`{bot.channel_models.get(channel_id, '(daemon default)')}`")
+        embed.add_field(
+            name="Require plans",
+            value="yes" if bot.channel_plans_required.get(channel_id, True) else "no",
+        )
+        embed.add_field(
+            name="Background job",
+            value=f"`{bot.channel_jobs[interaction.channel_id][:8]}…`"
+            if interaction.channel_id in bot.channel_jobs
+            else "(none)",
+        )
+        await interaction.followup.send(embed=embed)
 
-    async def send_chunked_followup(self, interaction: discord.Interaction, text: str):
-        if len(text) <= 2000:
-            await interaction.followup.send(text)
+    @bot.tree.command(name="new_session", description="Start a fresh session for this channel")
+    async def new_session(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        channel_id = str(interaction.channel_id)
+        channel_name = getattr(interaction.channel, "name", channel_id)
+        result = await bot.api(
+            "POST", "/api/sessions/new", json={"name": f"discord-{channel_name}"}
+        )
+        bot.channel_sessions[channel_id] = result["id"]
+        bot.save_state()
+        await interaction.followup.send(f"New session started: `{result['id']}`")
+
+    @bot.tree.command(name="cancel", description="Cancel this channel's active ClawForge job")
+    async def cancel(interaction: discord.Interaction) -> None:
+        job_id = bot.channel_jobs.get(interaction.channel_id)
+        if not job_id:
+            await interaction.response.send_message("No active job in this channel.", ephemeral=True)
             return
-        chunks = []
-        current = ""
-        for line in text.split("\n"):
-            if len(current) + len(line) + 1 <= 2000:
-                current += line + "\n"
-            else:
-                if current:
-                    chunks.append(current.rstrip())
-                while len(line) > 2000:
-                    chunks.append(line[:2000])
-                    line = line[2000:]
-                current = line + "\n"
-        if current.strip():
-            chunks.append(current.rstrip())
-        for chunk in chunks:
-            await interaction.followup.send(chunk)
+        try:
+            result = await bot.rpc.call("cancel", job_id=job_id)
+            text = "Cancellation requested." if result.get("cancelled") else "Job is no longer cancellable."
+        except Exception as exc:
+            text = f"Cancellation failed: {exc}"
+        await interaction.response.send_message(text, ephemeral=True)
 
+    respond_choices = [
+        app_commands.Choice(name="Mention only", value="mention"),
+        app_commands.Choice(name="Every message", value="all"),
+    ]
 
-# ---------------------------------------------------------------------------
-# Slash command registration
-# ---------------------------------------------------------------------------
+    @bot.tree.command(name="respond_mode", description="Choose when the bot responds in this channel")
+    @app_commands.choices(mode=respond_choices)
+    async def respond_mode(
+        interaction: discord.Interaction, mode: app_commands.Choice[str]
+    ) -> None:
+        channel_id = str(interaction.channel_id)
+        if mode.value == "all":
+            bot.channel_respond_all[channel_id] = True
+        else:
+            bot.channel_respond_all.pop(channel_id, None)
+        bot.save_state()
+        await interaction.response.send_message(
+            f"Respond mode set to **{mode.value}** for this channel.", ephemeral=True
+        )
 
-def register_commands(bridge: ClawForgeBridge) -> None:
-    tree = bridge.tree
+    toggle_choices = [
+        app_commands.Choice(name="On", value="on"),
+        app_commands.Choice(name="Off", value="off"),
+        app_commands.Choice(name="Status", value="status"),
+    ]
 
-    # ---- /help ----
-    @tree.command(name="help", description="Show all ClawForge commands")
-    async def cmd_help(interaction: discord.Interaction):
-        embed = discord.Embed(
-            title="ClawForge Bridge Commands",
-            description="Mention me in any channel to chat. Use slash commands to manage state.",
-            color=0x5865F2,
+    @bot.tree.command(name="require_plans", description="Toggle required plans for this channel")
+    @app_commands.choices(mode=toggle_choices)
+    async def require_plans(
+        interaction: discord.Interaction, mode: app_commands.Choice[str]
+    ) -> None:
+        channel_id = str(interaction.channel_id)
+        if mode.value != "status":
+            bot.channel_plans_required[channel_id] = mode.value == "on"
+            bot.save_state()
+        enabled = bot.channel_plans_required.get(channel_id, True)
+        await interaction.response.send_message(
+            f"Require plans is **{'ON' if enabled else 'OFF'}** for this channel.", ephemeral=True
+        )
+
+    @bot.tree.command(name="autoapprove", description="Toggle global tool auto-approval")
+    @app_commands.choices(mode=toggle_choices)
+    async def autoapprove(
+        interaction: discord.Interaction, mode: app_commands.Choice[str]
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if mode.value != "status":
+            await bot.api(
+                "POST", "/api/tools/autoapprove", json={"enabled": mode.value == "on"}
+            )
+        result = await bot.api("GET", "/api/tools/autoapprove")
+        await interaction.followup.send(
+            f"Auto-approve is **{'ON' if result.get('enabled') else 'OFF'}**."
+        )
+
+    @bot.tree.command(name="vision_model", description="Show or set the image-analysis model")
+    async def vision_model(
+        interaction: discord.Interaction, model: Optional[str] = None
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if model is not None:
+            await bot.api("POST", "/api/vision", json={"model": model})
+        result = await bot.api("GET", "/api/vision")
+        embed = discord.Embed(title="Vision config")
+        embed.add_field(name="Enabled", value="yes" if result.get("enabled") else "no")
+        embed.add_field(name="Active model", value=f"`{result.get('model', '?')}`", inline=False)
+        embed.add_field(
+            name="Config default", value=f"`{result.get('default_model', '?')}`", inline=False
+        )
+        await interaction.followup.send(embed=embed)
+
+    @bot.tree.command(name="restart", description="Schedule a ClawForge daemon rebuild and restart")
+    @app_commands.default_permissions(administrator=True)
+    async def restart(interaction: discord.Interaction) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+            await interaction.response.send_message("Only administrators can restart ClawForge.", ephemeral=True)
+            return
+        script = Path(
+            os.environ.get("CLAWFORGE_REBUILD_SCRIPT", str(Path.home() / ".local/bin/clawforge-rebuild.sh"))
+        )
+        if not script.is_file():
+            await interaction.response.send_message(f"Restart script not found: `{script}`", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        process = await asyncio.create_subprocess_exec(
+            "/bin/bash", str(script), "3", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        detail = (stdout if process.returncode == 0 else stderr).decode(errors="replace").strip()
+        await interaction.followup.send(
+            f"{'Restart scheduled' if process.returncode == 0 else 'Restart failed'}: `{detail or 'no details'}`"
+        )
+
+    @bot.tree.command(name="status", description="Show ClawForge daemon and Discord bridge status")
+    async def status(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            result = await bot.api("GET", "/api/status")
+            uptime = int(result.get("uptime_seconds", 0))
+            hours, remainder = divmod(uptime, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            embed = discord.Embed(title="ClawForge Daemon", color=0x57F287)
+            embed.add_field(name="Version", value=result.get("version", "?"))
+            embed.add_field(name="Active sessions", value=str(result.get("active_sessions", 0)))
+            embed.add_field(name="Uptime", value=f"{hours}h {minutes}m {seconds}s")
+            embed.add_field(name="Channels tracked", value=str(len(bot.channel_sessions)))
+            embed.add_field(name="Active Discord jobs", value=str(len(bot.channel_jobs)))
+        except Exception as exc:
+            log.exception("Discord status request failed")
+            await interaction.followup.send(f"ClawForge status request failed: {exc}", ephemeral=True)
+            return
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @bot.tree.command(name="help", description="Show all ClawForge commands")
+    async def help_command(interaction: discord.Interaction) -> None:
+        embed = discord.Embed(title="ClawForge Commands")
+        embed.add_field(
+            name="Chat and sessions",
+            value="`/ask` `/session` `/new_session` `/cancel` `/model` `/respond_mode`",
+            inline=False,
         )
         embed.add_field(
             name="Personas",
-            value=(
-                "`/persona [name]` — set persona for this channel (no name = view current)\n"
-                "`/persona_create name content` — create a new persona file\n"
-                "`/persona_delete name` — delete a persona file"
-            ),
+            value="`/persona` `/persona_create` `/persona_delete`",
             inline=False,
         )
         embed.add_field(
-            name="Tools",
-            value=(
-                "`/tools` — show enabled/disabled tools\n"
-                "`/tool_toggle tool` — enable/disable a tool\n"
-                "`/autoapprove on|off|status` — skip or require tool confirmation prompts"
-            ),
+            name="Tools and configuration",
+            value="`/tools` `/tool_toggle` `/autoapprove` `/require_plans` `/vision_model`",
             inline=False,
         )
-        embed.add_field(
-            name="Sessions",
-            value=(
-                "`/session` — show this channel's session info\n"
-                "`/new_session` — start a fresh session in this channel\n"
-                "`/cancel` — cancel the running background job in this channel"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="Misc",
-            value=(
-                "`/model [name]` — set model override for this channel\n"
-                "`/respond_mode mention|all` — reply to mentions only or every message\n"
-                "`/status` — daemon health (uptime, sessions, version)"
-            ),
-            inline=False,
-        )
+        embed.add_field(name="Daemon", value="`/status` `/restart`", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ---- /persona ----
-    @tree.command(name="persona", description="Set or view the persona for this channel")
-    @app_commands.describe(name="Persona name (omit to view current)")
-    async def cmd_persona(interaction: discord.Interaction, name: Optional[str] = None):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        channel_id = str(interaction.channel_id)
-        channel_name = getattr(interaction.channel, "name", channel_id)
-        session_id = await bridge.ensure_session(channel_id, channel_name)
-        if not session_id:
-            await interaction.followup.send("Failed to resolve session.")
-            return
 
-        if name is None:
-            data = await bridge.fetch_personas(session_id)
-            active = data.get("active", "default")
-            available = ", ".join(data.get("personas", [])) or "(none)"
-            await interaction.followup.send(
-                f"**Active persona:** `{active}`\n**Available:** {available}"
-            )
-            return
+def resolve_token(token_file: str) -> str:
+    """Resolve the Discord token without putting the secret on the command line."""
+    if token_file:
+        token = Path(token_file).read_text(encoding="utf-8").strip()
+        if token:
+            return token
 
-        ok = await bridge.set_persona(session_id, name)
-        if ok:
-            await interaction.followup.send(f"Persona set to `{name}` for this channel.")
-        else:
-            await interaction.followup.send(f"Failed to set persona `{name}`.")
-
-    @cmd_persona.autocomplete("name")
-    async def persona_autocomplete(interaction: discord.Interaction, current: str):
-        data = await bridge.fetch_personas()
-        names = data.get("personas", [])
-        if "default" not in names:
-            names = ["default"] + names
-        cur_lower = current.lower()
-        return [
-            app_commands.Choice(name=n, value=n)
-            for n in names
-            if cur_lower in n.lower()
-        ][:25]
-
-    # ---- /persona_create ----
-    @tree.command(name="persona_create", description="Create a new persona")
-    @app_commands.describe(name="Persona file name (no extension)", content="Persona system prompt content")
-    async def cmd_persona_create(interaction: discord.Interaction, name: str, content: str):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        ok = await bridge.create_persona(name, content)
-        if ok:
-            await interaction.followup.send(f"Persona `{name}` created.")
-        else:
-            await interaction.followup.send(f"Failed to create persona `{name}`.")
-
-    # ---- /persona_delete ----
-    @tree.command(name="persona_delete", description="Delete a persona")
-    @app_commands.describe(name="Persona name to delete")
-    async def cmd_persona_delete(interaction: discord.Interaction, name: str):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        ok = await bridge.delete_persona(name)
-        if ok:
-            await interaction.followup.send(f"Persona `{name}` deleted.")
-        else:
-            await interaction.followup.send(f"Failed to delete persona `{name}`.")
-
-    @cmd_persona_delete.autocomplete("name")
-    async def persona_delete_autocomplete(interaction: discord.Interaction, current: str):
-        data = await bridge.fetch_personas()
-        names = [n for n in data.get("personas", []) if n != "default"]
-        cur_lower = current.lower()
-        return [
-            app_commands.Choice(name=n, value=n)
-            for n in names
-            if cur_lower in n.lower()
-        ][:25]
-
-    # ---- /tools ----
-    @tree.command(name="tools", description="Show enabled and disabled tools")
-    async def cmd_tools(interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        lines = []
-        for tool in ALL_TOOLS:
-            icon = "✅" if tool in bridge.enabled_tools else "⬜"
-            lines.append(f"{icon} `{tool}`")
-        embed = discord.Embed(
-            title="Tool Allowlist",
-            description="\n".join(lines),
-            color=0x57F287,
-        )
-        embed.set_footer(text="Use /tool_toggle to enable or disable a tool.")
-        await interaction.followup.send(embed=embed)
-
-    # ---- /tool_toggle ----
-    tool_choices = [app_commands.Choice(name=t, value=t) for t in ALL_TOOLS]
-
-    @tree.command(name="tool_toggle", description="Enable or disable a tool")
-    @app_commands.describe(tool="The tool to toggle")
-    @app_commands.choices(tool=tool_choices)
-    async def cmd_tool_toggle(interaction: discord.Interaction, tool: app_commands.Choice[str]):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        name = tool.value
-        if name in bridge.enabled_tools:
-            bridge.enabled_tools.discard(name)
-            bridge.save_state()
-            await interaction.followup.send(f"Tool `{name}` disabled.")
-        else:
-            bridge.enabled_tools.add(name)
-            bridge.save_state()
-            await interaction.followup.send(f"Tool `{name}` enabled.")
-
-    # ---- /model ----
-    # Free-form string with live autocomplete populated from /api/models.
-    # Accepts `provider:model` prefixes (ollama:qwen3:8b, openai:gpt-4o,
-    # anthropic:claude-sonnet-4-6) or bare model names (which route to
-    # the daemon's default provider for backwards compat). Use the
-    # literal value `reset` to clear a channel override.
-
-    async def model_autocomplete(
-        interaction: discord.Interaction,
-        current: str,
-    ) -> list[app_commands.Choice[str]]:
-        models = await bridge.fetch_models()
-        # Always expose `reset` as the first option.
-        entries = ["reset"] + models
-        needle = current.lower().strip()
-        if needle:
-            entries = [m for m in entries if needle in m.lower()]
-        # Discord caps autocomplete suggestions at 25.
-        return [app_commands.Choice(name=m, value=m) for m in entries[:25]]
-
-    @tree.command(name="model", description="Set or view the model override for this channel")
-    @app_commands.describe(model="Model to use (omit to view current, 'reset' to clear)")
-    @app_commands.autocomplete(model=model_autocomplete)
-    async def cmd_model(interaction: discord.Interaction, model: Optional[str] = None):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        channel_id = str(interaction.channel_id)
-        if model is None:
-            current = bridge.channel_models.get(channel_id, "(daemon default)")
-            await interaction.followup.send(
-                f"**Current model for this channel:** `{current}`"
-            )
-            return
-        value = model.strip()
-        if value.lower() == "reset":
-            bridge.channel_models.pop(channel_id, None)
-            bridge.save_state()
-            await interaction.followup.send("Model override cleared — using daemon default.")
-            return
-        if len(value) > 128 or not value:
-            await interaction.followup.send("Invalid model string.")
-            return
-        bridge.channel_models[channel_id] = value
-        bridge.save_state()
-        await interaction.followup.send(
-            f"Model set to `{value}` for this channel."
-        )
-
-    # ---- /session ----
-    @tree.command(name="session", description="Show this channel's ClawForge session info")
-    async def cmd_session(interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        channel_id = str(interaction.channel_id)
-        channel_name = getattr(interaction.channel, "name", channel_id)
-        session_id = await bridge.ensure_session(channel_id, channel_name)
-        if not session_id:
-            await interaction.followup.send("Failed to resolve session.")
-            return
-
-        sessions = await bridge.fetch_sessions()
-        match = next((s for s in sessions if s.get("id") == session_id), None)
-        persona_data = await bridge.fetch_personas(session_id)
-        persona = persona_data.get("active", "default")
-        model = bridge.channel_models.get(channel_id, "(daemon default)")
-        running_job = bridge.channel_jobs.get(channel_id)
-
-        embed = discord.Embed(title=f"Session: {channel_name}", color=0x5865F2)
-        embed.add_field(name="ID", value=f"`{session_id}`", inline=False)
-        if match:
-            embed.add_field(name="Name", value=match.get("name") or "(unnamed)", inline=True)
-            embed.add_field(name="Messages", value=str(match.get("message_count", 0)), inline=True)
-        embed.add_field(name="Persona", value=f"`{persona}`", inline=True)
-        embed.add_field(name="Model", value=f"`{model}`", inline=True)
-        embed.add_field(
-            name="Background job",
-            value=f"`{running_job[:8]}…`" if running_job else "(none)",
-            inline=True,
-        )
-        await interaction.followup.send(embed=embed)
-
-    # ---- /new_session ----
-    @tree.command(name="new_session", description="Start a fresh session for this channel")
-    async def cmd_new_session(interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        channel_id = str(interaction.channel_id)
-        channel_name = getattr(interaction.channel, "name", channel_id)
-        new_id = await bridge._create_session(f"discord-{channel_name}")
-        if not new_id:
-            await interaction.followup.send("Failed to create new session.")
-            return
-        bridge.channel_sessions[channel_id] = new_id
-        bridge.save_state()
-        await interaction.followup.send(f"New session started for this channel: `{new_id}`")
-
-    # ---- /cancel ----
-    @tree.command(name="cancel", description="Cancel the running background job in this channel")
-    async def cmd_cancel(interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        channel_id = str(interaction.channel_id)
-        job_id = bridge.channel_jobs.get(channel_id)
-        if not job_id:
-            await interaction.followup.send("No background job is running in this channel.")
-            return
-        ok = await bridge.cancel_job(job_id)
-        if ok:
-            await interaction.followup.send(f"Cancelled job `{job_id[:8]}…`.")
-        else:
-            await interaction.followup.send("Cancel request failed.")
-
-    # ---- /respond_mode ----
-    respond_mode_choices = [
-        app_commands.Choice(name="Mention only (default)", value="mention"),
-        app_commands.Choice(name="Respond to all messages", value="all"),
-    ]
-
-    @tree.command(
-        name="respond_mode",
-        description="Set whether the bot responds only to mentions or to every message in this channel",
-    )
-    @app_commands.describe(mode="Reply trigger mode for this channel")
-    @app_commands.choices(mode=respond_mode_choices)
-    async def cmd_respond_mode(
-        interaction: discord.Interaction, mode: app_commands.Choice[str]
-    ):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        channel_id = str(interaction.channel_id)
-        if mode.value == "all":
-            bridge.channel_respond_all[channel_id] = True
-            bridge.save_state()
-            await interaction.followup.send(
-                "Now responding to **every message** in this channel. "
-                "Use `/respond_mode mention` to revert."
-            )
-        else:
-            bridge.channel_respond_all.pop(channel_id, None)
-            bridge.save_state()
-            await interaction.followup.send(
-                "Now responding to **mentions only** in this channel."
-            )
-
-    # ---- /autoapprove ----
-    autoapprove_choices = [
-        app_commands.Choice(name="On — skip confirmation prompts for mutating tools", value="on"),
-        app_commands.Choice(name="Off — prompt for every mutating tool (default)", value="off"),
-        app_commands.Choice(name="Status — show current setting", value="status"),
-    ]
-
-    @tree.command(
-        name="autoapprove",
-        description="Toggle global auto-approval for tool confirmation prompts",
-    )
-    @app_commands.describe(mode="On = no prompts, Off = prompt per tool, Status = show current")
-    @app_commands.choices(mode=autoapprove_choices)
-    async def cmd_autoapprove(
-        interaction: discord.Interaction, mode: app_commands.Choice[str]
-    ):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        if mode.value == "status":
-            current = await bridge.fetch_auto_approve()
-            if current is None:
-                await interaction.followup.send("Failed to fetch auto-approve status.")
-            else:
-                state = "**ON** (no prompts)" if current else "**OFF** (prompting per tool)"
-                await interaction.followup.send(f"Auto-approve is currently {state}.")
-            return
-
-        target = mode.value == "on"
-        ok = await bridge.set_auto_approve(target)
-        if not ok:
-            await interaction.followup.send("Failed to update auto-approve.")
-            return
-        if target:
-            await interaction.followup.send(
-                "Auto-approve **ON**. Tool confirmation prompts are suppressed globally. "
-                "Use `/autoapprove off` to restore prompts."
-            )
-        else:
-            await interaction.followup.send(
-                "Auto-approve **OFF**. Mutating tools will prompt for approval again."
-            )
-
-    # ---- /vision_model ----
-    @tree.command(
-        name="vision_model",
-        description="Show or set the model used for image analysis (budget control)",
-    )
-    @app_commands.describe(
-        model="Model id (e.g. claude-haiku-4-5-20251001, claude-sonnet-4-6, claude-opus-4-6). Omit to view.",
-    )
-    async def cmd_vision_model(
-        interaction: discord.Interaction,
-        model: Optional[str] = None,
-    ):
-        if model is None:
-            # GET — show the current state.
-            data = await bridge.fetch_vision()
-            if not data:
-                await interaction.response.send_message(
-                    "Failed to fetch vision config.", ephemeral=True,
-                )
-                return
-            enabled = data.get("enabled", False)
-            current = data.get("model", "?")
-            default_model = data.get("default_model", "?")
-            max_bytes = data.get("max_image_bytes", 0)
-            per_turn = data.get("max_images_per_turn", 0)
-            embed = discord.Embed(title="Vision config", color=0x5865F2)
-            embed.add_field(name="Enabled", value="yes" if enabled else "no", inline=True)
-            embed.add_field(name="Active model", value=f"`{current}`", inline=False)
-            embed.add_field(name="Config default", value=f"`{default_model}`", inline=False)
-            embed.add_field(
-                name="Limits",
-                value=f"{max_bytes // 1024} KiB per image, {per_turn} per turn",
-                inline=False,
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-
-        # POST — set override.
-        ok = await bridge.set_vision_model(model)
-        if ok:
-            await interaction.response.send_message(
-                f"Vision model set to `{model}`. Budget is on you now — good luck. 🎯",
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                f"Failed to set vision model to `{model}`. Check daemon logs.",
-                ephemeral=True,
-            )
-
-    # ---- /status ----
-    @tree.command(name="status", description="Show ClawForge daemon status")
-    async def cmd_status(interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        data = await bridge.fetch_status()
-        if not data:
-            await interaction.followup.send("Failed to fetch status.")
-            return
-        uptime = data.get("uptime_seconds", 0)
-        hours, rem = divmod(uptime, 3600)
-        minutes, seconds = divmod(rem, 60)
-        embed = discord.Embed(title="ClawForge Daemon", color=0x57F287)
-        embed.add_field(name="Version", value=data.get("version", "?"), inline=True)
-        embed.add_field(name="Active sessions", value=str(data.get("active_sessions", 0)), inline=True)
-        embed.add_field(
-            name="Uptime",
-            value=f"{hours}h {minutes}m {seconds}s",
-            inline=True,
-        )
-        embed.add_field(name="Channels tracked", value=str(len(bridge.channel_sessions)), inline=True)
-        embed.add_field(name="Active bridge jobs", value=str(len(bridge.channel_jobs)), inline=True)
-        await interaction.followup.send(embed=embed)
-
-
-# ---------------------------------------------------------------------------
-# Bootstrap
-# ---------------------------------------------------------------------------
-
-def load_dotenv(path: Path) -> dict[str, str]:
-    """Parse a .env file into a dict. Ignores comments and blank lines."""
-    env = {}
-    if not path.is_file():
-        return env
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        env[key.strip()] = value.strip().strip("'\"")
-    return env
-
-
-def resolve_token(cli_token: Optional[str]) -> Optional[str]:
-    """Resolve Discord token: CLI arg > env var > .env file."""
-    if cli_token:
-        return cli_token
-
-    env_token = os.environ.get("DISCORD_TOKEN")
-    if env_token:
-        return env_token
-
-    dotenv_path = Path(__file__).resolve().parent.parent / ".env"
-    dotenv = load_dotenv(dotenv_path)
-    token = dotenv.get("DISCORD_TOKEN", "")
+    token = os.environ.get("DISCORD_TOKEN", "").strip()
     if token:
-        log.info("Loaded DISCORD_TOKEN from %s", dotenv_path)
         return token
 
-    return None
-
-
-def load_guild_id() -> Optional[str]:
-    config_path = Path(__file__).resolve().parent.parent / "config" / "config.json"
-    if not config_path.is_file():
-        return None
+    dotenv_path = Path(__file__).resolve().parent.parent / ".env"
     try:
-        data = json.loads(config_path.read_text())
-        gid = data.get("discord", {}).get("guild_id", "").strip()
-        return gid or None
-    except Exception as e:
-        log.warning("Failed to read config.json for guild_id: %s", e)
-        return None
+        for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() == "DISCORD_TOKEN":
+                return value.strip().strip("\"'")
+    except FileNotFoundError:
+        pass
+
+    raise RuntimeError(
+        "Discord token is missing; set discord.token_file, DISCORD_TOKEN, or DISCORD_TOKEN in .env"
+    )
 
 
-def main():
-    parser = argparse.ArgumentParser(description="ClawForge Discord Bridge")
-    parser.add_argument(
-        "--clawforge-url",
-        default=os.environ.get("CLAWFORGE_URL", "http://127.0.0.1:8081"),
-        help="ClawForge HTTP API URL (default: http://127.0.0.1:8081)",
-    )
-    parser.add_argument(
-        "--token",
-        default=None,
-        help="Discord bot token (or set DISCORD_TOKEN env var, or add to .env)",
-    )
-    parser.add_argument(
-        "--guild-id",
-        default=None,
-        help="Discord guild ID for instant slash command sync (overrides config.json)",
-    )
+def main() -> None:
+    parser = argparse.ArgumentParser(description="ClawForge Discord protocol transport")
+    parser.add_argument("--token-file", default="")
+    parser.add_argument("--guild-id", default="")
+    parser.add_argument("--attachment-spool", default="data/discord_attachments")
+    parser.add_argument("--max-attachment-bytes", type=int, default=25 * 1024 * 1024)
+    parser.add_argument("--max-attachment-count", type=int, default=10)
     args = parser.parse_args()
-
-    token = resolve_token(args.token)
-    if not token:
-        env_path = Path(__file__).resolve().parent.parent / ".env"
-        print(
-            "Error: Discord token required.\n"
-            f"  Option 1: Add DISCORD_TOKEN=<token> to {env_path}\n"
-            "  Option 2: Set DISCORD_TOKEN environment variable\n"
-            "  Option 3: Use --token <token>",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    guild_id = args.guild_id or load_guild_id()
-    if guild_id:
-        log.info("Slash commands will sync to guild %s (instant)", guild_id)
-    else:
-        log.info("No guild_id configured — slash commands will sync globally (slow propagation)")
-
-    intents = discord.Intents.default()
-    intents.message_content = True
-
-    client = ClawForgeBridge(
-        clawforge_url=args.clawforge_url,
-        guild_id=guild_id,
-        intents=intents,
+    token = resolve_token(args.token_file)
+    guild_id = int(args.guild_id) if args.guild_id else None
+    bot = DiscordTransport(
+        guild_id,
+        Path(args.attachment_spool),
+        args.max_attachment_bytes,
+        args.max_attachment_count,
     )
-    client.run(token, log_handler=None)
+    register_commands(bot)
+    bot.run(token, log_handler=None)
 
 
 if __name__ == "__main__":

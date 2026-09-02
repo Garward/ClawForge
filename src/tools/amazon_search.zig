@@ -9,7 +9,7 @@ pub const definition = registry.ToolDefinition{
         " Returns per product: title, price, rating, review_count, unit_size_oz, pack_count, total_oz, price_per_oz (pre-computed), url, value_rank, sponsored." ++
         " Results are sorted by best value (lowest price_per_oz first).",
     .input_schema_json =
-        \\{"type":"object","properties":{"query":{"type":"string","description":"Single search term or ASIN"},"queries":{"type":"array","items":{"type":"string"},"description":"Multiple search terms/ASINs to search in parallel (e.g. ['rice', 'chicken breast', 'peanut butter'])"},"max_results":{"type":"integer","description":"Max results per query (default 10)"}}}
+    \\{"type":"object","properties":{"query":{"type":"string","description":"Single search term or ASIN"},"queries":{"type":"array","items":{"type":"string"},"description":"Multiple search terms/ASINs to search in parallel (e.g. ['rice', 'chicken breast', 'peanut butter'])"},"max_results":{"type":"integer","description":"Max results per query (default 10)"}}}
     ,
     .requires_confirmation = false,
     .handler = &execute,
@@ -28,7 +28,7 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
     defer allocator.free(search_script);
 
     // Build argv dynamically
-    var argv_list: std.ArrayList([]const u8) = .{};
+    var argv_list: std.ArrayList([]const u8) = .empty;
     argv_list.append(allocator, python) catch return .{ .content = "Alloc error", .is_error = true };
     argv_list.append(allocator, search_script) catch return .{ .content = "Alloc error", .is_error = true };
 
@@ -62,7 +62,7 @@ fn execute(allocator: std.mem.Allocator, input: json.Value) registry.ToolResult 
         }
     }
 
-    const result = std.process.Child.run(.{
+    const result = common.process.run(.{
         .allocator = allocator,
         .argv = argv_list.items,
         .max_output_bytes = 1024 * 1024, // 1MB for multi-query

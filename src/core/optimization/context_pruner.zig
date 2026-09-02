@@ -58,7 +58,7 @@ pub const ContextPruner = struct {
         if (messages.len < 5) return try self.allocator.alloc(bool, 0);
 
         // Segment messages by topic
-        var segments: std.ArrayList(Segment) = .{};
+        var segments: std.ArrayList(Segment) = .empty;
         defer segments.deinit(self.allocator);
         self.segmentMessages(messages, &segments);
 
@@ -94,7 +94,7 @@ pub const ContextPruner = struct {
 
         if (std.mem.indexOf(u8, content, "tool") != null and
             (std.mem.indexOf(u8, content, "register") != null or
-            std.mem.indexOf(u8, content, "implement") != null))
+                std.mem.indexOf(u8, content, "implement") != null))
             return .tool_development;
 
         if (std.mem.indexOf(u8, content, "error") != null or
@@ -164,7 +164,7 @@ pub const ContextPruner = struct {
         var removed: usize = 0;
 
         // Sort segment indices by relevance (lowest first = prune first)
-        var indices: std.ArrayList(usize) = .{};
+        var indices: std.ArrayList(usize) = .empty;
         defer indices.deinit(self.allocator);
         for (0..segments.len) |i| {
             try indices.append(self.allocator, i);
